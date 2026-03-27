@@ -1,0 +1,1324 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Polymarket Scanner</title>
+<style>
+  :root {
+    --bg: #0a0e17;
+    --surface: #111827;
+    --surface2: #1a2234;
+    --border: #2a3548;
+    --text: #e2e8f0;
+    --text2: #94a3b8;
+    --green: #10b981;
+    --red: #ef4444;
+    --blue: #3b82f6;
+    --amber: #f59e0b;
+    --purple: #8b5cf6;
+    --teal: #14b8a6;
+    --sky: #0ea5e9;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: 'SF Mono', 'Fira Code', 'Consolas', monospace;
+    background: var(--bg);
+    color: var(--text);
+    font-size: 13px;
+    line-height: 1.5;
+  }
+  .container { max-width: 1600px; margin: 0 auto; padding: 20px; }
+
+  header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 16px 0;
+    border-bottom: 1px solid var(--border);
+    margin-bottom: 24px;
+    flex-wrap: wrap;
+    gap: 12px;
+  }
+  header h1 { font-size: 18px; font-weight: 600; }
+  header h1 span { color: var(--blue); }
+  .header-actions { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  .status-dot {
+    width: 8px; height: 8px; border-radius: 50%;
+    background: var(--green);
+    display: inline-block;
+    animation: pulse 2s infinite;
+  }
+  @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.4; } }
+
+  .stats-row {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+    gap: 12px;
+    margin-bottom: 24px;
+  }
+  .stat-card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 16px;
+  }
+  .stat-card .label { color: var(--text2); font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; }
+  .stat-card .value { font-size: 22px; font-weight: 700; margin-top: 4px; }
+  .stat-card .value.green { color: var(--green); }
+  .stat-card .value.red { color: var(--red); }
+  .stat-card .value.blue { color: var(--blue); }
+  .stat-card .value.amber { color: var(--amber); }
+  .stat-card .value.teal { color: var(--teal); }
+
+  .btn {
+    padding: 8px 14px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    background: var(--surface);
+    color: var(--text);
+    cursor: pointer;
+    font-family: inherit;
+    font-size: 12px;
+    transition: all 0.15s;
+    white-space: nowrap;
+  }
+  .btn:hover { background: var(--surface2); border-color: var(--blue); }
+  .btn.primary { background: var(--blue); border-color: var(--blue); color: white; }
+  .btn.primary:hover { background: #2563eb; }
+  .btn.teal { background: var(--teal); border-color: var(--teal); color: #000; font-weight: 600; }
+  .btn.teal:hover { background: #0d9488; }
+  .btn.sky { background: var(--sky); border-color: var(--sky); color: #000; font-weight: 600; }
+  .btn.sky:hover { background: #0284c7; }
+  .btn:disabled { opacity: 0.5; cursor: not-allowed; }
+  .btn.sm { padding: 4px 10px; font-size: 11px; }
+
+  .tabs {
+    display: flex;
+    gap: 0;
+    border-bottom: 1px solid var(--border);
+    margin-bottom: 16px;
+    overflow-x: auto;
+  }
+  .tab {
+    padding: 10px 18px;
+    cursor: pointer;
+    color: var(--text2);
+    border-bottom: 2px solid transparent;
+    transition: all 0.15s;
+    white-space: nowrap;
+    font-size: 12px;
+  }
+  .tab:hover { color: var(--text); }
+  .tab.active { color: var(--blue); border-color: var(--blue); }
+  .tab .badge-count {
+    display: inline-block;
+    background: var(--surface2);
+    border-radius: 10px;
+    padding: 1px 6px;
+    font-size: 10px;
+    margin-left: 4px;
+    color: var(--text2);
+  }
+  .tab.active .badge-count { background: rgba(59,130,246,0.2); color: var(--blue); }
+
+  .table-wrap {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    overflow-x: auto;
+  }
+  table { width: 100%; border-collapse: collapse; }
+  th {
+    text-align: left;
+    padding: 10px 12px;
+    color: var(--text2);
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    border-bottom: 1px solid var(--border);
+    white-space: nowrap;
+  }
+  td { padding: 9px 12px; border-bottom: 1px solid var(--border); white-space: nowrap; }
+  tr:last-child td { border-bottom: none; }
+  tr:hover { background: var(--surface2); }
+
+  .z-pos { color: var(--red); font-weight: 600; }
+  .z-neg { color: var(--green); font-weight: 600; }
+  .pnl-pos { color: var(--green); font-weight: 600; }
+  .pnl-neg { color: var(--red); font-weight: 600; }
+
+  .badge {
+    display: inline-block;
+    padding: 2px 8px;
+    border-radius: 4px;
+    font-size: 11px;
+    font-weight: 600;
+  }
+  .badge.open   { background: #1e3a5f; color: var(--blue); }
+  .badge.closed { background: #1a2e1a; color: var(--green); }
+  .badge.new    { background: #3b1f0b; color: var(--amber); }
+  .badge.traded { background: #1e1040; color: var(--purple); }
+  .badge.yes    { background: rgba(16,185,129,0.15); color: var(--green); }
+  .badge.no     { background: rgba(239,68,68,0.15); color: var(--red); }
+  .badge.agree  { background: rgba(20,184,166,0.15); color: var(--teal); }
+  .badge.disagree { background: rgba(107,114,128,0.15); color: #9ca3af; }
+
+  .grade { font-weight: 700; font-size: 14px; }
+  .grade-a  { color: var(--green); }
+  .grade-b  { color: #22d3ee; }
+  .grade-c  { color: var(--amber); }
+  .grade-d  { color: var(--red); }
+  .grade-f  { color: #6b7280; }
+
+  .event-name  { max-width: 180px; overflow: hidden; text-overflow: ellipsis; }
+  .market-name { max-width: 220px; overflow: hidden; text-overflow: ellipsis; font-size: 12px; }
+
+  .chart-container {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 16px;
+    margin-bottom: 24px;
+    height: 180px;
+    position: relative;
+  }
+  .chart-container canvas { width: 100%; height: 100%; }
+  .chart-label { color: var(--text2); font-size: 11px; margin-bottom: 8px; }
+
+  .empty { text-align: center; padding: 40px; color: var(--text2); }
+  .empty .icon { font-size: 28px; margin-bottom: 8px; }
+
+  .panel-toolbar {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 8px 0 12px;
+    flex-wrap: wrap;
+    gap: 8px;
+  }
+  .panel-toolbar .info { color: var(--text2); font-size: 12px; }
+
+  .spinner {
+    display: inline-block;
+    width: 13px; height: 13px;
+    border: 2px solid var(--border);
+    border-top-color: var(--blue);
+    border-radius: 50%;
+    animation: spin 0.6s linear infinite;
+    vertical-align: middle;
+    margin-right: 5px;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  .toast {
+    position: fixed;
+    bottom: 24px; right: 24px;
+    background: var(--surface2);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 12px 20px;
+    color: var(--text);
+    font-size: 13px;
+    z-index: 1000;
+    max-width: 420px;
+    transform: translateY(100px);
+    opacity: 0;
+    transition: all 0.3s;
+  }
+  .toast.show { transform: translateY(0); opacity: 1; }
+
+  /* Pill for source agreement */
+  .pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    padding: 2px 8px;
+    border-radius: 20px;
+    font-size: 11px;
+    font-weight: 600;
+  }
+  .pill.confirmed { background: rgba(20,184,166,0.15); color: var(--teal); }
+  .pill.partial   { background: rgba(245,158,11,0.15); color: var(--amber); }
+  .pill.single    { background: rgba(107,114,128,0.15); color: #9ca3af; }
+
+  @media (max-width: 768px) {
+    .stats-row { grid-template-columns: repeat(2, 1fr); }
+    .container { padding: 12px; }
+  }
+</style>
+</head>
+<body>
+<div class="container">
+  <header>
+    <h1><span>&#9670;</span> Polymarket Scanner</h1>
+    <div class="header-actions">
+      <span class="status-dot" id="statusDot"></span>
+      <span id="lastScan" style="color: var(--text2); font-size: 12px;">No scans yet</span>
+      <button class="btn sky" id="weatherScanBtn" onclick="runWeatherScan()">Weather Scan</button>
+      <button class="btn" id="autoTradeBtn" onclick="runAutoTrade()" style="background:var(--green);color:#000;font-weight:600;">Auto Trade</button>
+    </div>
+  </header>
+
+  <!-- Stats -->
+  <div class="stats-row">
+    <div class="stat-card">
+      <div class="label">Total P&L</div>
+      <div class="value" id="statPnl">$0.00</div>
+    </div>
+    <div class="stat-card">
+      <div class="label">Win Rate</div>
+      <div class="value blue" id="statWinRate">0%</div>
+    </div>
+    <div class="stat-card">
+      <div class="label">Open Trades</div>
+      <div class="value amber" id="statOpen">0</div>
+    </div>
+    <div class="stat-card">
+      <div class="label">Closed Trades</div>
+      <div class="value" id="statClosed">0</div>
+    </div>
+    <div class="stat-card">
+      <div class="label">Coint Signals</div>
+      <div class="value" id="statSignals">0</div>
+    </div>
+    <div class="stat-card">
+      <div class="label">Weather Opps</div>
+      <div class="value sky" id="statWeather" style="color:var(--sky);">—</div>
+    </div>
+    <div class="stat-card">
+      <div class="label">Scans Run</div>
+      <div class="value" id="statScans">0</div>
+    </div>
+  </div>
+
+  <!-- P&L Chart -->
+  <div class="chart-container">
+    <div class="chart-label">Cumulative P&L</div>
+    <canvas id="pnlChart"></canvas>
+  </div>
+
+  <!-- Tabs -->
+  <div class="tabs">
+    <div class="tab active" data-tab="signals"  onclick="switchTab('signals')">Cointegration <span class="badge-count" id="cntSignals">0</span></div>
+    <div class="tab"        data-tab="weather"  onclick="switchTab('weather')">Weather <span class="badge-count" id="cntWeather">0</span></div>
+    <div class="tab"        data-tab="copy"     onclick="switchTab('copy')">Copy Trader <span class="badge-count" id="cntCopy">0</span></div>
+    <div class="tab"        data-tab="trades"   onclick="switchTab('trades')">Open Trades</div>
+    <div class="tab"        data-tab="history"  onclick="switchTab('history')">Trade History</div>
+    <div class="tab"        data-tab="scans"    onclick="switchTab('scans')">Scan Log</div>
+    <div class="tab"        data-tab="console"  onclick="switchTab('console')">Console</div>
+  </div>
+
+  <!-- ── Cointegration Signals ── -->
+  <div id="panel-signals" class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>Time</th><th>Event</th><th>Market A</th><th>Market B</th>
+          <th>Z-Score</th><th>P-Val</th><th>Grade</th>
+          <th>EV%</th><th>Kelly $</th><th>Liquidity</th><th>Status</th><th>Action</th>
+        </tr>
+      </thead>
+      <tbody id="signalsBody"></tbody>
+    </table>
+  </div>
+
+  <!-- ── Locked Arb ── -->
+  <div id="panel-locked" style="display:none">
+    <div class="panel-toolbar">
+      <span class="info" id="lockedInfo">Run a Locked Arb scan to find opportunities.</span>
+      <div style="display:flex;gap:8px;">
+        <label style="color:var(--text2);font-size:12px;display:flex;align-items:center;gap:4px;">
+          <input type="checkbox" id="lockedTradeableOnly" onchange="loadLocked()"> Tradeable only
+        </label>
+        <button class="btn sm teal" onclick="runLockedScan()">Scan Now</button>
+      </div>
+    </div>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>Time</th><th>Event</th><th>Market</th>
+            <th>YES</th><th>NO</th><th>Sum</th>
+            <th>Gap Gross</th><th>Gap Net</th>
+            <th>Liquidity</th><th>Tradeable</th>
+          </tr>
+        </thead>
+        <tbody id="lockedBody"></tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- ── Weather Edge ── -->
+  <div id="panel-weather" style="display:none">
+    <div class="panel-toolbar">
+      <span class="info" id="weatherInfo">Run a Weather scan to compare NOAA + Open-Meteo vs market prices.</span>
+      <div style="display:flex;gap:8px;">
+        <label style="color:var(--text2);font-size:12px;display:flex;align-items:center;gap:4px;">
+          <input type="checkbox" id="weatherTradeableOnly" onchange="loadWeather()"> Tradeable only
+        </label>
+        <button class="btn sm sky" onclick="runWeatherScan()">Scan Now</button>
+      </div>
+    </div>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>Time</th><th>City</th><th>Date</th><th>Direction</th><th>Threshold</th>
+            <th>Market</th><th>NOAA</th><th>Open-Meteo</th><th>Combined</th>
+            <th>Edge%</th><th>Sources</th><th>Action</th>
+          </tr>
+        </thead>
+        <tbody id="weatherBody"></tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- ── Open Trades ── -->
+  <div id="panel-trades" class="table-wrap" style="display:none">
+    <table>
+      <thead>
+        <tr>
+          <th>Opened</th><th>Type</th><th>Market</th><th>Action</th>
+          <th>Entry</th><th>Detail</th><th>Size</th><th>Action</th>
+        </tr>
+      </thead>
+      <tbody id="tradesBody"></tbody>
+    </table>
+  </div>
+
+  <!-- ── Copy Trader ── -->
+  <div id="panel-copy" class="table-wrap" style="display:none">
+    <div style="display:flex;gap:12px;align-items:center;padding:8px 0 12px;flex-wrap:wrap">
+      <span id="copyInfo" style="color:var(--text2);font-size:13px">Loading watched wallets...</span>
+      <button class="btn sm sky" onclick="loadCopy()">Refresh</button>
+    </div>
+
+    <!-- Discover / Score new wallet -->
+    <div style="background:var(--card);border:1px solid var(--border);border-radius:8px;padding:14px;margin-bottom:16px">
+      <div style="font-weight:600;margin-bottom:10px;font-size:13px">Discover Wallet</div>
+      <div style="font-size:12px;color:var(--text2);margin-bottom:10px">
+        Visit <a href="https://polymarket.com/leaderboard" target="_blank" style="color:var(--sky)">polymarket.com/leaderboard</a>,
+        copy a wallet address and paste it below.
+      </div>
+      <div style="display:flex;gap:8px;flex-wrap:wrap">
+        <input id="discoverAddr" type="text" placeholder="0x wallet address..."
+          style="flex:1;min-width:280px;background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:7px 10px;color:var(--text1);font-size:13px;font-family:monospace">
+        <input id="discoverLabel" type="text" placeholder="Label (optional)"
+          style="width:140px;background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:7px 10px;color:var(--text1);font-size:13px">
+        <button class="btn sm sky" onclick="scoreWallet()">Score</button>
+      </div>
+      <div id="discoverResult" style="margin-top:12px"></div>
+    </div>
+
+    <!-- Watched wallet score cards -->
+    <div id="copyScores" style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:14px"></div>
+
+    <!-- Candidates from auto-discovery -->
+    <div style="display:flex;gap:10px;align-items:center;margin-bottom:10px">
+      <div style="font-weight:600;font-size:13px">Discovery Candidates</div>
+      <button class="btn sm sky" onclick="runDiscovery(this)">Run Discovery</button>
+      <span id="discoveryStatus" style="color:var(--text2);font-size:12px"></span>
+    </div>
+    <div id="candidatesPanel" style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:18px">
+      <span style="color:var(--text2);font-size:12px">No candidates yet — run discovery or wait for next autonomy cycle (every 6h).</span>
+    </div>
+
+    <div id="copyBody"></div>
+  </div>
+
+  <!-- ── Trade History ── -->
+  <div id="panel-history" class="table-wrap" style="display:none">
+    <table>
+      <thead>
+        <tr>
+          <th>Opened</th><th>Closed</th><th>Event</th>
+          <th>Entry A/B</th><th>Exit A/B</th><th>P&L</th><th>Notes</th>
+        </tr>
+      </thead>
+      <tbody id="historyBody"></tbody>
+    </table>
+  </div>
+
+  <!-- ── Scan Log ── -->
+  <div id="panel-scans" class="table-wrap" style="display:none">
+    <table>
+      <thead>
+        <tr><th>Time</th><th>Opportunities</th><th>Duration</th></tr>
+      </thead>
+      <tbody id="scansBody"></tbody>
+    </table>
+  </div>
+
+  <!-- ── Console ── -->
+  <div id="panel-console" style="display:none">
+    <div class="panel-toolbar">
+      <span class="info">Live log — auto-refreshes every 3s</span>
+      <div style="display:flex;gap:8px;align-items:center;">
+        <label style="color:var(--text2);font-size:12px;display:flex;align-items:center;gap:4px;">
+          <input type="checkbox" id="consoleAutoScroll" checked> Auto-scroll
+        </label>
+        <button class="btn sm" onclick="clearConsoleFilter()">All</button>
+        <button class="btn sm" onclick="setConsoleFilter('ERROR')"  style="color:var(--red);">Errors</button>
+        <button class="btn sm" onclick="setConsoleFilter('TRADE')"  style="color:var(--green);">Trades</button>
+        <button class="btn sm" onclick="setConsoleFilter('weather')" style="color:var(--sky);">Weather</button>
+        <button class="btn sm" onclick="setConsoleFilter('locked')" style="color:var(--teal);">Locked</button>
+        <button class="btn sm" onclick="setConsoleFilter('Brain')"  style="color:var(--purple);">Brain</button>
+      </div>
+    </div>
+    <div id="consoleOutput" style="
+      background:#0a0e17;
+      border:1px solid var(--border);
+      border-radius:8px;
+      padding:12px;
+      height:440px;
+      overflow-y:auto;
+      font-family:'SF Mono','Fira Code',monospace;
+      font-size:11px;
+      line-height:1.7;
+    "></div>
+  </div>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script>
+const API = '';
+const ALL_PANELS = ['signals','locked','weather','copy','trades','history','scans','console'];
+
+// ── Utilities ──────────────────────────────────────────────────────────────
+
+function fmt(ts) {
+  if (!ts) return '-';
+  const d = new Date(ts * 1000);
+  return d.toLocaleString('en-GB', { day:'2-digit', month:'short', hour:'2-digit', minute:'2-digit' });
+}
+function fmtPct(v) { return v != null ? (v * 100).toFixed(1) + '%' : '-'; }
+function fmtUsd(v) { return '$' + Number(v || 0).toLocaleString('en-US', {minimumFractionDigits:2, maximumFractionDigits:2}); }
+function fmtNum(v, dp=3) { return v != null ? Number(v).toFixed(dp) : '-'; }
+function esc(s) { const d = document.createElement('div'); d.textContent = String(s||''); return d.innerHTML; }
+
+function toast(msg, duration=4000) {
+  const el = document.getElementById('toast');
+  el.textContent = msg;
+  el.classList.add('show');
+  clearTimeout(el._t);
+  el._t = setTimeout(() => el.classList.remove('show'), duration);
+}
+
+// ── Tabs ───────────────────────────────────────────────────────────────────
+
+function switchTab(name) {
+  document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+  document.querySelector(`.tab[data-tab="${name}"]`).classList.add('active');
+  ALL_PANELS.forEach(p => {
+    document.getElementById('panel-' + p).style.display = p === name ? '' : 'none';
+  });
+  if (name === 'trades')  loadTrades();
+  if (name === 'history') loadHistory();
+  if (name === 'scans')   loadScans();
+  if (name === 'locked')  loadLocked();
+  if (name === 'weather') loadWeather();
+  if (name === 'copy')    { loadCopy(); loadCandidates(); }
+}
+
+// ── Stats ──────────────────────────────────────────────────────────────────
+
+async function loadStats() {
+  try {
+    const r = await fetch(API + '/api/stats');
+    const s = await r.json();
+    const pnlEl = document.getElementById('statPnl');
+    pnlEl.textContent = fmtUsd(s.total_pnl);
+    pnlEl.className = 'value ' + (s.total_pnl >= 0 ? 'green' : 'red');
+    document.getElementById('statWinRate').textContent = s.win_rate + '%';
+    document.getElementById('statOpen').textContent = s.open_trades;
+    document.getElementById('statClosed').textContent = s.closed_trades;
+    document.getElementById('statSignals').textContent = s.total_signals;
+    document.getElementById('statScans').textContent = s.total_scans;
+    drawPnlChart(s.pnl_series);
+  } catch(e) {}
+}
+
+// ── P&L Chart ──────────────────────────────────────────────────────────────
+
+function drawPnlChart(series) {
+  const canvas = document.getElementById('pnlChart');
+  const ctx = canvas.getContext('2d');
+  const rect = canvas.parentElement.getBoundingClientRect();
+  canvas.width  = rect.width  - 32;
+  canvas.height = rect.height - 40;
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  if (!series || series.length < 2) {
+    ctx.fillStyle = '#94a3b8'; ctx.font = '13px monospace';
+    ctx.textAlign = 'center';
+    ctx.fillText('No closed trades yet', canvas.width/2, canvas.height/2);
+    return;
+  }
+  let cum = 0;
+  const points = series.map(s => { cum += s.pnl; return cum; });
+  const maxVal = Math.max(...points, 0.01);
+  const minVal = Math.min(...points, -0.01);
+  const range = maxVal - minVal || 1;
+  const w = canvas.width, h = canvas.height, pad = 10;
+  const zeroY = pad + (maxVal / range) * (h - 2 * pad);
+  ctx.strokeStyle = '#2a3548'; ctx.lineWidth = 1;
+  ctx.setLineDash([4,4]);
+  ctx.beginPath(); ctx.moveTo(0, zeroY); ctx.lineTo(w, zeroY); ctx.stroke();
+  ctx.setLineDash([]);
+  ctx.strokeStyle = cum >= 0 ? '#10b981' : '#ef4444'; ctx.lineWidth = 2;
+  ctx.beginPath();
+  points.forEach((v, i) => {
+    const x = (i / (points.length - 1)) * w;
+    const y = pad + ((maxVal - v) / range) * (h - 2 * pad);
+    i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+  });
+  ctx.stroke();
+  ctx.lineTo(w, zeroY); ctx.lineTo(0, zeroY); ctx.closePath();
+  ctx.fillStyle = cum >= 0 ? 'rgba(16,185,129,0.1)' : 'rgba(239,68,68,0.1)';
+  ctx.fill();
+}
+
+// ── Cointegration Signals ──────────────────────────────────────────────────
+
+async function loadSignals() {
+  try {
+    const r = await fetch(API + '/api/signals?limit=50');
+    const signals = await r.json();
+    document.getElementById('cntSignals').textContent = signals.length;
+    const body = document.getElementById('signalsBody');
+    if (!signals.length) {
+      body.innerHTML = '<tr><td colspan="12" class="empty"><div class="icon">◎</div>No signals yet — run a scan.</td></tr>';
+      return;
+    }
+    body.innerHTML = signals.map(s => {
+      const gl = s.grade_label || '-';
+      const gc = gl.startsWith('A') ? 'grade-a' : gl==='B' ? 'grade-b' : gl==='C' ? 'grade-c' : gl==='D' ? 'grade-d' : 'grade-f';
+      const evPct     = s.ev     && s.ev.ev_pct     != null ? s.ev.ev_pct.toFixed(1) + '%' : '-';
+      const kellySize = s.sizing && s.sizing.recommended_size != null ? fmtUsd(s.sizing.recommended_size) : '-';
+      return `<tr>
+        <td>${fmt(s.timestamp)}</td>
+        <td class="event-name" title="${esc(s.event)}">${esc(s.event)}</td>
+        <td class="market-name" title="${esc(s.market_a)}">${esc((s.market_a||'').slice(0,38))}</td>
+        <td class="market-name" title="${esc(s.market_b)}">${esc((s.market_b||'').slice(0,38))}</td>
+        <td class="${s.z_score>0?'z-pos':'z-neg'}">${s.z_score>0?'+':''}${s.z_score.toFixed(2)}</td>
+        <td>${s.coint_pvalue.toFixed(4)}</td>
+        <td><span class="grade ${gc}">${gl}</span></td>
+        <td>${evPct}</td>
+        <td>${kellySize}</td>
+        <td>${fmtUsd(s.liquidity)}</td>
+        <td><span class="badge ${s.status}">${s.status}</span></td>
+        <td>${s.status==='new'
+          ? `<button class="btn sm" onclick="paperTrade(${s.id})">Trade</button>
+             <button class="btn sm" onclick="brainValidate(${s.id})" title="Ask Claude">Brain</button>`
+          : ''}</td>
+      </tr>`;
+    }).join('');
+  } catch(e) { console.error('Signals error:', e); }
+}
+
+// ── Locked Arb ─────────────────────────────────────────────────────────────
+
+async function loadLocked() {
+  try {
+    const tradeable = document.getElementById('lockedTradeableOnly').checked;
+    const r = await fetch(API + `/api/locked?limit=100&tradeable_only=${tradeable}`);
+    const rows = await r.json();
+    document.getElementById('cntLocked').textContent = rows.length;
+    document.getElementById('statLocked').textContent = rows.length;
+    const body = document.getElementById('lockedBody');
+    if (!rows.length) {
+      body.innerHTML = '<tr><td colspan="10" class="empty"><div class="icon">◈</div>No locked-arb opportunities found. Run a scan.</td></tr>';
+      document.getElementById('lockedInfo').textContent = 'No results yet — click "Scan Now" to check all active markets.';
+      return;
+    }
+    const tradeable_count = rows.filter(r => r.tradeable).length;
+    document.getElementById('lockedInfo').textContent =
+      `${rows.length} opportunities · ${tradeable_count} tradeable · last scan ${fmt(rows[0].timestamp)}`;
+    body.innerHTML = rows.map(row => {
+      const netPct  = row.gap_net  != null ? (row.gap_net  * 100).toFixed(2) + '%' : '-';
+      const grossPct = row.gap_gross != null ? (row.gap_gross * 100).toFixed(2) + '%' : '-';
+      const trBadge = row.tradeable
+        ? '<span class="badge yes">YES</span>'
+        : '<span class="badge disagree">NO</span>';
+      const gapColor = row.gap_net > 0 ? 'color:var(--green);font-weight:600' : 'color:var(--red)';
+      return `<tr>
+        <td>${fmt(row.timestamp)}</td>
+        <td class="event-name" title="${esc(row.event)}">${esc(row.event)}</td>
+        <td class="market-name" title="${esc(row.market)}">${esc((row.market||'').slice(0,45))}</td>
+        <td>${fmtNum(row.yes_price)}</td>
+        <td>${fmtNum(row.no_price)}</td>
+        <td style="${row.sum_price<1?'color:var(--amber);font-weight:600':''}">${fmtNum(row.sum_price)}</td>
+        <td>${grossPct}</td>
+        <td style="${gapColor}">${netPct}</td>
+        <td>${fmtUsd(row.liquidity)}</td>
+        <td>${trBadge}</td>
+      </tr>`;
+    }).join('');
+  } catch(e) { console.error('Locked error:', e); }
+}
+
+// ── Weather Edge ───────────────────────────────────────────────────────────
+
+async function loadWeather() {
+  try {
+    const tradeable = document.getElementById('weatherTradeableOnly').checked;
+    const r = await fetch(API + `/api/weather?limit=100&tradeable_only=${tradeable}`);
+    const rows = await r.json();
+    document.getElementById('cntWeather').textContent = rows.length;
+    document.getElementById('statWeather').textContent = rows.length;
+    const body = document.getElementById('weatherBody');
+    if (!rows.length) {
+      body.innerHTML = '<tr><td colspan="12" class="empty"><div class="icon">☁</div>No weather signals found. Polymarket may not currently have active temperature bucket markets ("Will [city] exceed X°F on [date]?"). These appear seasonally.</td></tr>';
+      document.getElementById('weatherInfo').textContent = 'No temperature markets found — Polymarket has these seasonally. Scanner checked all active markets.';
+      return;
+    }
+    const tradeable_count = rows.filter(r => r.tradeable).length;
+    document.getElementById('weatherInfo').textContent =
+      `${rows.length} signals · ${tradeable_count} tradeable (both sources agree) · last scan ${fmt(rows[0].timestamp)}`;
+
+    body.innerHTML = rows.map(row => {
+      const edgePct = row.combined_edge_pct != null
+        ? `<span style="color:${Math.abs(row.combined_edge_pct)>=6?'var(--green)':'var(--text2)'};font-weight:${Math.abs(row.combined_edge_pct)>=6?'600':'400'}">${row.combined_edge_pct>0?'+':''}${row.combined_edge_pct.toFixed(1)}%</span>`
+        : '-';
+      const noaaStr = row.noaa_prob   != null ? `${(row.noaa_prob*100).toFixed(0)}% (${row.noaa_forecast_f}°)` : '<span style="color:var(--text2)">—</span>';
+      const omStr   = row.om_prob     != null ? `${(row.om_prob*100).toFixed(0)}% (${row.om_forecast_f}°)` : '<span style="color:var(--text2)">—</span>';
+      const combStr = row.combined_prob != null ? `${(row.combined_prob*100).toFixed(0)}%` : '-';
+      let sourcesPill;
+      if (row.tradeable) {
+        sourcesPill = '<span class="pill confirmed">&#10003; Both agree</span>';
+      } else if (row.sources_available === 1) {
+        sourcesPill = '<span class="pill single">1 source</span>';
+      } else {
+        sourcesPill = '<span class="pill partial">Disagree</span>';
+      }
+      const action = row.action
+        ? `<span class="badge ${row.action==='BUY_YES'?'yes':'no'}">${row.action}</span>`
+        : '-';
+      let tradeBtn;
+      if (row.open_trade_id) {
+        tradeBtn = '<span style="color:var(--green);font-size:11px;font-weight:600">● open</span>';
+      } else if (row.status === 'traded') {
+        tradeBtn = '<span style="color:var(--text2);font-size:11px">closed</span>';
+      } else if (row.tradeable) {
+        tradeBtn = `<button class="btn sm sky" onclick="openWeatherTrade(${row.id}, this)" style="margin-left:6px">Trade</button>`;
+      } else {
+        tradeBtn = '';
+      }
+      return `<tr>
+        <td>${fmt(row.timestamp)}</td>
+        <td style="text-transform:capitalize">${esc(row.city||'')}</td>
+        <td>${esc(row.target_date||'')}</td>
+        <td style="color:${row.direction==='above'?'var(--amber)':'var(--sky)'}">${esc(row.direction||'')}</td>
+        <td style="font-weight:600">${row.threshold_f != null ? row.threshold_f + '°F' : '-'}</td>
+        <td>${row.market_price != null ? (row.market_price*100).toFixed(0)+'%' : '-'}</td>
+        <td>${noaaStr}</td>
+        <td>${omStr}</td>
+        <td style="font-weight:600">${combStr}</td>
+        <td>${edgePct}</td>
+        <td>${sourcesPill}</td>
+        <td>${action}${tradeBtn}</td>
+      </tr>`;
+    }).join('');
+  } catch(e) { console.error('Weather error:', e); }
+}
+
+// ── Trades ─────────────────────────────────────────────────────────────────
+
+async function loadTrades() {
+  try {
+    const r = await fetch(API + '/api/trades?status=open');
+    const trades = await r.json();
+    const body = document.getElementById('tradesBody');
+    if (!trades.length) {
+      body.innerHTML = '<tr><td colspan="8" class="empty"><div class="icon">◻</div>No open trades.</td></tr>';
+      return;
+    }
+    body.innerHTML = trades.map(t => {
+      if (t.trade_type === 'copy') {
+        const actionBadge = `<span class="badge ${t.side_a==='BUY_YES'?'yes':'no'}">${t.copy_outcome||t.side_a}</span>`;
+        return `<tr>
+          <td>${fmt(t.opened_at)}</td>
+          <td><span class="pill" style="background:var(--purple);color:#fff">copy</span></td>
+          <td class="event-name" title="${esc(t.copy_label)}">${esc(t.copy_label||'')}</td>
+          <td>${actionBadge}</td>
+          <td>${fmtPct(t.entry_price_a)}</td>
+          <td style="color:var(--text2);font-size:12px">${esc(t.event||'')}</td>
+          <td>${fmtUsd(t.size_usd)}</td>
+          <td><button class="btn sm" onclick="closeTrade(${t.id})">Close</button></td>
+        </tr>`;
+      }
+      if (t.trade_type === 'weather') {
+        const actionBadge = `<span class="badge ${t.side_a==='BUY_YES'?'yes':'no'}">${t.side_a}</span>`;
+        const detail = [t.city, t.direction, t.threshold_f ? t.threshold_f+'°F' : ''].filter(Boolean).join(' ');
+        return `<tr>
+          <td>${fmt(t.opened_at)}</td>
+          <td><span class="pill single">weather</span></td>
+          <td class="event-name" title="${esc(t.event)}">${esc(t.event)}</td>
+          <td>${actionBadge}</td>
+          <td>${fmtPct(t.entry_price_a)}</td>
+          <td style="color:var(--text2);font-size:12px">${esc(detail)}</td>
+          <td>${fmtUsd(t.size_usd)}</td>
+          <td><button class="btn sm" onclick="closeTrade(${t.id})">Close</button></td>
+        </tr>`;
+      }
+      return `<tr>
+        <td>${fmt(t.opened_at)}</td>
+        <td><span class="pill confirmed">pairs</span></td>
+        <td class="event-name" title="${esc(t.event)}">${esc(t.event)}</td>
+        <td><span class="badge ${t.side_a==='BUY'?'yes':'no'}">${t.side_a} / <span class="${t.side_b==='BUY'?'yes':'no'}">${t.side_b}</span></span></td>
+        <td>${fmtPct(t.entry_price_a)}</td>
+        <td>${fmtPct(t.entry_price_b)}</td>
+        <td>${fmtUsd(t.size_usd)}</td>
+        <td><button class="btn sm" onclick="closeTrade(${t.id})">Close</button></td>
+      </tr>`;
+    }).join('');
+  } catch(e) { console.error('loadTrades error:', e); }
+}
+
+async function loadHistory() {
+  try {
+    const r = await fetch(API + '/api/trades?status=closed');
+    const trades = await r.json();
+    const body = document.getElementById('historyBody');
+    if (!trades.length) {
+      body.innerHTML = '<tr><td colspan="7" class="empty"><div class="icon">◻</div>No closed trades yet.</td></tr>';
+      return;
+    }
+    body.innerHTML = trades.map(t => `<tr>
+      <td>${fmt(t.opened_at)}</td>
+      <td>${fmt(t.closed_at)}</td>
+      <td class="event-name" title="${esc(t.event)}">${esc(t.event)}</td>
+      <td>${fmtPct(t.entry_price_a)} / ${fmtPct(t.entry_price_b)}</td>
+      <td>${t.exit_price_a ? fmtPct(t.exit_price_a) + ' / ' + fmtPct(t.exit_price_b) : '-'}</td>
+      <td class="${t.pnl>=0?'pnl-pos':'pnl-neg'}">${fmtUsd(t.pnl)}</td>
+      <td>${esc(t.notes||'')}</td>
+    </tr>`).join('');
+  } catch(e) {}
+}
+
+async function loadScans() {
+  try {
+    const r = await fetch(API + '/api/scan-runs');
+    const runs = await r.json();
+    const body = document.getElementById('scansBody');
+    if (!runs.length) {
+      body.innerHTML = '<tr><td colspan="3" class="empty">No scans yet.</td></tr>';
+      return;
+    }
+    body.innerHTML = runs.map(r => `<tr>
+      <td>${fmt(r.timestamp)}</td>
+      <td>${r.opportunities}</td>
+      <td>${r.duration_secs.toFixed(1)}s</td>
+    </tr>`).join('');
+  } catch(e) {}
+}
+
+// ── Console ────────────────────────────────────────────────────────────────
+
+let _consoleFilter = '';
+let _lastLogLine = '';
+
+function colorLine(line) {
+  const e = esc(line);
+  if (line.includes('ERROR'))   return `<span style="color:var(--red)">${e}</span>`;
+  if (line.includes('PAPER FILL') || line.includes('LIVE FILL')) return `<span style="color:var(--green);font-weight:bold">${e}</span>`;
+  if (line.includes('scanner.weather') || line.includes('Weather scan') || line.includes('Open-Meteo')) return `<span style="color:var(--sky)">${e}</span>`;
+  if (line.includes('scanner.locked') || line.includes('Locked scan') || line.includes('locked_arb')) return `<span style="color:var(--teal)">${e}</span>`;
+  if (line.includes('Brain') || line.includes('brain')) return `<span style="color:var(--purple)">${e}</span>`;
+  if (line.includes('WARNING'))  return `<span style="color:var(--amber)">${e}</span>`;
+  if (line.includes('Scan complete') || line.includes('scan:') || line.includes('Autonomy')) return `<span style="color:var(--blue)">${e}</span>`;
+  return `<span style="color:var(--text2)">${e}</span>`;
+}
+
+function setConsoleFilter(f) { _consoleFilter = f; _lastLogLine = ''; refreshConsole(); }
+function clearConsoleFilter() { _consoleFilter = ''; _lastLogLine = ''; refreshConsole(); }
+
+async function refreshConsole() {
+  try {
+    const r = await fetch(API + '/api/logs?lines=300');
+    const data = await r.json();
+    let lines = data.lines || [];
+    if (_consoleFilter) lines = lines.filter(l => l.toLowerCase().includes(_consoleFilter.toLowerCase()));
+    // Only re-render if content actually changed
+    const lastLine = lines[lines.length - 1] || '';
+    if (lastLine === _lastLogLine && document.getElementById('consoleOutput').innerHTML !== '') return;
+    _lastLogLine = lastLine;
+    const out = document.getElementById('consoleOutput');
+    // Only render if panel is visible (avoid hidden DOM work)
+    if (document.getElementById('panel-console').style.display === 'none') return;
+    out.innerHTML = lines.map(colorLine).join('<br>');
+    if (document.getElementById('consoleAutoScroll').checked) {
+      out.scrollTop = out.scrollHeight;
+    }
+  } catch(e) {}
+}
+
+// Console always polls every 3s regardless of active tab
+setInterval(refreshConsole, 3000);
+
+// ── Scan Actions ───────────────────────────────────────────────────────────
+
+async function _scan(btnId, label, endpoint, onDone) {
+  const btn = document.getElementById(btnId);
+  btn.disabled = true;
+  btn.innerHTML = `<span class="spinner"></span>${label}...`;
+  try {
+    const r = await fetch(API + endpoint, { method: 'POST' });
+    const data = await r.json();
+    onDone(data);
+    document.getElementById('lastScan').textContent = 'Last scan: just now';
+  } catch(e) {
+    toast('Scan failed: ' + e.message);
+  }
+  btn.disabled = false;
+  btn.innerHTML = label;
+}
+
+function runScan() {
+  _scan('scanBtn', 'Coint Scan', '/api/scan', data => {
+    toast(`Scan: ${data.opportunities} opps in ${data.duration_secs}s`);
+    loadStats(); loadSignals();
+  });
+}
+
+function runFastScan() {
+  _scan('fastScanBtn', 'Fast Scan', '/api/scan/fast', data => {
+    toast(`Fast scan: ${data.opportunities} opps in ${data.duration_secs}s`);
+    loadStats(); loadSignals();
+  });
+}
+
+function runLockedScan() {
+  _scan('lockedScanBtn', 'Locked Arb', '/api/scan/locked', data => {
+    toast(`Locked arb: ${data.opportunities} opps (${data.tradeable} tradeable) in ${data.duration_secs}s`);
+    loadLocked();
+    document.getElementById('statLocked').textContent = data.opportunities;
+  });
+}
+
+function runWeatherScan() {
+  _scan('weatherScanBtn', 'Weather', '/api/scan/weather', data => {
+    const mkt = data.markets_checked ? ` · scanned ${data.markets_checked.toLocaleString()} markets` : '';
+    const found = data.weather_found != null ? `, ${data.weather_found} matched parser` : '';
+    toast(`Weather: ${data.opportunities} signals (${data.tradeable} tradeable) in ${data.duration_secs}s${mkt}${found}`);
+    loadWeather();
+    document.getElementById('statWeather').textContent = data.opportunities;
+  });
+}
+
+async function openWeatherTrade(signalId, btn) {
+  btn.disabled = true;
+  btn.textContent = '…';
+  try {
+    const r = await fetch(API + `/api/weather/${signalId}/trade`, {method: 'POST'});
+    const data = await r.json();
+    if (r.ok) {
+      toast(`Weather trade #${data.trade_id} opened`);
+      btn.textContent = 'traded';
+      btn.disabled = true;
+      btn.style.opacity = '0.5';
+    } else {
+      toast(`Error: ${data.detail || JSON.stringify(data)}`, true);
+      btn.disabled = false;
+      btn.textContent = 'Trade';
+    }
+  } catch(e) {
+    toast(`Error: ${e}`, true);
+    btn.disabled = false;
+    btn.textContent = 'Trade';
+  }
+}
+
+async function runAutoTrade() {
+  const btn = document.getElementById('autoTradeBtn');
+  btn.disabled = true;
+  btn.innerHTML = '<span class="spinner"></span>Running...';
+  try {
+    const r = await fetch(API + '/api/autonomy', { method: 'POST' });
+    const data = await r.json();
+    if (!data.ok) {
+      toast('Auto trade: ' + data.error);
+      btn.disabled = false; btn.innerHTML = 'Auto Trade'; return;
+    }
+    toast('Cycle started — watch Console tab...');
+    const poll = setInterval(async () => {
+      try {
+        const sr = await fetch(API + '/api/autonomy/status');
+        const status = await sr.json();
+        if (!status.running) {
+          clearInterval(poll);
+          btn.disabled = false; btn.innerHTML = 'Auto Trade';
+          const res = status.last_result;
+          if (res && res.ok)
+            toast(`Done: ${res.signals_found} signals, ${res.trades_opened} opened, ${res.trades_closed} closed (${res.duration_secs}s)`);
+          loadStats(); loadSignals(); loadTrades(); loadWeather();
+        }
+      } catch(e) { clearInterval(poll); btn.disabled = false; btn.innerHTML = 'Auto Trade'; }
+    }, 5000);
+  } catch(e) {
+    toast('Auto trade error: ' + e.message);
+    btn.disabled = false; btn.innerHTML = 'Auto Trade';
+  }
+}
+
+async function brainValidate(signalId) {
+  toast('Asking Claude...');
+  try {
+    const r = await fetch(API + `/api/brain/validate/${signalId}`, { method: 'POST' });
+    const data = await r.json();
+    toast(`Brain: ${data.should_trade ? 'TRADE' : 'SKIP'} — ${data.reasoning}`);
+  } catch(e) { toast('Brain error: ' + e.message); }
+}
+
+async function paperTrade(signalId) {
+  const size = prompt('Paper trade size (USD):', '100');
+  if (!size) return;
+  try {
+    const r = await fetch(API + `/api/trades?signal_id=${signalId}&size_usd=${size}`, { method: 'POST' });
+    const data = await r.json();
+    toast(`Paper trade opened (ID: ${data.trade_id})`);
+    loadSignals(); loadStats();
+  } catch(e) { toast('Failed: ' + e.message); }
+}
+
+async function closeTrade(tradeId) {
+  const exitA = prompt('Exit price A (0–1):'); if (!exitA) return;
+  const exitB = prompt('Exit price B (0–1):'); if (!exitB) return;
+  const notes = prompt('Notes (optional):', '') || '';
+  try {
+    const r = await fetch(API + `/api/trades/${tradeId}/close?exit_price_a=${exitA}&exit_price_b=${exitB}&notes=${encodeURIComponent(notes)}`, { method: 'POST' });
+    const data = await r.json();
+    toast(`Trade closed. P&L: ${fmtUsd(data.pnl)}`);
+    loadTrades(); loadStats();
+  } catch(e) { toast('Failed: ' + e.message); }
+}
+
+// ── Copy Trader ─────────────────────────────────────────────────────────────
+
+function fmtM(v) {
+  if (!v) return '$0';
+  if (Math.abs(v) >= 1e6) return '$' + (v/1e6).toFixed(2) + 'M';
+  if (Math.abs(v) >= 1e3) return '$' + (v/1e3).toFixed(1) + 'K';
+  return '$' + v.toFixed(2);
+}
+
+function aiVerdictBadge(verdict) {
+  if (!verdict) return '';
+  const cfg = {
+    copy:    { bg: 'var(--green)',  text: '#000', label: '✓ Claude: Copy' },
+    caution: { bg: 'var(--amber)',  text: '#000', label: '⚠ Claude: Caution' },
+    skip:    { bg: 'var(--red)',    text: '#fff', label: '✗ Claude: Skip' },
+  }[verdict] || { bg: 'var(--text2)', text: '#fff', label: verdict };
+  return `<span style="background:${cfg.bg};color:${cfg.text};border-radius:4px;padding:2px 7px;font-size:10px;font-weight:700">${cfg.label}</span>`;
+}
+
+function walletScoreCard(w, showRemove) {
+  const cls = w.classification || 'unknown';
+  const col = cls === 'informed' ? 'var(--green)' : cls === 'neutral' ? 'var(--amber)' : 'var(--text2)';
+  const b = w.score_breakdown || w.breakdown || {};
+  const isDropped = w.active === 0;
+  const willCopy = w.will_copy == 1 || w.will_copy === true;
+  const removeBtn = showRemove
+    ? `<button class="btn sm" style="margin-top:6px;font-size:10px;padding:2px 7px;background:var(--red);color:#fff"
+         onclick="removeWallet('${esc(w.address)}', this)">Remove</button>` : '';
+  const droppedBadge = isDropped
+    ? `<div style="color:var(--red);font-size:10px;font-weight:700;margin-top:4px">AUTO-DROPPED: ${esc(w.auto_drop_reason||'')}</div>` : '';
+  const openTrades = w.open_copy_trades || 0;
+  return `<div style="background:var(--surface);border:1px solid ${isDropped ? 'var(--red)' : 'var(--border)'};border-radius:8px;padding:10px 14px;min-width:200px;opacity:${isDropped ? '0.65' : '1'}">
+    <div style="display:flex;justify-content:space-between;align-items:flex-start">
+      <div style="font-weight:600;font-size:13px">${esc(w.label)}</div>
+      ${aiVerdictBadge(w.ai_verdict)}
+    </div>
+    <div style="color:${col};font-size:12px;margin:3px 0">${cls.toUpperCase()} · ${(w.score||0).toFixed(0)}/100</div>
+    <div style="color:var(--text2);font-size:11px">${willCopy ? '✓ auto-copy' : '✗ no auto-copy'} · ${openTrades} open trades</div>
+    <div style="color:var(--text2);font-size:11px;margin-top:4px">${b.trade_count||'?'} trades · avg ${fmtM(b.avg_size_usd||0)}</div>
+    <div style="color:var(--text2);font-size:11px">${b.top_category||'?'} (${b.top_cat_pct||0}%)</div>
+    ${w.ai_reasoning ? `<div style="color:var(--text2);font-size:10px;margin-top:5px;font-style:italic">${esc(w.ai_reasoning)}</div>` : ''}
+    ${droppedBadge}
+    ${removeBtn}
+  </div>`;
+}
+
+async function loadCopyScores() {
+  try {
+    const [monR, wlR] = await Promise.all([
+      fetch(API + '/api/copy/monitor'),
+      fetch(API + '/api/copy/watchlist'),
+    ]);
+    const mon = await monR.json();
+    const watchlist = await wlR.json();
+
+    const lastPoll = mon.last_poll ? fmt(mon.last_poll) : 'never';
+    document.getElementById('copyInfo').textContent =
+      `Monitor: ${mon.running ? '● live' : '○ stopped'} · last poll ${lastPoll} · ${mon.polls_run||0} polls · ${mon.new_trades_found||0} auto-opened`;
+
+    const scoresEl = document.getElementById('copyScores');
+    scoresEl.innerHTML = watchlist.map(w => walletScoreCard(w, true)).join('');
+  } catch(e) { console.error('loadCopyScores:', e); }
+}
+
+async function scoreWallet() {
+  const addr = document.getElementById('discoverAddr').value.trim();
+  const label = document.getElementById('discoverLabel').value.trim();
+  if (!addr) { toast('Enter a wallet address', true); return; }
+  const resultEl = document.getElementById('discoverResult');
+  resultEl.innerHTML = '<span style="color:var(--text2);font-size:13px">Scoring wallet… (may take 10-20s)</span>';
+  try {
+    const r = await fetch(API + `/api/copy/score?address=${encodeURIComponent(addr)}&label=${encodeURIComponent(label||addr.slice(0,16)+'...')}`, {method:'POST'});
+    const d = await r.json();
+    if (!r.ok) { resultEl.innerHTML = `<span style="color:var(--red)">${esc(d.detail||'Error')}</span>`; return; }
+
+    const cls = d.classification || 'unknown';
+    const col = cls === 'informed' ? 'var(--green)' : cls === 'neutral' ? 'var(--amber)' : 'var(--text2)';
+    const ai = d.ai || {};
+    const b = d.breakdown || {};
+    const willCopy = d.will_copy;
+
+    resultEl.innerHTML = `
+      <div style="background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:14px;margin-top:8px">
+        <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:8px">
+          <div>
+            <span style="font-weight:700;font-size:14px">${esc(d.label)}</span>
+            <span style="color:var(--text2);font-size:11px;margin-left:8px">${esc(d.address.slice(0,18))}...</span>
+          </div>
+          ${aiVerdictBadge(ai.verdict)}
+        </div>
+        <div style="color:${col};font-weight:700;margin-bottom:6px">${cls.toUpperCase()} · ${(d.score||0).toFixed(1)}/100</div>
+        <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:6px;font-size:12px;margin-bottom:8px">
+          <div><span style="color:var(--text2)">Trades</span> ${b.trade_count||'?'}</div>
+          <div><span style="color:var(--text2)">Avg size</span> ${fmtM(b.avg_size_usd||0)}</div>
+          <div><span style="color:var(--text2)">Volume</span> ${fmtM(b.total_volume_usd||0)}</div>
+          <div><span style="color:var(--text2)">Category</span> ${b.top_category||'?'}</div>
+          <div><span style="color:var(--text2)">Unrealised</span> ${fmtM(b.unrealised_pnl||0)}</div>
+          <div><span style="color:var(--text2)">Auto-copy</span> ${willCopy ? '<span style="color:var(--green)">Yes</span>' : '<span style="color:var(--red)">No</span>'}</div>
+        </div>
+        ${ai.reasoning ? `<div style="color:var(--text2);font-size:12px;font-style:italic;margin-bottom:8px">${esc(ai.reasoning)}</div>` : ''}
+        ${(ai.risk_flags||[]).length ? `<div style="color:var(--amber);font-size:11px;margin-bottom:8px">⚠ ${(ai.risk_flags||[]).join(' · ')}</div>` : ''}
+        <button class="btn sm" style="background:var(--green);color:#000"
+          onclick="addToWatchlist('${esc(d.address)}','${esc(d.label)}','${esc(ai.verdict||'')}','${esc(ai.reasoning||'')}',this)">
+          + Add to Watch List
+        </button>
+      </div>`;
+  } catch(e) { resultEl.innerHTML = `<span style="color:var(--red)">Error: ${esc(e.message)}</span>`; }
+}
+
+async function addToWatchlist(address, label, verdict, reasoning, btn) {
+  if (btn) { btn.disabled = true; btn.textContent = '…'; }
+  try {
+    const params = new URLSearchParams({address, label});
+    if (verdict) params.set('ai_verdict', verdict);
+    if (reasoning) params.set('ai_reasoning', reasoning);
+    const r = await fetch(API + '/api/copy/watch?' + params.toString(), {method:'POST'});
+    const d = await r.json();
+    if (d.ok) {
+      toast(`Added ${label} to watch list`);
+      if (btn) { btn.textContent = '✓ Watching'; btn.style.background = 'var(--purple)'; }
+      loadCopyScores();
+    } else {
+      toast(d.error || 'Failed', true);
+      if (btn) { btn.disabled = false; btn.textContent = '+ Add to Watch List'; }
+    }
+  } catch(e) { toast('Error: ' + e, true); if (btn) { btn.disabled = false; } }
+}
+
+async function removeWallet(address, btn) {
+  if (!confirm('Remove this wallet and close its copy trades?')) return;
+  btn.disabled = true;
+  try {
+    const r = await fetch(API + `/api/copy/watch/${encodeURIComponent(address)}`, {method:'DELETE'});
+    const d = await r.json();
+    toast(`Removed wallet · ${d.trades_closed} trades closed`);
+    loadCopyScores(); loadTrades(); loadStats();
+  } catch(e) { toast('Error: ' + e, true); btn.disabled = false; }
+}
+
+async function runDiscovery(btn) {
+  btn.disabled = true; btn.textContent = 'Running…';
+  document.getElementById('discoveryStatus').textContent = 'Discovery running (may take 2-3 min)…';
+  try {
+    const r = await fetch(API + '/api/copy/discover?auto_add=true', {method:'POST'});
+    const d = await r.json();
+    if (!d.ok) { toast(d.error || 'Discovery failed', true); }
+    else { toast('Discovery started — results will appear below'); }
+    // Poll for completion
+    let polls = 0;
+    const timer = setInterval(async () => {
+      polls++;
+      const sr = await fetch(API + '/api/copy/discover/status');
+      const sd = await sr.json();
+      if (!sd.running) {
+        clearInterval(timer);
+        btn.disabled = false; btn.textContent = 'Run Discovery';
+        const res = sd.last_result || {};
+        document.getElementById('discoveryStatus').textContent =
+          res.ok ? `Done — ${res.traders_found||0} traders found · ${res.candidates_pending||0} pending · ${res.auto_added||0} auto-added · ${res.candidates_dismissed||0} dismissed (${res.duration_secs||0}s)` : (res.error || 'Done');
+        loadCopyScores();
+        loadCandidates();
+      } else if (polls > 60) {
+        clearInterval(timer);
+        btn.disabled = false; btn.textContent = 'Run Discovery';
+      }
+    }, 3000);
+  } catch(e) { toast('Error: ' + e, true); btn.disabled = false; btn.textContent = 'Run Discovery'; }
+}
+
+function candidateCard(c, isPending) {
+  const cls = c.classification || 'unknown';
+  const col = cls === 'informed' ? 'var(--green)' : cls === 'neutral' ? 'var(--amber)' : 'var(--text2)';
+  const b = c.score_breakdown || {};
+  const mkts = (c.source_markets || []).slice(0,2).join(', ');
+  const opacity = isPending ? '' : 'opacity:0.55;';
+  return `<div style="background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:10px 14px;min-width:210px;max-width:280px;${opacity}">
+    <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:4px">
+      <span style="font-weight:600;font-size:13px">${esc(c.label||c.address.slice(0,14)+'...')}</span>
+      ${aiVerdictBadge(c.ai_verdict)}
+    </div>
+    <div style="color:${col};font-size:12px;margin-bottom:4px">${cls.toUpperCase()} · ${(c.score||0).toFixed(0)}/100</div>
+    <div style="color:var(--text2);font-size:11px">${b.trade_count||'?'} trades · avg ${fmtM(b.avg_size_usd||0)}</div>
+    <div style="color:var(--text2);font-size:11px">${b.top_category||'?'}</div>
+    ${c.ai_reasoning ? `<div style="color:var(--text2);font-size:10px;margin-top:4px;font-style:italic">${esc(c.ai_reasoning)}</div>` : ''}
+    ${mkts ? `<div style="color:var(--text2);font-size:10px;margin-top:3px">Seen in: ${esc(mkts)}</div>` : ''}
+    ${isPending ? `<div style="display:flex;gap:6px;margin-top:8px">
+      <button class="btn sm" style="background:var(--green);color:#000;flex:1"
+        onclick="addCandidate(${c.id}, this)">+ Watch</button>
+      <button class="btn sm" style="background:var(--surface);border:1px solid var(--border);flex:1"
+        onclick="dismissCandidate(${c.id}, this)">Dismiss</button>
+    </div>` : ''}
+  </div>`;
+}
+
+async function loadCandidates() {
+  try {
+    const [rp, rd] = await Promise.all([
+      fetch(API + '/api/copy/candidates?status=pending'),
+      fetch(API + '/api/copy/candidates?status=dismissed'),
+    ]);
+    const pending   = await rp.json();
+    const dismissed = await rd.json();
+    const el = document.getElementById('candidatesPanel');
+    let html = '';
+
+    if (pending.length) {
+      html += `<div style="width:100%;color:var(--text2);font-size:11px;font-weight:600;letter-spacing:.05em;margin-bottom:6px">PENDING REVIEW</div>`;
+      html += pending.map(c => candidateCard(c, true)).join('');
+    }
+
+    if (dismissed.length) {
+      const recent = dismissed.slice(0, 10);
+      html += `<details style="width:100%;margin-top:${pending.length ? 14 : 0}px">
+        <summary style="color:var(--text2);font-size:11px;font-weight:600;letter-spacing:.05em;cursor:pointer;list-style:none;display:flex;align-items:center;gap:6px">
+          <span>▶</span> DISMISSED (${dismissed.length}) — scored but below threshold
+        </summary>
+        <div style="display:flex;gap:10px;flex-wrap:wrap;margin-top:8px">
+          ${recent.map(c => candidateCard(c, false)).join('')}
+        </div>
+      </details>`;
+    }
+
+    if (!html) {
+      el.innerHTML = '<span style="color:var(--text2);font-size:12px">No candidates yet — run discovery or wait for next autonomy cycle (every 6h).</span>';
+    } else {
+      el.innerHTML = html;
+    }
+  } catch(e) { console.error('loadCandidates:', e); }
+}
+
+async function addCandidate(id, btn) {
+  btn.disabled = true; btn.textContent = '…';
+  try {
+    const r = await fetch(API + `/api/copy/candidates/${id}/add`, {method:'POST'});
+    const d = await r.json();
+    if (d.ok) { toast(`Added ${d.label} to watch list`); loadCopyScores(); loadCandidates(); }
+    else { toast(d.detail || 'Failed', true); btn.disabled = false; btn.textContent = '+ Watch'; }
+  } catch(e) { toast('Error: ' + e, true); btn.disabled = false; }
+}
+
+async function dismissCandidate(id, btn) {
+  btn.disabled = true;
+  try {
+    await fetch(API + `/api/copy/candidates/${id}/dismiss`, {method:'POST'});
+    btn.closest('div[style]').remove();
+  } catch(e) { toast('Error: ' + e, true); btn.disabled = false; }
+}
+
+async function loadCopy() {
+  document.getElementById('copyInfo').textContent = 'Fetching wallet positions...';
+  loadCopyScores();
+  try {
+    const r = await fetch(API + '/api/copy/positions');
+    const wallets = await r.json();
+    const body = document.getElementById('copyBody');
+    let totalPositions = 0;
+
+    body.innerHTML = wallets.map(w => {
+      const positions = w.positions || [];
+      totalPositions += positions.length;
+      const rows = positions
+        .sort((a, b) => (b.currentValue || 0) - (a.currentValue || 0))
+        .map(p => {
+          const pnl = p.cashPnl || 0;
+          const pnlStr = (pnl >= 0 ? '+' : '') + fmtM(pnl);
+          const pnlCol = pnl >= 0 ? 'var(--green)' : 'var(--red)';
+          const mirrorBtn = p.mirrored
+            ? `<span style="color:var(--green);font-size:11px;font-weight:600">✓ Mirrored</span>`
+            : `<button class="btn sm sky" onclick="mirrorTrade('${w.address}','${esc(p.conditionId||'')}',this)">Mirror $20</button>`;
+          return `<tr>
+            <td style="text-transform:capitalize">${esc(p.outcome||'')}</td>
+            <td>${fmtM(p.currentValue)}</td>
+            <td>@${(p.curPrice||0).toFixed(3)}</td>
+            <td style="color:var(--text2);font-size:11px">avg @${(p.avgPrice||0).toFixed(3)}</td>
+            <td style="color:${pnlCol};font-weight:600">${pnlStr}</td>
+            <td class="event-name" title="${esc(p.title)}">${esc(p.title||'')}</td>
+            <td>${p.endDate ? esc(p.endDate.slice(0,10)) : '-'}</td>
+            <td>${mirrorBtn}</td>
+          </tr>`;
+        }).join('');
+
+      return `
+        <div style="margin-bottom:24px">
+          <div style="display:flex;gap:16px;align-items:baseline;margin-bottom:8px">
+            <span style="font-weight:600;font-size:14px">${esc(w.label)}</span>
+            <span style="color:var(--text2);font-size:12px">${w.address.slice(0,10)}...${w.address.slice(-6)}</span>
+            <span style="color:var(--sky);font-size:12px">${fmtM(w.portfolio_usd)} portfolio</span>
+            <span style="color:var(--text2);font-size:12px">${positions.length} positions</span>
+          </div>
+          ${positions.length ? `<table><thead><tr>
+            <th>Outcome</th><th>Value</th><th>Price</th><th>Avg</th><th>P&L</th><th>Market</th><th>Ends</th><th>Action</th>
+          </tr></thead><tbody>${rows}</tbody></table>` : '<p style="color:var(--text2);font-size:13px;padding:8px 0">No open positions</p>'}
+        </div>`;
+    }).join('');
+
+    document.getElementById('cntCopy').textContent = totalPositions;
+    document.getElementById('copyInfo').textContent =
+      `${wallets.length} wallets · ${totalPositions} open positions · updated ${new Date().toLocaleTimeString('en-GB')}`;
+  } catch(e) { console.error('loadCopy error:', e); document.getElementById('copyInfo').textContent = 'Error loading wallets'; }
+}
+
+async function mirrorTrade(wallet, conditionId, btn) {
+  btn.disabled = true; btn.textContent = '…';
+  try {
+    const r = await fetch(API + `/api/copy/mirror?wallet=${encodeURIComponent(wallet)}&condition_id=${encodeURIComponent(conditionId)}&size_usd=20`, {method:'POST'});
+    const data = await r.json();
+    if (r.ok && data.ok) {
+      btn.textContent = '✓ Mirrored';
+      btn.style.background = 'var(--green)'; btn.style.color = '#000';
+      toast(`Mirror trade #${data.trade_id}: ${data.outcome} on ${(data.market||'').slice(0,40)}`);
+      loadTrades(); loadStats();
+    } else {
+      toast(data.error || 'Mirror failed', true);
+      btn.disabled = false; btn.textContent = 'Mirror $20';
+    }
+  } catch(e) { toast('Error: ' + e, true); btn.disabled = false; btn.textContent = 'Mirror $20'; }
+}
+
+// ── Init ───────────────────────────────────────────────────────────────────
+
+loadStats();
+loadSignals();
+setInterval(loadStats, 60000);
+setInterval(loadTrades, 60000);
+setInterval(() => { if (document.querySelector('.tab[data-tab="copy"]')?.classList.contains('active')) loadCopy(); }, 120000);
+</script>
+</body>
+</html>

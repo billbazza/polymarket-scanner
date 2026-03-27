@@ -1,0 +1,9 @@
+scanner.db
+.env
+logs/
+__pycache__/
+*.pyc
+*.pyo
+.DS_Store
+wallet_state.json
+logs/wallet_state.json

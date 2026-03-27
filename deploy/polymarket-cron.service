@@ -1,0 +1,11 @@
+[Unit]
+Description=Polymarket Scanner Cron Scan
+After=network.target
+
+[Service]
+Type=oneshot
+User=scanner
+WorkingDirectory=/opt/polymarket-scanner
+ExecStart=/usr/bin/python3 cron_scan.py
+Environment=PYTHONUNBUFFERED=1
+EnvironmentFile=/opt/polymarket-scanner/.env

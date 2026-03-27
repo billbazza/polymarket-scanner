@@ -1,0 +1,16 @@
+[Unit]
+Description=Polymarket Scanner API Server
+After=network.target
+
+[Service]
+Type=simple
+User=scanner
+WorkingDirectory=/opt/polymarket-scanner
+ExecStart=/usr/bin/python3 server.py
+Restart=always
+RestartSec=10
+Environment=PYTHONUNBUFFERED=1
+EnvironmentFile=/opt/polymarket-scanner/.env
+
+[Install]
+WantedBy=multi-user.target

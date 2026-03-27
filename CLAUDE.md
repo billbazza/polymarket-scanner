@@ -1,0 +1,137 @@
+# Polymarket Scanner — Claude Code Contract
+
+## What This Is
+Multi-strategy scanner for Polymarket prediction markets. Three live strategies:
+1. **Cointegration pairs** — finds diverged spreads between correlated markets, trades mean-reversion
+2. **Weather edge** — compares NOAA + Open-Meteo forecasts vs market prices on temperature bucket markets (seasonal — markets appear in summer/autumn)
+3. **Locked arb** — flags markets where YES+NO < $1 (alerting only; needs near-atomic fills to exploit)
+
+Scores opportunities through math filters (EV, Kelly, slippage), optionally validates with Claude AI, and supports paper + live trading.
+
+## Architecture
+
+```
+Entry points:  server.py (:8899)  |  scan.py (CLI)  |  autonomy.py (30-min launchd loop)
+                    |                    |                     |
+Scanners:      scanner.py / async_scanner.py (cointegration pairs)
+               weather_scanner.py (NOAA+Open-Meteo vs market price)
+               locked_scanner.py (YES+NO < $1 arb detection)
+                    |
+Math:          math_engine.py (EV, Kelly, slippage, scoring)
+                    |
+AI:            brain.py (Claude probability estimation) → bayes.py (updating)
+                    |
+Execution:     execution.py (paper/live trading) → blockchain.py (web3/Polygon)
+                    |
+Persistence:   db.py (SQLite) → scanner.db
+               Tables: signals, trades, snapshots, scan_runs, weather_signals, locked_arb
+                    |
+Monitoring:    log_setup.py → logs/scanner.log + logs/journal.jsonl (trade audit trail)
+```
+
+### Trade Types
+- **pairs** (two-leg): `entry_price_a/b`, `side_a/b`, linked to `signals` table. Auto-closes when |z| < 0.5 or price resolves.
+- **weather** (single-leg): `entry_price_a` only, `token_id_a` stored on trade. Auto-closes when price ≥ 0.99 (WIN) or ≤ 0.01 (LOSS). `signal_id=NULL`, `weather_signal_id` foreign key instead.
+
+### Autonomy Loop (every 30 min via launchd)
+`autonomy.py` levels: `scout` (scan only) → `paper` (auto paper-trade A+ signals) → `penny` (real $1-5) → `book` (Kelly-sized). Each cycle: scan pairs → scan weather → refresh open trades → auto-close reverted/resolved trades → open new trades up to `max_open`.
+
+## Key Conventions
+
+### Module Pattern
+Every module follows: docstring → imports → `log = logging.getLogger("scanner.<name>")` → functions. Entry points call `init_logging()` and `load_dotenv()`. Library modules do neither.
+
+### API Clients
+- `api.py` — synchronous (requests), used by scanner.py and cron_scan.py
+- `async_api.py` — async (httpx), used by async_scanner.py and server.py fast scan
+- Both have identical function signatures. Both retry on connection errors.
+
+### Scoring Pipeline
+Every opportunity flows: scanner finds pair → `math_engine.score_opportunity()` grades A+ to F → optionally `brain.validate_signal()` for Claude check → `execution.execute_trade()` if tradeable.
+
+### Trading Modes
+- **Paper** (default): simulates against current prices, tracks in SQLite
+- **Live**: requires `POLYMARKET_PRIVATE_KEY` in `.env`, uses py-clob-client
+
+### Database
+SQLite at `scanner.db`. Schema auto-migrates on import via `db.init_db()`. New columns added via ALTER TABLE with try/except. `get_trades()`/`get_trade()` use LEFT JOIN to both `signals` and `weather_signals` so both trade types are returned correctly.
+
+## Rules
+
+### Never Do
+- Hardcode API keys or private keys anywhere. Always use `.env` via python-dotenv.
+- Use `eval()` for JSON parsing. Always `json.loads()`.
+- Skip error recovery on API calls. Every external call needs try/except.
+- Commit `.env` or `scanner.db` to git.
+- Place real money trades without explicit user confirmation.
+- Use FOK (Fill or Kill) orders — use GTC (Good Till Cancelled) instead.
+
+### Always Do
+- Log every trading decision with timestamp (the log file is the audit trail).
+- Cap Kelly fraction at 0.25 (quarter-Kelly). Full Kelly is too aggressive.
+- Check slippage before any trade. Skip if >2%.
+- Check balance before any live trade.
+- Return structured dicts from functions (not bare values).
+- Degrade gracefully when optional services are unavailable (Claude API, web3, Telegram).
+
+### Testing Changes
+```bash
+# Verify all imports work
+python3 -c "import log_setup, math_engine, db, scanner, async_api, async_scanner, brain, bayes, returns, execution, blockchain; print('OK')"
+
+# Run a CLI scan
+python3 scan.py --top 3
+
+# Start server and check dashboard
+python3 server.py  # then visit http://localhost:8899
+
+# Check cron is working
+tail -f logs/cron.log
+
+# Run analysis report
+python3 analysis.py
+```
+
+### Common Operations
+```bash
+# Manual scan via API
+curl -X POST http://localhost:8899/api/scan
+
+# Fast (async) scan
+curl -X POST http://localhost:8899/api/scan/fast
+
+# Check signals
+curl http://localhost:8899/api/signals?limit=5
+
+# Brain-validate a signal
+curl -X POST http://localhost:8899/api/brain/validate/42
+
+# Open paper trade (pairs)
+curl -X POST "http://localhost:8899/api/trades?signal_id=42&size_usd=100"
+
+# Open paper trade (weather)
+curl -X POST "http://localhost:8899/api/weather/7/trade"
+
+# Weather scan
+curl -X POST http://localhost:8899/api/scan/weather
+
+# System stats
+curl http://localhost:8899/api/stats
+
+# Restart cron scanning
+launchctl unload ~/Library/LaunchAgents/com.polymarket.scanner.plist
+launchctl load ~/Library/LaunchAgents/com.polymarket.scanner.plist
+```
+
+## Situational Guides
+
+- When modifying the scoring pipeline → read `guides/scoring.md`
+- When adding new API endpoints → read `guides/api-patterns.md`
+- When debugging scan failures → check `logs/scanner.log` first, then `logs/cron.log`
+
+## Environment Variables
+All in `.env` (see `.env.example`):
+- `ANTHROPIC_API_KEY` — enables brain.py (Claude probability estimation)
+- `TELEGRAM_BOT_TOKEN` + `TELEGRAM_CHAT_ID` — enables Telegram alerts
+- `ALCHEMY_API_KEY` — enables blockchain.py (Polygon RPC)
+- `POLYMARKET_PRIVATE_KEY` — enables live trading (Tier 3)

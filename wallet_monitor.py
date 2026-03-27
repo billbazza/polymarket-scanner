@@ -1,0 +1,495 @@
+"""Wallet monitor — background service for copy trading.
+
+Two jobs:
+  1. SCORING: classify each watched wallet (informed / neutral / bot / skip)
+  2. POLLING: check positions every 2 min, open copy trades on new positions,
+              close copy trades when wallet exits
+
+WebSocket price feed: subscribes to markets where we have open copy trades
+and updates prices in near-real-time (separate async thread).
+
+Usage (standalone):
+    arch -arm64 python3 wallet_monitor.py
+
+Started automatically by server.py on startup.
+"""
+import asyncio
+import json
+import logging
+import math
+import threading
+import time
+from collections import defaultdict
+from pathlib import Path
+
+import requests
+
+import db
+from copy_scanner import WATCHED_WALLETS as _LEGACY_WALLETS, get_activity, get_positions, _categorise
+
+
+def _get_active_wallets() -> dict:
+    """Return {address: label} for all active watched wallets from DB."""
+    rows = db.get_watched_wallets(active_only=True)
+    return {r["address"]: r["label"] for r in rows}
+
+log = logging.getLogger("scanner.wallet_monitor")
+
+# ── Config ─────────────────────────────────────────────────────────────────────
+
+POLL_INTERVAL   = 120        # seconds between position checks
+SCORE_INTERVAL  = 3600       # rescore wallets every hour
+MIN_TRADES      = 50         # skip wallets with fewer trades
+BOT_TRADES_MONTH = 150       # above this = bot, skip
+MIN_AVG_SIZE    = 500        # minimum avg trade size USD to copy
+MIN_SCORE       = 60         # only auto-copy wallets scoring >= this
+COPY_SIZE_USD   = 20         # paper trade size per copy
+STATE_FILE      = Path(__file__).parent / "logs" / "wallet_state.json"
+
+WS_URI = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
+
+# ── Module-level state (shared between threads) ────────────────────────────────
+
+_status: dict = {
+    "running": False,
+    "last_poll": None,
+    "last_score": None,
+    "polls_run": 0,
+    "new_trades_found": 0,
+    "wallets": {},    # address → {score, classification, last_checked, ...}
+}
+
+_known_positions: dict = {}   # address → set of conditionIds seen last poll
+_ws_thread: threading.Thread | None = None
+_poll_thread: threading.Thread | None = None
+_stop_event = threading.Event()
+
+
+# ── Scoring ────────────────────────────────────────────────────────────────────
+
+def score_wallet(address: str, label: str, activity_limit: int = 500) -> dict:
+    """Score a wallet 0-100. Returns full scoring breakdown."""
+    trades = get_activity(address, limit=activity_limit)
+    positions = get_positions(address)
+
+    if not trades:
+        return _score_result(address, label, 0, "no_data", {}, trades, positions)
+
+    now = time.time()
+    trade_count = len(trades)
+
+    # Trades per month (bot detection)
+    oldest = min(t["timestamp"] for t in trades)
+    months_active = max((now - oldest) / (30 * 86400), 0.1)
+    trades_per_month = trade_count / months_active
+
+    # Average trade size
+    sizes = [t.get("usdcSize", 0) for t in trades if t.get("usdcSize", 0) > 0]
+    avg_size = sum(sizes) / len(sizes) if sizes else 0
+    total_volume = sum(sizes)
+
+    # Category focus (fewer = more focused = more informed)
+    cat_counts = defaultdict(int)
+    for t in trades:
+        cat_counts[_categorise(t.get("title", ""))] += 1
+    n_cats = len(cat_counts)
+    top_cat_pct = max(cat_counts.values()) / trade_count if trade_count else 0
+
+    # Buy/sell ratio (market makers hold both, informed traders buy and hold)
+    buys = sum(1 for t in trades if t.get("side") == "BUY")
+    sell_ratio = 1 - (buys / trade_count) if trade_count else 0.5
+
+    # Current P&L
+    unrealised = sum(p.get("cashPnl", 0) for p in positions)
+    realised = sum(p.get("realizedPnl", 0) for p in positions)
+
+    # Rolling win rate (last 30 positions by unrealised direction)
+    recent_trades = trades[:30]
+    recent_buy_avg = sum(
+        t.get("usdcSize", 0) for t in recent_trades if t.get("side") == "BUY"
+    ) / max(len(recent_trades), 1)
+
+    # ── Score components (each 0-100) ──────────────────────────────────────────
+
+    # 1. Sample size (need enough history)
+    if trade_count < MIN_TRADES:
+        return _score_result(address, label, 0, "insufficient_data",
+                             {"reason": f"only {trade_count} trades, need {MIN_TRADES}"},
+                             trades, positions)
+
+    # 2. Bot filter — high frequency AND small size = bot (large frequent traders are fine)
+    if trades_per_month > BOT_TRADES_MONTH and avg_size < 200:
+        return _score_result(address, label, 0, "bot",
+                             {"trades_per_month": round(trades_per_month, 1),
+                              "avg_size_usd": round(avg_size, 0)},
+                             trades, positions)
+
+    # 3. Size filter (only copy meaningful positions)
+    if avg_size < MIN_AVG_SIZE:
+        return _score_result(address, label, 15, "small_trader",
+                             {"avg_size_usd": round(avg_size, 0)},
+                             trades, positions)
+
+    # Score each dimension
+    s_sample   = min(100, (trade_count / 200) * 100)          # up to 200 trades
+    s_size     = min(100, math.log10(max(avg_size, 1)) / math.log10(100000) * 100)
+    s_focus    = (1 - (n_cats - 1) / 8) * 100                 # fewer categories = higher
+    s_focus    = max(0, min(100, s_focus))
+    # Frequency score — only penalise small high-frequency trades (bots), not large active traders
+    _size_adj_tpm = trades_per_month / max(avg_size / 1000, 1)  # normalise by size
+    s_freq     = max(0, 100 - (_size_adj_tpm / 50) * 100)
+    s_pnl      = min(100, 50 + (unrealised + realised) / max(total_volume, 1) * 500)
+    s_buy_hold = max(0, 100 - sell_ratio * 150)               # low sell ratio = buy-and-hold
+
+    score = (
+        s_sample   * 0.15 +
+        s_size     * 0.25 +
+        s_focus    * 0.20 +
+        s_freq     * 0.15 +
+        s_pnl      * 0.15 +
+        s_buy_hold * 0.10
+    )
+    score = round(score, 1)
+
+    if score >= 65:
+        classification = "informed"
+    elif score >= MIN_SCORE:
+        classification = "neutral"
+    else:
+        classification = "skip"
+
+    breakdown = {
+        "trade_count": trade_count,
+        "trades_per_month": round(trades_per_month, 1),
+        "avg_size_usd": round(avg_size, 0),
+        "total_volume_usd": round(total_volume, 0),
+        "n_categories": n_cats,
+        "top_category": max(cat_counts, key=cat_counts.get) if cat_counts else "?",
+        "top_cat_pct": round(top_cat_pct * 100, 1),
+        "sell_ratio": round(sell_ratio, 3),
+        "unrealised_pnl": round(unrealised, 2),
+        "realised_pnl": round(realised, 2),
+        "open_positions": len(positions),
+        "components": {
+            "sample":    round(s_sample, 1),
+            "size":      round(s_size, 1),
+            "focus":     round(s_focus, 1),
+            "frequency": round(s_freq, 1),
+            "pnl":       round(s_pnl, 1),
+            "buy_hold":  round(s_buy_hold, 1),
+        },
+    }
+    return _score_result(address, label, score, classification, breakdown, trades, positions)
+
+
+def _score_result(address, label, score, classification, breakdown, trades, positions):
+    return {
+        "address": address,
+        "label": label,
+        "score": score,
+        "classification": classification,
+        "will_copy": score >= MIN_SCORE and classification not in ("bot", "no_data", "insufficient_data", "skip"),
+        "breakdown": breakdown,
+        "scored_at": time.time(),
+    }
+
+
+# ── Position diff & copy trading ───────────────────────────────────────────────
+
+def _check_wallet(address: str, label: str, will_copy: bool) -> tuple[int, int]:
+    """Check a wallet for new/exited positions. Returns (opened, closed)."""
+    try:
+        positions = get_positions(address)
+    except Exception as e:
+        log.warning("Monitor: positions fetch failed for %s: %s", label, e)
+        return 0, 0
+
+    current_cids = {p["conditionId"] for p in positions if p.get("conditionId")}
+    prev_cids = _known_positions.get(address, None)
+    _known_positions[address] = current_cids
+
+    if prev_cids is None:
+        # First time seeing this wallet — record state, don't trade
+        log.info("Monitor: %s — initial snapshot: %d positions", label, len(current_cids))
+        return 0, 0
+
+    opened = 0
+    closed = 0
+    pos_by_cid = {p["conditionId"]: p for p in positions if p.get("conditionId")}
+
+    # New positions
+    for cid in current_cids - prev_cids:
+        pos = pos_by_cid.get(cid)
+        if not pos:
+            continue
+        size = pos.get("currentValue", 0)
+        log.info("Monitor: %s NEW position — %s %s @%.3f size=%s",
+                 label, pos.get("outcome"), pos.get("title", "")[:45],
+                 pos.get("curPrice", 0), f"${size:,.0f}")
+
+        if will_copy:
+            t_id = db.open_copy_trade(address, label, pos, size_usd=COPY_SIZE_USD)
+            if t_id:
+                opened += 1
+                log.info("Monitor: AUTO-MIRRORED %s → trade #%d ($%.0f paper)",
+                         label, t_id, COPY_SIZE_USD)
+                _status["new_trades_found"] += 1
+            else:
+                log.debug("Monitor: dedup — copy trade already open for %s", cid[:16])
+        else:
+            log.info("Monitor: %s scored below copy threshold — not mirroring", label)
+
+    # Exited positions — close our mirrors
+    open_copy = {
+        t["copy_condition_id"]: t
+        for t in db.get_trades(status="open", limit=500)
+        if t.get("trade_type") == "copy"
+        and t.get("copy_wallet") == address
+        and t.get("copy_condition_id")
+    }
+    for cid in prev_cids - current_cids:
+        if cid in open_copy:
+            trade = open_copy[cid]
+            pnl = db.close_trade(trade["id"], exit_price_a=trade["entry_price_a"],
+                                 notes=f"auto-close: {label} exited position")
+            closed += 1
+            log.info("Monitor: AUTO-CLOSED copy trade #%d (%s exited) pnl=$%.2f",
+                     trade["id"], label, pnl or 0)
+
+    return opened, closed
+
+
+# ── Poll loop ──────────────────────────────────────────────────────────────────
+
+def _load_state():
+    """Load persisted wallet state from disk."""
+    global _known_positions
+    if STATE_FILE.exists():
+        try:
+            data = json.loads(STATE_FILE.read_text())
+            _known_positions = {k: set(v) for k, v in data.get("positions", {}).items()}
+            log.info("Monitor: loaded state for %d wallets", len(_known_positions))
+        except Exception as e:
+            log.warning("Monitor: could not load state: %s", e)
+
+
+def _save_state():
+    STATE_FILE.parent.mkdir(exist_ok=True)
+    try:
+        STATE_FILE.write_text(json.dumps(
+            {"positions": {k: list(v) for k, v in _known_positions.items()},
+             "saved_at": time.time()}
+        ))
+    except Exception as e:
+        log.warning("Monitor: could not save state: %s", e)
+
+
+def _auto_drop_check():
+    """After re-scoring, deactivate wallets that fell below MIN_SCORE and close their trades."""
+    for row in db.get_watched_wallets(active_only=True):
+        address = row["address"]
+        label = row["label"]
+        score = row.get("score") or 0
+        if score > 0 and score < MIN_SCORE:
+            reason = f"score={score:.1f} dropped below MIN_SCORE={MIN_SCORE}"
+            log.warning("Monitor: AUTO-DROP %s — %s", label, reason)
+            db.deactivate_watched_wallet(address, reason=reason)
+            open_copy = [
+                t for t in db.get_trades(status="open", limit=500)
+                if t.get("trade_type") == "copy" and t.get("copy_wallet") == address
+            ]
+            for trade in open_copy:
+                pnl = db.close_trade(
+                    trade["id"],
+                    exit_price_a=trade.get("entry_price_a", 0.5),
+                    notes=f"auto-drop: {label} {reason}",
+                )
+                log.info("Monitor: closed copy trade #%d (auto-drop) pnl=$%.2f", trade["id"], pnl or 0)
+            _known_positions.pop(address, None)
+
+
+def _score_all():
+    """Score all watched wallets, update _status and persist to DB."""
+    wallets = _get_active_wallets()
+    log.info("Monitor: scoring %d wallets...", len(wallets))
+    for address, label in wallets.items():
+        try:
+            result = score_wallet(address, label)
+            _status["wallets"][address] = result
+            db.update_wallet_score(address, result)
+            log.info("Monitor: %s score=%.0f classification=%s will_copy=%s",
+                     label, result["score"], result["classification"], result["will_copy"])
+        except Exception as e:
+            log.warning("Monitor: scoring failed for %s: %s", label, e)
+    _status["last_score"] = time.time()
+    _auto_drop_check()
+
+
+def _poll_loop():
+    """Main background polling loop."""
+    # Seed DB from legacy hardcoded dict on first boot
+    if not db.get_watched_wallets(active_only=False):
+        for addr, lbl in _LEGACY_WALLETS.items():
+            db.add_watched_wallet(addr, lbl, added_by="legacy_seed")
+        log.info("Monitor: seeded %d wallets from legacy WATCHED_WALLETS", len(_LEGACY_WALLETS))
+
+    _load_state()
+    _score_all()   # Initial score
+
+    last_scored = time.time()
+
+    while not _stop_event.is_set():
+        t0 = time.time()
+        total_opened = total_closed = 0
+
+        for address, label in _get_active_wallets().items():
+            score_data = _status["wallets"].get(address, {})
+            will_copy = score_data.get("will_copy", False)
+            try:
+                opened, closed = _check_wallet(address, label, will_copy)
+                total_opened += opened
+                total_closed += closed
+            except Exception as e:
+                log.warning("Monitor: poll failed for %s: %s", label, e)
+
+        _status["last_poll"] = time.time()
+        _status["polls_run"] += 1
+        if total_opened or total_closed:
+            log.info("Monitor: poll complete — %d opened, %d closed in %.1fs",
+                     total_opened, total_closed, time.time() - t0)
+        _save_state()
+
+        # Re-score periodically
+        if time.time() - last_scored > SCORE_INTERVAL:
+            _score_all()
+            last_scored = time.time()
+
+        _stop_event.wait(POLL_INTERVAL)
+
+
+# ── WebSocket price feed ───────────────────────────────────────────────────────
+
+async def _ws_price_feed():
+    """Subscribe to open copy trade markets and update midpoint prices."""
+    import websockets
+
+    while not _stop_event.is_set():
+        # Collect token_ids for all open copy trades
+        open_copy = [
+            t for t in db.get_trades(status="open", limit=200)
+            if t.get("trade_type") == "copy" and t.get("token_id_a")
+        ]
+        if not open_copy:
+            await asyncio.sleep(30)
+            continue
+
+        token_ids = list({t["token_id_a"] for t in open_copy})
+        log.debug("WS: subscribing to %d copy trade markets", len(token_ids))
+
+        try:
+            async with websockets.connect(WS_URI, open_timeout=10) as ws:
+                await ws.send(json.dumps({"assets_ids": token_ids, "type": "Market"}))
+                deadline = time.time() + 60   # resubscribe every 60s to pick up new trades
+
+                while not _stop_event.is_set() and time.time() < deadline:
+                    try:
+                        raw = await asyncio.wait_for(ws.recv(), timeout=5)
+                        msgs = json.loads(raw)
+                        if not isinstance(msgs, list):
+                            continue
+                        for msg in msgs:
+                            if msg.get("event_type") == "last_trade_price":
+                                asset_id = msg.get("asset_id")
+                                price = float(msg.get("price", 0))
+                                if asset_id and price:
+                                    log.debug("WS price: %s → %.4f", asset_id[:16], price)
+                    except asyncio.TimeoutError:
+                        continue
+        except Exception as e:
+            log.debug("WS feed error: %s — reconnecting in 15s", e)
+            await asyncio.sleep(15)
+
+
+def _ws_thread_target():
+    """Run the async WebSocket feed in its own event loop."""
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        loop.run_until_complete(_ws_price_feed())
+    finally:
+        loop.close()
+
+
+# ── Public API ─────────────────────────────────────────────────────────────────
+
+def start():
+    """Start the wallet monitor (polling + WebSocket). Call once from server.py."""
+    global _poll_thread, _ws_thread
+
+    if _status["running"]:
+        log.warning("Monitor already running")
+        return
+
+    _stop_event.clear()
+    _status["running"] = True
+
+    _poll_thread = threading.Thread(target=_poll_loop, name="wallet-monitor", daemon=True)
+    _poll_thread.start()
+
+    _ws_thread = threading.Thread(target=_ws_thread_target, name="ws-price-feed", daemon=True)
+    _ws_thread.start()
+
+    log.info("Wallet monitor started — polling every %ds, WS price feed active", POLL_INTERVAL)
+
+
+def stop():
+    _stop_event.set()
+    _status["running"] = False
+    log.info("Wallet monitor stopped")
+
+
+def get_status() -> dict:
+    return {
+        "running": _status["running"],
+        "last_poll": _status["last_poll"],
+        "last_score": _status["last_score"],
+        "polls_run": _status["polls_run"],
+        "new_trades_found": _status["new_trades_found"],
+        "wallets": _status["wallets"],
+        "poll_interval_s": POLL_INTERVAL,
+    }
+
+
+# ── Entry point ────────────────────────────────────────────────────────────────
+
+if __name__ == "__main__":
+    import log_setup
+    from dotenv import load_dotenv
+    load_dotenv()
+    log_setup.init_logging()
+
+    print("Scoring watched wallets...\n")
+    for address, label in _get_active_wallets().items():
+        r = score_wallet(address, label)
+        print(f"{'─'*55}")
+        print(f"  {label:20s}  score={r['score']:5.1f}  [{r['classification'].upper()}]  copy={r['will_copy']}")
+        b = r["breakdown"]
+        if b:
+            print(f"  trades={b.get('trade_count','?')}  vol=${b.get('total_volume_usd',0):,.0f}  "
+                  f"avg=${b.get('avg_size_usd',0):,.0f}  /mo={b.get('trades_per_month','?')}")
+            print(f"  focus: {b.get('top_category','?')} ({b.get('top_cat_pct','?')}%)  "
+                  f"cats={b.get('n_categories','?')}  unrealised=${b.get('unrealised_pnl',0):+,.0f}")
+            if "components" in b:
+                c = b["components"]
+                print(f"  scores: sample={c['sample']:.0f} size={c['size']:.0f} "
+                      f"focus={c['focus']:.0f} freq={c['frequency']:.0f} "
+                      f"pnl={c['pnl']:.0f} buy_hold={c['buy_hold']:.0f}")
+
+    print(f"\n{'─'*55}")
+    print("Starting live monitor (Ctrl+C to stop)...")
+    start()
+    try:
+        while True:
+            time.sleep(10)
+    except KeyboardInterrupt:
+        stop()
