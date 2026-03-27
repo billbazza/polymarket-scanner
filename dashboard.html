@@ -549,34 +549,55 @@ function drawPnlChart(series) {
   canvas.width  = rect.width  - 32;
   canvas.height = rect.height - 40;
   ctx.clearRect(0, 0, canvas.width, canvas.height);
-  if (!series || series.length < 2) {
+  if (!series || series.length === 0) {
     ctx.fillStyle = '#94a3b8'; ctx.font = '13px monospace';
     ctx.textAlign = 'center';
     ctx.fillText('No closed trades yet', canvas.width/2, canvas.height/2);
     return;
   }
-  let cum = 0;
-  const points = series.map(s => { cum += s.pnl; return cum; });
+  // series already contains cumulative P&L values from the server
+  // Prepend a zero origin so the chart starts flat
+  const points = [0, ...series.map(s => s.pnl)];
+  const final  = points[points.length - 1];
   const maxVal = Math.max(...points, 0.01);
   const minVal = Math.min(...points, -0.01);
-  const range = maxVal - minVal || 1;
-  const w = canvas.width, h = canvas.height, pad = 10;
-  const zeroY = pad + (maxVal / range) * (h - 2 * pad);
+  const range  = maxVal - minVal || 1;
+  const w = canvas.width, h = canvas.height, pad = 20;
+  const xScale = i => (i / (points.length - 1)) * w;
+  const yScale = v => pad + ((maxVal - v) / range) * (h - 2 * pad);
+  const zeroY  = yScale(0);
+
+  // Zero line
   ctx.strokeStyle = '#2a3548'; ctx.lineWidth = 1;
-  ctx.setLineDash([4,4]);
+  ctx.setLineDash([4, 4]);
   ctx.beginPath(); ctx.moveTo(0, zeroY); ctx.lineTo(w, zeroY); ctx.stroke();
   ctx.setLineDash([]);
-  ctx.strokeStyle = cum >= 0 ? '#10b981' : '#ef4444'; ctx.lineWidth = 2;
+
+  // Fill under/over zero
+  const color = final >= 0 ? '#10b981' : '#ef4444';
+  ctx.strokeStyle = color; ctx.lineWidth = 2;
   ctx.beginPath();
   points.forEach((v, i) => {
-    const x = (i / (points.length - 1)) * w;
-    const y = pad + ((maxVal - v) / range) * (h - 2 * pad);
+    const x = xScale(i), y = yScale(v);
     i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
   });
   ctx.stroke();
-  ctx.lineTo(w, zeroY); ctx.lineTo(0, zeroY); ctx.closePath();
-  ctx.fillStyle = cum >= 0 ? 'rgba(16,185,129,0.1)' : 'rgba(239,68,68,0.1)';
+  // Filled area back to zero baseline
+  ctx.lineTo(xScale(points.length - 1), zeroY);
+  ctx.lineTo(xScale(0), zeroY);
+  ctx.closePath();
+  ctx.fillStyle = final >= 0 ? 'rgba(16,185,129,0.1)' : 'rgba(239,68,68,0.1)';
   ctx.fill();
+
+  // Dot + label at each real data point
+  series.forEach((s, i) => {
+    const x = xScale(i + 1), y = yScale(s.pnl);
+    ctx.beginPath();
+    ctx.arc(x, y, 4, 0, Math.PI * 2);
+    ctx.fillStyle = color; ctx.fill();
+    ctx.fillStyle = color; ctx.font = '10px monospace'; ctx.textAlign = 'center';
+    ctx.fillText((s.pnl >= 0 ? '+' : '') + s.pnl.toFixed(2), x, y - 8);
+  });
 }
 
 // ── Cointegration Signals ──────────────────────────────────────────────────

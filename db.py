@@ -665,15 +665,23 @@ def get_stats():
     total_signals = conn.execute("SELECT COUNT(*) FROM signals").fetchone()[0]
     total_scans = conn.execute("SELECT COUNT(*) FROM scan_runs").fetchone()[0]
 
-    # Recent P&L series (last 30 closed trades)
-    pnl_series = conn.execute("""
+    # Cumulative P&L series — only closed trades with real P&L, sorted by close time
+    pnl_rows = conn.execute("""
         SELECT closed_at, pnl FROM trades
-        WHERE status='closed' ORDER BY closed_at ASC LIMIT 100
+        WHERE status='closed' AND pnl IS NOT NULL AND pnl != 0
+        ORDER BY closed_at ASC
     """).fetchall()
 
     conn.close()
 
     win_rate = (wins / closed_trades * 100) if closed_trades > 0 else 0
+
+    # Build cumulative series: each point is the running total after that trade closes
+    cumulative = 0.0
+    pnl_series = []
+    for closed_at, pnl in pnl_rows:
+        cumulative += pnl
+        pnl_series.append({"t": closed_at, "pnl": round(cumulative, 2)})
 
     return {
         "total_trades": total_trades,
@@ -685,7 +693,7 @@ def get_stats():
         "win_rate": round(win_rate, 1),
         "total_signals": total_signals,
         "total_scans": total_scans,
-        "pnl_series": [{"t": r[0], "pnl": r[1]} for r in pnl_series],
+        "pnl_series": pnl_series,
     }
 
 
