@@ -268,6 +268,15 @@ def run_cycle(state):
     except Exception as e:
         log.warning("Trade monitoring failed: %s", e)
 
+    # Step 2b: Manage pending maker orders (check fills, cancel expired)
+    try:
+        order_result = execution.manage_open_orders()
+        if order_result["filled"] or order_result["cancelled"]:
+            log.info("Step 2b: maker orders — %d filled, %d cancelled",
+                     order_result["filled"], order_result["cancelled"])
+    except Exception as e:
+        log.warning("Maker order management failed: %s", e)
+
     # Step 3: Auto-close reverted trades
     log.info("Step 3: Checking for auto-closes...")
     try:

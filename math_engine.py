@@ -8,6 +8,19 @@ import api
 
 log = logging.getLogger("scanner.math")
 
+# ── Fee model ──────────────────────────────────────────────────────────────
+# Polymarket charges takers ~2% per leg. A full round-trip pairs trade
+# (entry + exit, both legs) costs 4× fee_per_leg on the total position.
+# Maker orders pay 0% — this is the target execution mode.
+TAKER_FEE_PCT  = 0.02   # per-leg fee as a fraction of notional
+MAKER_FEE_PCT  = 0.00   # maker orders: no fee
+
+# ── Minimum spread volatility ──────────────────────────────────────────────
+# Markets where the spread barely moves can't pay off even with zero fees.
+# spread_std is in price units (0-1). 0.02 = a 2-cent swing per std — the
+# minimum for a z=2 signal to generate meaningful dollar EV.
+MIN_SPREAD_STD = 0.02
+
 
 def expected_value(win_prob, win_payout, loss_amount):
     """Calculate expected value of a trade.
@@ -23,50 +36,54 @@ def expected_value(win_prob, win_payout, loss_amount):
     return (win_prob * win_payout) - ((1 - win_prob) * loss_amount)
 
 
-def ev_from_zscore(z_score, half_life, spread_std, size_usd=100):
-    """Estimate EV from z-score and half-life.
+def ev_from_zscore(z_score, half_life, spread_std, size_usd=100,
+                   fee_pct=TAKER_FEE_PCT):
+    """Estimate EV from z-score and half-life, net of round-trip fees.
 
-    Uses historical reversion rate as win probability proxy.
-    Higher |z| and shorter half-life = higher win probability.
-
-    The logic: if z > 2, historically ~95% of observations are within 2 std.
-    So a z of 2.5 means we're in the 1.2% tail — high reversion probability.
-    But we discount by half-life: slow reversion = more time for things to go wrong.
+    fee_pct: per-leg fee (TAKER_FEE_PCT=0.02 or MAKER_FEE_PCT=0.00).
+    A pairs trade has 4 legs (entry A, entry B, exit A, exit B), so the
+    total fee cost is 4 × fee_pct × half_size = 2 × fee_pct × size_usd.
+    EV returned is NET of fees so callers compare directly to a hurdle rate.
     """
-    # Base win probability from z-score (using normal CDF)
     from scipy.stats import norm
-    # Probability of reverting to within 0.5 std of mean
     abs_z = abs(z_score)
-    # P(revert) = P(|Z| < current |Z|) — how unusual is this deviation
-    base_prob = 2 * norm.cdf(abs_z) - 1  # e.g., z=2 -> 0.954
+    base_prob = 2 * norm.cdf(abs_z) - 1  # e.g., z=2 → 0.954
 
-    # Discount by half-life: fast reversion = keep full prob, slow = discount
-    # Half-life > 10 periods is slow, < 3 is fast
     if half_life <= 0 or half_life > 100:
-        hl_factor = 0.3  # slow reversion, big discount
+        hl_factor = 0.3
     else:
-        hl_factor = min(1.0, 3.0 / half_life)  # 1.0 at hl=3, 0.3 at hl=10
+        hl_factor = min(1.0, 3.0 / half_life)
 
     win_prob = base_prob * hl_factor
 
-    # Win payout: spread reverts to mean (z goes to 0)
-    # Each unit of z = spread_std in price terms
-    win_payout = abs_z * spread_std * size_usd
+    # Gross payoff: spread reverts to mean (z → 0)
+    win_payout_gross = abs_z * spread_std * size_usd
+    loss_amount_gross = 1.0 * spread_std * size_usd
 
-    # Loss: spread widens by another 1 std (stop-loss level)
-    loss_amount = 1.0 * spread_std * size_usd
+    # Round-trip fee cost (4 legs total)
+    fee_cost = 2 * fee_pct * size_usd
 
-    ev = expected_value(win_prob, win_payout, loss_amount)
+    # Net payoffs after fees
+    win_payout_net  = max(0.0, win_payout_gross - fee_cost)
+    loss_amount_net = loss_amount_gross + fee_cost
 
-    log.debug("EV calc: z=%.2f hl=%.1f base_prob=%.3f hl_factor=%.2f ev=%.4f",
-              z_score, half_life, base_prob, hl_factor, ev)
+    ev = expected_value(win_prob, win_payout_net, loss_amount_net)
+
+    log.debug(
+        "EV calc: z=%.2f hl=%.1f spread_std=%.4f fee_pct=%.0f%% "
+        "gross_win=%.2f fee=%.2f net_win=%.2f ev=%.4f",
+        z_score, half_life, spread_std, fee_pct * 100,
+        win_payout_gross, fee_cost, win_payout_net, ev,
+    )
 
     return {
         "ev": round(ev, 4),
         "ev_pct": round(ev / size_usd * 100, 2) if size_usd else 0,
         "win_prob": round(win_prob, 4),
-        "win_payout": round(win_payout, 4),
-        "loss_amount": round(loss_amount, 4),
+        "win_payout": round(win_payout_net, 4),
+        "win_payout_gross": round(win_payout_gross, 4),
+        "loss_amount": round(loss_amount_net, 4),
+        "fee_cost": round(fee_cost, 4),
         "base_prob": round(base_prob, 4),
         "hl_factor": round(hl_factor, 4),
     }
@@ -199,52 +216,55 @@ def check_slippage(token_id, trade_size_usd=100, max_slippage_pct=2.0):
     }
 
 
-def score_opportunity(opp, bankroll=1000, min_ev_pct=5.0, max_slippage_pct=2.0):
+def score_opportunity(opp, bankroll=1000, min_ev_pct=2.0, max_slippage_pct=2.0,
+                      fee_pct=TAKER_FEE_PCT, min_spread_std=MIN_SPREAD_STD):
     """Score a signal through all Tier 1 filters.
 
-    Returns the opportunity enriched with:
-    - EV calculation
-    - Kelly sizing
-    - Slippage check
-    - Overall pass/fail grade
+    min_ev_pct is now NET of fees (2% default). Pass fee_pct=MAKER_FEE_PCT
+    when executing as a maker to relax the EV hurdle appropriately.
     """
-    # EV calculation
+    spread_std = opp.get("spread_std") or 0
+
+    # EV calculation (fee-aware)
     ev = ev_from_zscore(
         z_score=opp["z_score"],
         half_life=opp["half_life"],
-        spread_std=opp["spread_std"],
+        spread_std=spread_std,
         size_usd=100,
+        fee_pct=fee_pct,
     )
 
     # Kelly sizing
     sizing = position_size(bankroll, ev)
 
-    # Filter #3: reject if either market price is near resolution (outside 5%-95%)
-    # A market at 0.01 or 0.99 is effectively resolved — no mean reversion possible
+    # Price filter: reject if either market is near resolution (outside 5%–95%)
     price_a = float(opp.get("price_a") or 0)
     price_b = float(opp.get("price_b") or 0)
     price_ok = (0.05 <= price_a <= 0.95) and (0.05 <= price_b <= 0.95)
 
     # Filters
     filters = {
-        "ev_pass":       bool(ev["ev_pct"] >= min_ev_pct),
-        "kelly_pass":    bool(sizing["kelly_fraction"] > 0),
-        "z_pass":        bool(abs(opp["z_score"]) >= 1.5),
-        "coint_pass":    bool(opp["coint_pvalue"] < 0.10),
-        "hl_pass":       bool(opp["half_life"] < 20),
-        # Filter #2: spread must be retreating toward mean, not still diverging
-        "momentum_pass": bool(opp.get("spread_retreating", True)),
-        # Filter #3: neither market near resolution
-        "price_pass":    bool(price_ok),
+        "ev_pass":        bool(ev["ev_pct"] >= min_ev_pct),
+        "kelly_pass":     bool(sizing["kelly_fraction"] > 0),
+        "z_pass":         bool(abs(opp["z_score"]) >= 1.5),
+        "coint_pass":     bool(opp["coint_pvalue"] < 0.10),
+        "hl_pass":        bool(opp["half_life"] < 20),
+        "momentum_pass":  bool(opp.get("spread_retreating", True)),
+        "price_pass":     bool(price_ok),
+        # Spread must have enough volatility to pay off after fees
+        "spread_std_pass": bool(spread_std >= min_spread_std),
     }
 
     grade = sum(filters.values())
     all_pass = all(filters.values())
 
-    label = ["F", "D", "C", "B", "A", "A", "A", "A+"][min(grade, 7)]
-    log.info("Scored: %s | grade=%s ev=%.2f%% kelly=%.4f z=%.2f tradeable=%s",
-             opp.get("event", "?")[:40], label, ev["ev_pct"], sizing["kelly_fraction"],
-             opp["z_score"], all_pass)
+    # 8 filters → need all 8 for A+
+    label = ["F", "D", "C", "B", "A", "A", "A", "A", "A+"][min(grade, 8)]
+    log.info(
+        "Scored: %s | grade=%s ev=%.2f%%(net) spread_std=%.4f z=%.2f tradeable=%s",
+        opp.get("event", "?")[:40], label, ev["ev_pct"], spread_std,
+        opp["z_score"], all_pass,
+    )
 
     return {
         **opp,
@@ -253,5 +273,6 @@ def score_opportunity(opp, bankroll=1000, min_ev_pct=5.0, max_slippage_pct=2.0):
         "filters": filters,
         "grade": grade,
         "tradeable": all_pass,
-        "grade_label": ["F", "D", "C", "B", "A", "A", "A", "A+"][min(grade, 7)],
+        "grade_label": label,
+        "fee_pct": fee_pct,
     }

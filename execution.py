@@ -13,8 +13,19 @@ import math_engine
 
 log = logging.getLogger("scanner.execution")
 
-MAX_SLIPPAGE_PCT = 2.5
-PAPER_BALANCE_USD = 10_000.0  # simulated starting balance
+MAX_SLIPPAGE_PCT  = 2.5
+PAPER_BALANCE_USD = 10_000.0
+
+# Execution mode: "maker" (GTC limit orders, 0% fee) or "taker" (market orders, 2% fee).
+# Default is maker — post inside the spread, pay no fees, capture better prices.
+EXECUTION_MODE = os.environ.get("EXECUTION_MODE", "maker")
+
+# How far inside the spread we post our limit (fraction of half-spread).
+# 0.5 = halfway between mid and best bid/ask.
+MAKER_AGGRESSION = 0.5
+
+# GTC orders expire and are cancelled after this many hours if unfilled.
+ORDER_TTL_HOURS = 4
 
 # In-memory paper balance tracker (resets on restart)
 _paper_state = {
@@ -66,6 +77,33 @@ def check_balance(mode=None):
                 "error": str(e)}
 
 
+def _get_maker_prices(token_a, token_b, side_a, side_b):
+    """Return limit prices inside the spread for both legs.
+
+    For a BUY we post at bid + aggression × half_spread (we improve on the bid).
+    For a SELL we post at ask - aggression × half_spread (we improve on the ask).
+    Falls back to midpoint if the order book is unavailable.
+    """
+    def _limit_price(token, side):
+        try:
+            book = api.get_book(token)
+            bids = book.get("bids", [])
+            asks = book.get("asks", [])
+            if not bids or not asks:
+                return api.get_midpoint(token)
+            best_bid = float(bids[0]["price"])
+            best_ask = float(asks[0]["price"])
+            half_spread = (best_ask - best_bid) / 2
+            if side == "BUY":
+                return round(best_bid + MAKER_AGGRESSION * half_spread, 4)
+            else:
+                return round(best_ask - MAKER_AGGRESSION * half_spread, 4)
+        except Exception:
+            return api.get_midpoint(token)
+
+    return _limit_price(token_a, side_a), _limit_price(token_b, side_b)
+
+
 def execute_trade(signal, size_usd, mode=None):
     """Execute a pairs trade from a signal.
 
@@ -94,23 +132,36 @@ def execute_trade(signal, size_usd, mode=None):
         return {"ok": False, "error": f"Insufficient balance: ${bal['balance_usd']:.2f} < ${size_usd:.2f}",
                 "mode": mode}
 
-    # 2. Fetch current prices — use token IDs (numeric), fall back to market name
+    # 2. Determine sides and fetch entry prices
     token_a = signal.get("token_id_a") or signal["market_a"]
     token_b = signal.get("token_id_b") or signal["market_b"]
-    try:
-        price_a = api.get_midpoint(token_a)
-        price_b = api.get_midpoint(token_b)
-    except Exception as e:
-        log.error("Failed to fetch current prices: %s", e)
-        return {"ok": False, "error": f"Price fetch failed: {e}", "mode": mode}
+    z = signal.get("z_score", 0)
+    side_a = "BUY"  if z < 0 else "SELL"
+    side_b = "SELL" if z < 0 else "BUY"
+
+    exec_mode = EXECUTION_MODE  # "maker" or "taker"
+
+    if exec_mode == "maker":
+        try:
+            price_a, price_b = _get_maker_prices(token_a, token_b, side_a, side_b)
+        except Exception as e:
+            log.error("Failed to compute maker prices: %s", e)
+            return {"ok": False, "error": f"Maker price fetch failed: {e}", "mode": mode}
+    else:
+        try:
+            price_a = api.get_midpoint(token_a)
+            price_b = api.get_midpoint(token_b)
+        except Exception as e:
+            log.error("Failed to fetch current prices: %s", e)
+            return {"ok": False, "error": f"Price fetch failed: {e}", "mode": mode}
 
     if price_a <= 0 or price_b <= 0:
         log.warning("Invalid prices: a=%.4f b=%.4f", price_a, price_b)
         return {"ok": False, "error": f"Invalid prices: a={price_a} b={price_b}",
                 "mode": mode}
 
-    # 3. Slippage check — live only (paper trades don't execute real orders)
-    if mode == "live":
+    # 3. Slippage check — taker mode only (maker orders set their own price)
+    if mode == "live" and exec_mode == "taker":
         slippage = math_engine.check_slippage(
             token_a, trade_size_usd=size_usd / 2, max_slippage_pct=MAX_SLIPPAGE_PCT,
         )
@@ -118,7 +169,6 @@ def execute_trade(signal, size_usd, mode=None):
             log.warning("Slippage check failed for leg A: %s", slippage.get("reason"))
             return {"ok": False, "error": f"Slippage too high: {slippage.get('reason')}",
                     "slippage": slippage, "mode": mode}
-
         slippage_b = math_engine.check_slippage(
             token_b, trade_size_usd=size_usd / 2, max_slippage_pct=MAX_SLIPPAGE_PCT,
         )
@@ -126,10 +176,10 @@ def execute_trade(signal, size_usd, mode=None):
             log.warning("Slippage check failed for leg B: %s", slippage_b.get("reason"))
             return {"ok": False, "error": f"Slippage too high on leg B: {slippage_b.get('reason')}",
                     "slippage": slippage_b, "mode": mode}
-    else:
-        # Paper mode: log slippage as info only, don't block
+    elif mode == "paper":
         slippage = math_engine.check_slippage(token_a, trade_size_usd=size_usd / 2)
-        log.info("Paper slippage (informational): leg A=%.2f%%", slippage.get("slippage_pct") or 0)
+        log.info("Paper slippage (informational, %s): leg A=%.2f%%",
+                 exec_mode, slippage.get("slippage_pct") or 0)
 
     # 4. HMRC gate — block live trades if GBP audit logging is unavailable
     if mode == "live":
@@ -140,11 +190,13 @@ def execute_trade(signal, size_usd, mode=None):
             log.error("LIVE TRADE BLOCKED — HMRC compliance failure: %s", e)
             return {"ok": False, "error": str(e), "mode": mode}
 
-    # 5. Execute based on mode
+    # 5. Execute based on mode and execution style
     if mode == "paper":
-        result = _execute_paper(signal, size_usd, price_a, price_b)
+        result = _execute_paper(signal, size_usd, price_a, price_b,
+                                side_a=side_a, side_b=side_b, exec_mode=exec_mode)
     else:
-        result = _execute_live(signal, size_usd, price_a, price_b)
+        result = _execute_live(signal, size_usd, price_a, price_b,
+                               side_a=side_a, side_b=side_b, exec_mode=exec_mode)
 
     # 6. Stamp and audit-log real trades
     if mode == "live" and result.get("ok"):
@@ -159,9 +211,14 @@ def execute_trade(signal, size_usd, mode=None):
     return result
 
 
-def _execute_paper(signal, size_usd, price_a, price_b):
-    """Simulate order fill at current midpoint prices."""
-    # Record the trade in DB
+def _execute_paper(signal, size_usd, price_a, price_b,
+                   side_a="BUY", side_b="SELL", exec_mode="maker"):
+    """Simulate order fill.
+
+    Maker mode: records limit prices (better than mid) with 0% fee — optimistic
+    but correct for benchmarking maker strategy vs taker.
+    Taker mode: fills at midpoint with fee already baked into EV model.
+    """
     signal_id = signal.get("id")
     if not signal_id:
         log.error("Signal missing 'id' field, cannot record trade")
@@ -172,24 +229,43 @@ def _execute_paper(signal, size_usd, price_a, price_b):
         log.error("Failed to open trade in DB for signal %s", signal_id)
         return {"ok": False, "error": "DB open_trade failed", "mode": "paper"}
 
-    # Deduct from paper balance
     _paper_state["balance"] -= size_usd
-    fill = {
-        "trade_id": trade_id,
-        "signal_id": signal_id,
-        "fill_price_a": price_a,
-        "fill_price_b": price_b,
-        "size_usd": size_usd,
-        "timestamp": time.time(),
-    }
-    _paper_state["fills"].append(fill)
 
-    log.info("PAPER FILL: trade=%d | A=%.4f B=%.4f | size=$%.2f | balance=$%.2f",
-             trade_id, price_a, price_b, size_usd, _paper_state["balance"])
+    now = time.time()
+    half = size_usd / 2
+
+    # Save open order records for both legs (useful for tracking in maker mode)
+    expires = now + ORDER_TTL_HOURS * 3600
+    for leg, token_id, side, price in [
+        ("a", signal.get("token_id_a") or signal["market_a"], side_a, price_a),
+        ("b", signal.get("token_id_b") or signal["market_b"], side_b, price_b),
+    ]:
+        db.save_open_order({
+            "order_id":    f"paper-{trade_id}-{leg}-{int(now*1000)}",
+            "trade_id":    trade_id,
+            "signal_id":   signal_id,
+            "token_id":    token_id,
+            "side":        side,
+            "leg":         leg,
+            "limit_price": price,
+            "size_shares": round(half / price, 4) if price > 0 else 0,
+            "size_usd":    half,
+            "status":      "filled",   # paper = immediate fill
+            "mode":        "paper",
+            "placed_at":   now,
+            "filled_at":   now,
+            "fill_price":  price,
+            "expires_at":  expires,
+        })
+
+    log.info("PAPER %s FILL: trade=%d | A(%s)=%.4f B(%s)=%.4f | $%.2f | bal=$%.2f",
+             exec_mode.upper(), trade_id, side_a, price_a, side_b, price_b,
+             size_usd, _paper_state["balance"])
 
     return {
         "ok": True,
         "mode": "paper",
+        "exec_mode": exec_mode,
         "trade_id": trade_id,
         "signal_id": signal_id,
         "fill_price_a": price_a,
@@ -199,8 +275,14 @@ def _execute_paper(signal, size_usd, price_a, price_b):
     }
 
 
-def _execute_live(signal, size_usd, price_a, price_b):
-    """Execute real orders via py-clob-client."""
+def _execute_live(signal, size_usd, price_a, price_b,
+                  side_a="BUY", side_b="SELL", exec_mode="maker"):
+    """Execute real orders via py-clob-client.
+
+    Maker mode: GTC limit orders posted inside spread — fills when someone
+    crosses our price. Pending until filled or expired.
+    Taker mode: market-style orders that fill immediately at ask/bid.
+    """
     try:
         from py_clob_client.client import ClobClient
     except ImportError:
@@ -216,50 +298,70 @@ def _execute_live(signal, size_usd, price_a, price_b):
         client = ClobClient(
             host="https://clob.polymarket.com",
             key=private_key,
-            chain_id=137,  # Polygon mainnet
+            chain_id=137,
         )
 
-        # Determine order sides from z-score
-        z = signal.get("z_score", 0)
-        if z < 0:
-            side_a, side_b = "BUY", "SELL"
-        else:
-            side_a, side_b = "SELL", "BUY"
-
         half_size = size_usd / 2
+        token_a = signal.get("token_id_a") or signal["market_a"]
+        token_b = signal.get("token_id_b") or signal["market_b"]
+        order_type = "GTC" if exec_mode == "maker" else "FOK"
 
-        # Place leg A
         order_a = client.create_and_post_order({
-            "tokenID": signal.get("token_id_a") or signal["market_a"],
-            "price": price_a,
-            "size": half_size / price_a if price_a > 0 else 0,
-            "side": side_a,
+            "tokenID": token_a,
+            "price":   price_a,
+            "size":    round(half_size / price_a, 4) if price_a > 0 else 0,
+            "side":    side_a,
+            "type":    order_type,
         })
-
-        # Place leg B
         order_b = client.create_and_post_order({
-            "tokenID": signal.get("token_id_b") or signal["market_b"],
-            "price": price_b,
-            "size": half_size / price_b if price_b > 0 else 0,
-            "side": side_b,
+            "tokenID": token_b,
+            "price":   price_b,
+            "size":    round(half_size / price_b, 4) if price_b > 0 else 0,
+            "side":    side_b,
+            "type":    order_type,
         })
 
-        # Record in DB
         signal_id = signal.get("id")
+        # In maker mode the trade is pending until both legs fill
+        trade_status = "pending_fill" if exec_mode == "maker" else "open"
         trade_id = db.open_trade(signal_id, size_usd=size_usd) if signal_id else None
 
-        log.info("LIVE FILL: trade=%s | orders=%s,%s | size=$%.2f",
-                 trade_id, order_a, order_b, size_usd)
+        now = time.time()
+        expires = now + ORDER_TTL_HOURS * 3600
+        for leg, token_id, side, price, order_id in [
+            ("a", token_a, side_a, price_a, str(order_a)),
+            ("b", token_b, side_b, price_b, str(order_b)),
+        ]:
+            db.save_open_order({
+                "order_id":    order_id,
+                "trade_id":    trade_id,
+                "signal_id":   signal_id,
+                "token_id":    token_id,
+                "side":        side,
+                "leg":         leg,
+                "limit_price": price,
+                "size_shares": round(half_size / price, 4) if price > 0 else 0,
+                "size_usd":    half_size,
+                "status":      "pending",
+                "mode":        "live",
+                "placed_at":   now,
+                "expires_at":  expires,
+            })
+
+        log.info("LIVE %s: trade=%s | orders=%s,%s | size=$%.2f",
+                 exec_mode.upper(), trade_id, order_a, order_b, size_usd)
 
         return {
             "ok": True,
             "mode": "live",
+            "exec_mode": exec_mode,
             "trade_id": trade_id,
-            "order_a": order_a,
-            "order_b": order_b,
+            "order_a": str(order_a),
+            "order_b": str(order_b),
             "fill_price_a": price_a,
             "fill_price_b": price_b,
             "size_usd": size_usd,
+            "pending": exec_mode == "maker",
         }
 
     except Exception as e:
@@ -379,3 +481,70 @@ def cancel_order(order_id, mode=None):
     except Exception as e:
         log.error("Cancel failed: %s", e)
         return {"ok": False, "error": str(e), "mode": "live"}
+
+
+def manage_open_orders():
+    """Check pending GTC maker orders: fill paper orders that have crossed,
+    cancel any that have expired. Called each autonomy cycle.
+
+    Returns counts of filled and cancelled orders.
+    """
+    mode = _get_mode()
+    pending = db.get_open_orders(status="pending")
+    if not pending:
+        return {"filled": 0, "cancelled": 0}
+
+    filled = 0
+    cancelled = 0
+    now = time.time()
+
+    for order in pending:
+        # Cancel expired orders
+        if now > order["expires_at"]:
+            log.info("Cancelling expired maker order %s (trade=%s leg=%s)",
+                     order["order_id"], order["trade_id"], order["leg"])
+            if mode == "live":
+                cancel_order(order["order_id"], mode="live")
+            db.cancel_open_order(order["id"], reason="expired")
+            cancelled += 1
+            continue
+
+        if mode == "paper":
+            # In paper mode: check if current mid has crossed our limit price.
+            # If yes, consider it filled at our limit (best-case simulation).
+            try:
+                mid = api.get_midpoint(order["token_id"])
+                side = order["side"]
+                limit = order["limit_price"]
+                crossed = (side == "BUY"  and mid <= limit) or \
+                          (side == "SELL" and mid >= limit)
+                if crossed:
+                    db.fill_open_order(order["id"], fill_price=limit)
+                    log.info("PAPER MAKER FILL: order=%s leg=%s price=%.4f",
+                             order["order_id"], order["leg"], limit)
+                    filled += 1
+            except Exception as e:
+                log.warning("Paper order fill check failed: %s", e)
+
+        else:  # live mode — query exchange for fill status
+            try:
+                from py_clob_client.client import ClobClient
+                private_key = os.environ.get("POLYMARKET_PRIVATE_KEY", "")
+                client = ClobClient("https://clob.polymarket.com",
+                                    key=private_key, chain_id=137)
+                order_data = client.get_order(order["order_id"])
+                status = (order_data or {}).get("status", "")
+                if status in ("MATCHED", "FILLED"):
+                    fill_price = float((order_data or {}).get("price",
+                                       order["limit_price"]))
+                    db.fill_open_order(order["id"], fill_price=fill_price)
+                    log.info("LIVE MAKER FILL: order=%s leg=%s price=%.4f",
+                             order["order_id"], order["leg"], fill_price)
+                    filled += 1
+            except Exception as e:
+                log.warning("Live order status check failed for %s: %s",
+                            order["order_id"], e)
+
+    if filled or cancelled:
+        log.info("manage_open_orders: %d filled, %d cancelled", filled, cancelled)
+    return {"filled": filled, "cancelled": cancelled}

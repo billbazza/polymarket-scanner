@@ -173,6 +173,27 @@ def init_db():
             source_markets   TEXT
         );
 
+        CREATE TABLE IF NOT EXISTS open_orders (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            order_id     TEXT NOT NULL,
+            trade_id     INTEGER REFERENCES trades(id),
+            signal_id    INTEGER REFERENCES signals(id),
+            token_id     TEXT NOT NULL,
+            side         TEXT NOT NULL,
+            leg          TEXT NOT NULL,
+            limit_price  REAL NOT NULL,
+            size_shares  REAL NOT NULL,
+            size_usd     REAL,
+            status       TEXT DEFAULT 'pending',
+            mode         TEXT DEFAULT 'paper',
+            placed_at    REAL NOT NULL,
+            filled_at    REAL,
+            fill_price   REAL,
+            expires_at   REAL NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_open_orders_status   ON open_orders(status);
+        CREATE INDEX IF NOT EXISTS idx_open_orders_trade    ON open_orders(trade_id);
         CREATE INDEX IF NOT EXISTS idx_wallet_candidates_status ON wallet_candidates(status);
         CREATE INDEX IF NOT EXISTS idx_signals_ts ON signals(timestamp);
         CREATE INDEX IF NOT EXISTS idx_trades_status ON trades(status);
@@ -855,6 +876,61 @@ def get_wallet_candidates(status: str = "pending") -> list[dict]:
 def update_candidate_status(candidate_id: int, status: str) -> None:
     conn = get_conn()
     conn.execute("UPDATE wallet_candidates SET status=? WHERE id=?", (status, candidate_id))
+    conn.commit()
+    conn.close()
+
+
+# --- Open Orders (maker GTC limit orders) ---
+
+def save_open_order(order: dict) -> int:
+    """Record a pending GTC maker order. Returns row id."""
+    conn = get_conn()
+    conn.execute("""
+        INSERT INTO open_orders
+            (order_id, trade_id, signal_id, token_id, side, leg,
+             limit_price, size_shares, size_usd, status, mode,
+             placed_at, expires_at)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+    """, (
+        order["order_id"], order.get("trade_id"), order.get("signal_id"),
+        order["token_id"], order["side"], order["leg"],
+        order["limit_price"], order["size_shares"], order.get("size_usd"),
+        order.get("status", "pending"), order.get("mode", "paper"),
+        order.get("placed_at", time.time()),
+        order.get("expires_at", time.time() + 4 * 3600),
+    ))
+    row_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+    conn.commit()
+    conn.close()
+    return row_id
+
+
+def get_open_orders(status: str = "pending") -> list[dict]:
+    conn = get_conn()
+    rows = conn.execute(
+        "SELECT * FROM open_orders WHERE status=? ORDER BY placed_at ASC",
+        (status,)
+    ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def fill_open_order(row_id: int, fill_price: float) -> None:
+    conn = get_conn()
+    conn.execute(
+        "UPDATE open_orders SET status='filled', filled_at=?, fill_price=? WHERE id=?",
+        (time.time(), fill_price, row_id),
+    )
+    conn.commit()
+    conn.close()
+
+
+def cancel_open_order(row_id: int, reason: str = "expired") -> None:
+    conn = get_conn()
+    conn.execute(
+        "UPDATE open_orders SET status=? WHERE id=?",
+        (reason, row_id),
+    )
     conn.commit()
     conn.close()
 
