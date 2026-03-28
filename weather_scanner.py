@@ -54,7 +54,9 @@ OPENMETEO_BASE = "https://api.open-meteo.com/v1/forecast"
 # Forecast σ (°F) by hours ahead — calibrated to NWS verification statistics
 _SIGMA_BY_HOURS = [(24, 2.5), (48, 3.5), (72, 5.0), (999, 6.5)]
 
-MIN_EDGE = 0.06        # 6pp minimum combined edge to surface
+MIN_EDGE = 0.06        # 6pp minimum combined edge to surface (for display)
+MIN_TRADE_EDGE = 0.15  # 15pp minimum edge required to mark tradeable
+MIN_TRADE_PRICE = 0.35 # never buy a token below this price (avoids near-wipeout long shots)
 MIN_LIQUIDITY = 200    # minimum event liquidity USD
 
 _WEATHER_KEYWORDS = [
@@ -564,8 +566,15 @@ def scan(min_edge=MIN_EDGE, min_liquidity=MIN_LIQUIDITY, verbose=True):
             )
             kelly_f = math_engine.kelly_fraction(our_prob, 1 - our_price, our_price)
 
-            # Tradeable when both sources agree, OR single Open-Meteo source (international)
-            tradeable = (sources_agree or single_source_ok) and ev_pct > 0 and kelly_f > 0
+            # Tradeable: BOTH sources must agree (no single-source trades for international)
+            # AND edge >= 15pp AND the token we're buying must be >= 35¢ (no long shots)
+            tradeable = (
+                sources_agree
+                and ev_pct > 0
+                and kelly_f > 0
+                and abs(combined_edge) >= MIN_TRADE_EDGE
+                and our_price >= MIN_TRADE_PRICE
+            )
 
             opp = {
                 # Identity
