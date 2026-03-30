@@ -2,13 +2,16 @@
 import json
 import os
 import sqlite3
+import threading
 import time
 from pathlib import Path
 
 DB_PATH = Path(os.environ.get("SCANNER_DB_PATH", Path(__file__).parent / "scanner.db"))
+_INIT_LOCK = threading.Lock()
+_DB_INITIALIZED = False
 
 
-def get_conn():
+def _connect():
     conn = sqlite3.connect(str(DB_PATH))
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
@@ -16,9 +19,16 @@ def get_conn():
     return conn
 
 
-def init_db():
-    """Create tables if they don't exist."""
-    conn = get_conn()
+def _table_columns(conn, table_name):
+    return {row["name"] for row in conn.execute(f"PRAGMA table_info({table_name})").fetchall()}
+
+
+def _add_column_if_missing(conn, table_name, column_name, column_type):
+    if column_name not in _table_columns(conn, table_name):
+        conn.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_type}")
+
+
+def _migration_001_base_schema(conn):
     conn.executescript("""
         CREATE TABLE IF NOT EXISTS signals (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -42,7 +52,9 @@ def init_db():
             grade_label TEXT,
             tradeable INTEGER DEFAULT 0,
             ev_json TEXT,
-            sizing_json TEXT
+            sizing_json TEXT,
+            token_id_a TEXT,
+            token_id_b TEXT
         );
 
         CREATE TABLE IF NOT EXISTS trades (
@@ -59,7 +71,15 @@ def init_db():
             size_usd REAL DEFAULT 100,
             pnl REAL,
             status TEXT DEFAULT 'open',
-            notes TEXT
+            notes TEXT,
+            trade_type TEXT DEFAULT 'pairs',
+            weather_signal_id INTEGER,
+            token_id_a TEXT,
+            token_id_b TEXT,
+            copy_wallet TEXT,
+            copy_label TEXT,
+            copy_condition_id TEXT,
+            copy_outcome TEXT
         );
 
         CREATE TABLE IF NOT EXISTS snapshots (
@@ -192,8 +212,8 @@ def init_db():
             expires_at   REAL NOT NULL
         );
 
-        CREATE INDEX IF NOT EXISTS idx_open_orders_status   ON open_orders(status);
-        CREATE INDEX IF NOT EXISTS idx_open_orders_trade    ON open_orders(trade_id);
+        CREATE INDEX IF NOT EXISTS idx_open_orders_status ON open_orders(status);
+        CREATE INDEX IF NOT EXISTS idx_open_orders_trade ON open_orders(trade_id);
         CREATE INDEX IF NOT EXISTS idx_wallet_candidates_status ON wallet_candidates(status);
         CREATE INDEX IF NOT EXISTS idx_signals_ts ON signals(timestamp);
         CREATE INDEX IF NOT EXISTS idx_trades_status ON trades(status);
@@ -202,16 +222,19 @@ def init_db():
         CREATE INDEX IF NOT EXISTS idx_locked_arb_ts ON locked_arb(timestamp);
         CREATE INDEX IF NOT EXISTS idx_watched_wallets_active ON watched_wallets(active);
     """)
-    # Migrate: add new columns if they don't exist (safe for existing DBs)
-    for col, coltype in [("grade_label", "TEXT"), ("tradeable", "INTEGER DEFAULT 0"),
-                         ("ev_json", "TEXT"), ("sizing_json", "TEXT"),
-                         ("token_id_a", "TEXT"), ("token_id_b", "TEXT")]:
-        try:
-            conn.execute(f"ALTER TABLE signals ADD COLUMN {col} {coltype}")
-        except sqlite3.OperationalError:
-            pass
 
-    # trades: multi-type support (pairs, weather, copy)
+
+def _migration_002_backfill_columns(conn):
+    for col, coltype in [
+        ("grade_label", "TEXT"),
+        ("tradeable", "INTEGER DEFAULT 0"),
+        ("ev_json", "TEXT"),
+        ("sizing_json", "TEXT"),
+        ("token_id_a", "TEXT"),
+        ("token_id_b", "TEXT"),
+    ]:
+        _add_column_if_missing(conn, "signals", col, coltype)
+
     for col, coltype in [
         ("trade_type", "TEXT DEFAULT 'pairs'"),
         ("weather_signal_id", "INTEGER"),
@@ -222,13 +245,75 @@ def init_db():
         ("copy_condition_id", "TEXT"),
         ("copy_outcome", "TEXT"),
     ]:
-        try:
-            conn.execute(f"ALTER TABLE trades ADD COLUMN {col} {coltype}")
-        except sqlite3.OperationalError:
-            pass
+        _add_column_if_missing(conn, "trades", col, coltype)
 
-    conn.commit()
-    conn.close()
+
+def _migration_003_scan_jobs(conn):
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS scan_jobs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            kind TEXT NOT NULL,
+            status TEXT NOT NULL,
+            params_json TEXT,
+            result_json TEXT,
+            error TEXT,
+            created_at REAL NOT NULL,
+            started_at REAL,
+            finished_at REAL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_scan_jobs_status ON scan_jobs(status);
+        CREATE INDEX IF NOT EXISTS idx_scan_jobs_kind ON scan_jobs(kind);
+        CREATE INDEX IF NOT EXISTS idx_scan_jobs_created_at ON scan_jobs(created_at);
+    """)
+
+
+_MIGRATIONS = [
+    ("001_base_schema", _migration_001_base_schema),
+    ("002_backfill_columns", _migration_002_backfill_columns),
+    ("003_scan_jobs", _migration_003_scan_jobs),
+]
+
+
+def get_conn():
+    init_db()
+    return _connect()
+
+
+def init_db():
+    """Create or migrate the database schema."""
+    global _DB_INITIALIZED
+    if _DB_INITIALIZED:
+        return
+
+    with _INIT_LOCK:
+        if _DB_INITIALIZED:
+            return
+
+        conn = _connect()
+        try:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS schema_migrations (
+                    name TEXT PRIMARY KEY,
+                    applied_at REAL NOT NULL
+                )
+            """)
+            applied = {
+                row["name"]
+                for row in conn.execute("SELECT name FROM schema_migrations").fetchall()
+            }
+            for name, migration in _MIGRATIONS:
+                if name in applied:
+                    continue
+                migration(conn)
+                conn.execute(
+                    "INSERT INTO schema_migrations (name, applied_at) VALUES (?, ?)",
+                    (name, time.time()),
+                )
+            conn.commit()
+            _DB_INITIALIZED = True
+        finally:
+            conn.close()
 
 
 # --- Signals ---
@@ -649,6 +734,62 @@ def get_locked_arb(limit=50, tradeable_only=False):
     return [dict(r) for r in rows]
 
 
+# --- Jobs ---
+
+def create_scan_job(kind: str, params: dict | None = None) -> int:
+    conn = get_conn()
+    conn.execute("""
+        INSERT INTO scan_jobs (kind, status, params_json, created_at)
+        VALUES (?, 'queued', ?, ?)
+    """, (kind, json.dumps(params or {}), time.time()))
+    job_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+    conn.commit()
+    conn.close()
+    return job_id
+
+
+def start_scan_job(job_id: int) -> None:
+    conn = get_conn()
+    conn.execute(
+        "UPDATE scan_jobs SET status='running', started_at=? WHERE id=?",
+        (time.time(), job_id),
+    )
+    conn.commit()
+    conn.close()
+
+
+def finish_scan_job(job_id: int, result: dict) -> None:
+    conn = get_conn()
+    conn.execute(
+        "UPDATE scan_jobs SET status='completed', result_json=?, finished_at=? WHERE id=?",
+        (json.dumps(result), time.time(), job_id),
+    )
+    conn.commit()
+    conn.close()
+
+
+def fail_scan_job(job_id: int, error: str) -> None:
+    conn = get_conn()
+    conn.execute(
+        "UPDATE scan_jobs SET status='failed', error=?, finished_at=? WHERE id=?",
+        (error, time.time(), job_id),
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_scan_job(job_id: int) -> dict | None:
+    conn = get_conn()
+    row = conn.execute("SELECT * FROM scan_jobs WHERE id=?", (job_id,)).fetchone()
+    conn.close()
+    if not row:
+        return None
+    job = dict(row)
+    job["params"] = json.loads(job.pop("params_json")) if job.get("params_json") else None
+    job["result"] = json.loads(job.pop("result_json")) if job.get("result_json") else None
+    return job
+
+
 # --- Scan Runs ---
 
 def save_scan_run(pairs_tested, cointegrated, opportunities, duration):
@@ -933,7 +1074,3 @@ def cancel_open_order(row_id: int, reason: str = "expired") -> None:
     )
     conn.commit()
     conn.close()
-
-
-# Initialize on import
-init_db()

@@ -13,30 +13,18 @@ How it works:
 import json
 import logging
 import sys
-from datetime import datetime, timezone
-import numpy as np
-from statsmodels.tsa.stattools import coint
-from sklearn.linear_model import LinearRegression
 
 import api
 import math_engine
 from log_setup import init_logging
+from scanner_core import MIN_DAYS_TO_RESOLUTION, align_prices, days_to_resolution, test_pair as core_test_pair
 
 init_logging()
 log = logging.getLogger("scanner.core")
 
-MIN_DAYS_TO_RESOLUTION = 21   # filter #1: skip pairs resolving too soon
-
 
 def _days_to_resolution(end_date_str):
-    """Return days until market resolves, or inf if unknown/unparseable."""
-    if not end_date_str:
-        return float("inf")
-    try:
-        end = datetime.fromisoformat(end_date_str.replace("Z", "+00:00"))
-        return max(0, (end - datetime.now(timezone.utc)).days)
-    except (ValueError, TypeError):
-        return float("inf")
+    return days_to_resolution(end_date_str)
 
 
 def find_multi_market_events(min_markets=2, max_markets=15, min_liquidity=1000, max_events=200):
@@ -100,98 +88,16 @@ def get_aligned_prices(token_a, token_b, interval="1w", fidelity=100):
     """Fetch price history for two tokens and align by timestamp."""
     hist_a = api.get_price_history(token_a, interval=interval, fidelity=fidelity)
     hist_b = api.get_price_history(token_b, interval=interval, fidelity=fidelity)
-
-    if not hist_a or not hist_b:
-        return None, None
-
-    # Build timestamp -> price maps
-    map_a = {h["t"]: h["p"] for h in hist_a}
-    map_b = {h["t"]: h["p"] for h in hist_b}
-
-    # Find common timestamps (or nearest within tolerance)
-    common_ts = sorted(set(map_a.keys()) & set(map_b.keys()))
-
-    if len(common_ts) < 20:
-        # Try aligning by index position instead (same fidelity = same sample count)
-        if len(hist_a) >= 20 and len(hist_b) >= 20:
-            min_len = min(len(hist_a), len(hist_b))
-            prices_a = np.array([h["p"] for h in hist_a[-min_len:]])
-            prices_b = np.array([h["p"] for h in hist_b[-min_len:]])
-            return prices_a, prices_b
-        return None, None
-
-    prices_a = np.array([map_a[t] for t in common_ts])
-    prices_b = np.array([map_b[t] for t in common_ts])
-    return prices_a, prices_b
+    return align_prices(hist_a, hist_b)
 
 
 def test_pair(prices_a, prices_b):
-    """Run cointegration test and compute spread statistics.
-
-    Returns dict with test results or None if not enough data.
-    """
-    if prices_a is None or prices_b is None:
-        return None
-    if len(prices_a) < 20 or len(prices_b) < 20:
-        return None
-
-    # Check for constant series (no variance = no signal)
-    if np.std(prices_a) < 0.001 or np.std(prices_b) < 0.001:
-        return None
-
-    # Cointegration test
-    try:
-        score, pvalue, crit_values = coint(prices_a, prices_b)
-    except Exception:
-        return None
-
-    # Beta (hedge ratio)
-    model = LinearRegression()
-    model.fit(prices_b.reshape(-1, 1), prices_a)
-    beta = model.coef_[0]
-
-    # Spread and z-score
-    spread = prices_a - beta * prices_b
-    mean_spread = np.mean(spread)
-    std_spread = np.std(spread)
-
-    if std_spread < 0.0001:
-        return None
-
-    z_score = (spread[-1] - mean_spread) / std_spread
-
-    # Filter #2: spread momentum — is the spread retreating toward the mean?
-    z_prev = float((spread[-2] - mean_spread) / std_spread) if len(spread) >= 2 else float(z_score)
-    spread_retreating = bool(abs(z_score) < abs(z_prev))
-
-    # Half-life of mean reversion (how fast the spread reverts)
-    spread_lag = spread[:-1]
-    spread_diff = np.diff(spread)
-    if len(spread_lag) > 5:
-        hl_model = LinearRegression()
-        hl_model.fit(spread_lag.reshape(-1, 1), spread_diff)
-        lam = hl_model.coef_[0]
-        half_life = -np.log(2) / lam if lam < 0 else float("inf")
-    else:
-        half_life = float("inf")
-
-    return {
-        "coint_score": float(score),
-        "coint_pvalue": float(pvalue),
-        "beta": float(beta),
-        "z_score": float(z_score),
-        "z_prev": float(z_prev),
-        "spread_retreating": spread_retreating,
-        "spread_mean": float(mean_spread),
-        "spread_std": float(std_spread),
-        "current_spread": float(spread[-1]),
-        "half_life": float(half_life),
-        "n_points": int(len(prices_a)),
-    }
+    """Run cointegration test and compute spread statistics."""
+    return core_test_pair(prices_a, prices_b)
 
 
 def scan(z_threshold=1.5, p_threshold=0.10, min_liquidity=5000,
-         interval="1w", fidelity=100, verbose=True):
+         interval="1w", fidelity=100, verbose=True, include_stats=False):
     """Run the full scan. Returns list of opportunities sorted by |z-score|.
 
     Args:
@@ -206,7 +112,8 @@ def scan(z_threshold=1.5, p_threshold=0.10, min_liquidity=5000,
         events = find_multi_market_events(min_liquidity=min_liquidity)
     except Exception as e:
         log.error("Failed to fetch events: %s", e)
-        return []
+        empty = {"opportunities": [], "pairs_tested": 0, "pairs_cointegrated": 0}
+        return empty if include_stats else []
 
     log.info("Found %d events with 2+ active markets", len(events))
     if verbose:
@@ -323,6 +230,13 @@ def scan(z_threshold=1.5, p_threshold=0.10, min_liquidity=5000,
         print(f"Cointegrated (p<{p_threshold}): {pairs_cointegrated}")
         print(f"Diverged (|z|>{z_threshold}): {len(opportunities)}")
         print(f"{'='*60}")
+
+    if include_stats:
+        return {
+            "opportunities": opportunities,
+            "pairs_tested": pairs_tested,
+            "pairs_cointegrated": pairs_cointegrated,
+        }
 
     return opportunities
 

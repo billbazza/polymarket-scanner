@@ -887,10 +887,39 @@ async function _scan(btnId, label, endpoint, onDone) {
   try {
     const r = await fetch(API + endpoint, { method: 'POST' });
     const data = await r.json();
-    onDone(data);
-    document.getElementById('lastScan').textContent = 'Last scan: just now';
+    if (!r.ok) {
+      throw new Error(data.detail || data.error || `HTTP ${r.status}`);
+    }
+    if (!data.job_id) {
+      throw new Error('Scan job did not return a job id');
+    }
+
+    const poll = async () => {
+      const jr = await fetch(API + `/api/jobs/${data.job_id}`);
+      const job = await jr.json();
+      if (!jr.ok) {
+        throw new Error(job.detail || `Job ${data.job_id} failed to load`);
+      }
+      if (job.status === 'completed') {
+        onDone(job.result || {});
+        document.getElementById('lastScan').textContent = 'Last scan: just now';
+        return;
+      }
+      if (job.status === 'failed') {
+        throw new Error(job.error || 'Scan job failed');
+      }
+      setTimeout(() => {
+        poll().catch(e => {
+          toast('Scan failed: ' + e.message, true);
+          btn.disabled = false;
+          btn.innerHTML = label;
+        });
+      }, 2000);
+    };
+
+    await poll();
   } catch(e) {
-    toast('Scan failed: ' + e.message);
+    toast('Scan failed: ' + e.message, true);
   }
   btn.disabled = false;
   btn.innerHTML = label;

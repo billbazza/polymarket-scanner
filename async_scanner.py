@@ -7,30 +7,18 @@ import asyncio
 import json
 import logging
 import time
-from datetime import datetime, timezone
-import numpy as np
-from statsmodels.tsa.stattools import coint
-from sklearn.linear_model import LinearRegression
 
 import async_api
 import math_engine
 from log_setup import init_logging
+from scanner_core import MIN_DAYS_TO_RESOLUTION, align_prices, days_to_resolution, test_pair as core_test_pair
 
 init_logging()
 log = logging.getLogger("scanner.async")
 
-MIN_DAYS_TO_RESOLUTION = 21
-
 
 def _days_to_resolution(end_date_str):
-    """Return days until market resolves, or inf if unknown/unparseable."""
-    if not end_date_str:
-        return float("inf")
-    try:
-        end = datetime.fromisoformat(end_date_str.replace("Z", "+00:00"))
-        return max(0, (end - datetime.now(timezone.utc)).days)
-    except (ValueError, TypeError):
-        return float("inf")
+    return days_to_resolution(end_date_str)
 
 
 async def find_multi_market_events(min_markets=2, max_markets=15, min_liquidity=1000):
@@ -82,87 +70,23 @@ async def find_multi_market_events(min_markets=2, max_markets=15, min_liquidity=
 
 def _align_prices(hist_a, hist_b):
     """Align two price history lists by timestamp."""
-    if not hist_a or not hist_b:
-        return None, None
-
-    map_a = {h["t"]: h["p"] for h in hist_a}
-    map_b = {h["t"]: h["p"] for h in hist_b}
-    common_ts = sorted(set(map_a.keys()) & set(map_b.keys()))
-
-    if len(common_ts) < 20:
-        if len(hist_a) >= 20 and len(hist_b) >= 20:
-            min_len = min(len(hist_a), len(hist_b))
-            return (np.array([h["p"] for h in hist_a[-min_len:]]),
-                    np.array([h["p"] for h in hist_b[-min_len:]]))
-        return None, None
-
-    return (np.array([map_a[t] for t in common_ts]),
-            np.array([map_b[t] for t in common_ts]))
+    return align_prices(hist_a, hist_b)
 
 
 def _test_pair(prices_a, prices_b):
     """Run cointegration test (same as scanner.test_pair)."""
-    if prices_a is None or prices_b is None:
-        return None
-    if len(prices_a) < 20 or len(prices_b) < 20:
-        return None
-    if np.std(prices_a) < 0.001 or np.std(prices_b) < 0.001:
-        return None
-
-    try:
-        score, pvalue, crit_values = coint(prices_a, prices_b)
-    except Exception:
-        return None
-
-    model = LinearRegression()
-    model.fit(prices_b.reshape(-1, 1), prices_a)
-    beta = model.coef_[0]
-
-    spread = prices_a - beta * prices_b
-    mean_spread = np.mean(spread)
-    std_spread = np.std(spread)
-    if std_spread < 0.0001:
-        return None
-
-    z_score = (spread[-1] - mean_spread) / std_spread
-
-    # Filter #2: spread momentum
-    z_prev = float((spread[-2] - mean_spread) / std_spread) if len(spread) >= 2 else float(z_score)
-    spread_retreating = bool(abs(z_score) < abs(z_prev))
-
-    spread_lag = spread[:-1]
-    spread_diff = np.diff(spread)
-    if len(spread_lag) > 5:
-        hl_model = LinearRegression()
-        hl_model.fit(spread_lag.reshape(-1, 1), spread_diff)
-        lam = hl_model.coef_[0]
-        half_life = -np.log(2) / lam if lam < 0 else float("inf")
-    else:
-        half_life = float("inf")
-
-    return {
-        "coint_score": float(score),
-        "coint_pvalue": float(pvalue),
-        "beta": float(beta),
-        "z_score": float(z_score),
-        "z_prev": float(z_prev),
-        "spread_retreating": spread_retreating,
-        "spread_mean": float(mean_spread),
-        "spread_std": float(std_spread),
-        "current_spread": float(spread[-1]),
-        "half_life": float(half_life),
-        "n_points": int(len(prices_a)),
-    }
+    return core_test_pair(prices_a, prices_b)
 
 
 async def scan(z_threshold=1.5, p_threshold=0.10, min_liquidity=5000,
-               interval="1w", fidelity=100, verbose=True):
+               interval="1w", fidelity=100, verbose=True, include_stats=False):
     """Async scan — fetches all prices in parallel, then tests pairs."""
     try:
         events = await find_multi_market_events(min_liquidity=min_liquidity)
     except Exception as e:
         log.error("Failed to fetch events: %s", e)
-        return []
+        empty = {"opportunities": [], "pairs_tested": 0, "pairs_cointegrated": 0}
+        return empty if include_stats else []
 
     log.info("Found %d events with 2+ active markets", len(events))
 
@@ -177,9 +101,12 @@ async def scan(z_threshold=1.5, p_threshold=0.10, min_liquidity=5000,
     t0 = time.time()
 
     # Fetch all price histories in parallel
-    histories = await async_api.get_price_histories(
-        list(all_tokens), interval=interval, fidelity=fidelity, max_concurrent=15
-    )
+    try:
+        histories = await async_api.get_price_histories(
+            list(all_tokens), interval=interval, fidelity=fidelity, max_concurrent=15
+        )
+    finally:
+        await async_api.close()
 
     fetch_time = time.time() - t0
     log.info("Fetched %d histories in %.1fs", len(histories), fetch_time)
@@ -276,7 +203,13 @@ async def scan(z_threshold=1.5, p_threshold=0.10, min_liquidity=5000,
     log.info("Async scan: %d tested, %d cointegrated, %d diverged (fetch=%.1fs)",
              pairs_tested, pairs_cointegrated, len(opportunities), fetch_time)
 
-    await async_api.close()
+    if include_stats:
+        return {
+            "opportunities": opportunities,
+            "pairs_tested": pairs_tested,
+            "pairs_cointegrated": pairs_cointegrated,
+        }
+
     return opportunities
 
 

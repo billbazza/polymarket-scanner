@@ -39,23 +39,25 @@ def main():
     t0 = time.time()
 
     try:
-        opportunities = scanner.scan(
+        scan_result = scanner.scan(
             z_threshold=z_thresh,
             p_threshold=p_thresh,
             min_liquidity=5000,
             interval="1w",
             verbose=False,
+            include_stats=True,
         )
     except Exception as e:
         log.error("Cron scan failed: %s", e)
         return
 
     duration = time.time() - t0
+    opportunities = scan_result["opportunities"]
 
     # Save scan run
     db.save_scan_run(
-        pairs_tested=0,
-        cointegrated=0,
+        pairs_tested=scan_result["pairs_tested"],
+        cointegrated=scan_result["pairs_cointegrated"],
         opportunities=len(opportunities),
         duration=duration,
     )

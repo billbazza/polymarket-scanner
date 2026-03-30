@@ -3,12 +3,15 @@ from dotenv import load_dotenv
 load_dotenv()
 
 import logging
+import threading
 import time
 from pathlib import Path
+import asyncio
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 
+from auth import require_admin, require_operator
 import db
 import scanner
 import brain
@@ -22,6 +25,7 @@ app = FastAPI(title="Polymarket Scanner")
 
 @app.on_event("startup")
 async def startup_event():
+    db.init_db()
     try:
         import wallet_monitor
         wallet_monitor.start()
@@ -29,7 +33,105 @@ async def startup_event():
     except Exception as e:
         log.warning("Wallet monitor failed to start: %s", e)
 
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    try:
+        import wallet_monitor
+        wallet_monitor.stop()
+    except Exception as e:
+        log.warning("Wallet monitor failed to stop cleanly: %s", e)
+
+    try:
+        import async_api
+        await async_api.close()
+    except Exception as e:
+        log.warning("Async API client failed to close cleanly: %s", e)
+
+
+@app.middleware("http")
+async def authorize_mutating_routes(request: Request, call_next):
+    if request.method in {"GET", "HEAD", "OPTIONS"}:
+        return await call_next(request)
+
+    path = request.url.path
+    required = None
+
+    if (
+        path.startswith("/api/trades")
+        or path.startswith("/api/weather/")
+        or path == "/api/copy/mirror"
+        or path == "/api/copy/watch"
+        or path.startswith("/api/copy/watch/")
+        or path.startswith("/api/copy/candidates/")
+    ):
+        required = "admin"
+    elif (
+        path.startswith("/api/scan")
+        or path == "/api/autonomy"
+        or path.startswith("/api/brain/validate/")
+        or path == "/api/copy/score"
+        or path == "/api/copy/discover"
+    ):
+        required = "operator"
+
+    if required == "admin":
+        await require_admin(request=request, x_api_key=request.headers.get("X-API-Key"))
+    elif required == "operator":
+        await require_operator(request=request, x_api_key=request.headers.get("X-API-Key"))
+
+    return await call_next(request)
+
 DASHBOARD_PATH = Path(__file__).parent / "dashboard.html"
+
+
+def _save_pairs_scan_run(scan_result, duration):
+    opportunities = scan_result["opportunities"]
+    db.save_scan_run(
+        pairs_tested=scan_result["pairs_tested"],
+        cointegrated=scan_result["pairs_cointegrated"],
+        opportunities=len(opportunities),
+        duration=duration,
+    )
+
+    signal_ids = []
+    for opp in opportunities:
+        try:
+            signal_ids.append(db.save_signal(opp))
+        except Exception as e:
+            log.warning("Failed to save signal: %s", e)
+
+    return {
+        "opportunities": len(opportunities),
+        "signal_ids": signal_ids,
+        "duration_secs": round(duration, 1),
+        "signals": opportunities,
+        "pairs_tested": scan_result["pairs_tested"],
+        "cointegrated": scan_result["pairs_cointegrated"],
+    }
+
+
+def _run_job(job_id, job_kind, work_fn):
+    db.start_scan_job(job_id)
+    try:
+        result = work_fn()
+        db.finish_scan_job(job_id, result)
+        log.info("%s job %d completed", job_kind, job_id)
+    except Exception as e:
+        log.error("%s job %d failed: %s", job_kind, job_id, e)
+        db.fail_scan_job(job_id, str(e))
+
+
+def _start_job(job_kind, params, work_fn):
+    job_id = db.create_scan_job(job_kind, params)
+    thread = threading.Thread(
+        target=_run_job,
+        args=(job_id, job_kind, work_fn),
+        name=f"{job_kind}-job-{job_id}",
+        daemon=True,
+    )
+    thread.start()
+    return JSONResponse(status_code=202, content={"job_id": job_id, "status": "queued", "kind": job_kind})
 
 
 # --- Dashboard ---
@@ -70,51 +172,21 @@ async def run_scan(
     min_liquidity: float = 5000,
     interval: str = "1w",
 ):
-    """Run a scan and save results to DB."""
-    t0 = time.time()
-    log.info("Scan started: z>%.1f p<%.2f liq>$%.0f interval=%s",
-             z_threshold, p_threshold, min_liquidity, interval)
-
-    try:
-        opportunities = scanner.scan(
-            z_threshold=z_threshold,
-            p_threshold=p_threshold,
-            min_liquidity=min_liquidity,
-            interval=interval,
-            verbose=False,
-        )
-    except Exception as e:
-        log.error("Scan failed: %s", e)
-        return JSONResponse(
-            status_code=500,
-            content={"error": f"Scan failed: {e}", "opportunities": 0},
-        )
-
-    duration = time.time() - t0
-
-    db.save_scan_run(
-        pairs_tested=0,
-        cointegrated=0,
-        opportunities=len(opportunities),
-        duration=duration,
-    )
-
-    signal_ids = []
-    for opp in opportunities:
-        try:
-            sid = db.save_signal(opp)
-            signal_ids.append(sid)
-        except Exception as e:
-            log.warning("Failed to save signal: %s", e)
-
-    log.info("Scan complete: %d opportunities in %.1fs", len(opportunities), duration)
-
-    return {
-        "opportunities": len(opportunities),
-        "signal_ids": signal_ids,
-        "duration_secs": round(duration, 1),
-        "signals": opportunities,
+    """Queue a scan and return a persisted job id."""
+    params = {
+        "z_threshold": z_threshold,
+        "p_threshold": p_threshold,
+        "min_liquidity": min_liquidity,
+        "interval": interval,
     }
+    log.info("Queued scan job: %s", params)
+
+    def work():
+        t0 = time.time()
+        result = scanner.scan(verbose=False, include_stats=True, **params)
+        return _save_pairs_scan_run(result, time.time() - t0)
+
+    return _start_job("scan", params, work)
 
 
 # --- Fast Scan (async) ---
@@ -126,49 +198,23 @@ async def run_fast_scan(
     min_liquidity: float = 5000,
     interval: str = "1w",
 ):
-    """Async scan — parallel API calls, ~5x faster."""
+    """Queue the async scanner and return a persisted job id."""
     import async_scanner
-    t0 = time.time()
-    log.info("Fast scan started")
 
-    try:
-        opportunities = await async_scanner.scan(
-            z_threshold=z_threshold,
-            p_threshold=p_threshold,
-            min_liquidity=min_liquidity,
-            interval=interval,
-            verbose=False,
-        )
-    except Exception as e:
-        log.error("Fast scan failed: %s", e)
-        return JSONResponse(
-            status_code=500,
-            content={"error": f"Fast scan failed: {e}", "opportunities": 0},
-        )
-
-    duration = time.time() - t0
-
-    db.save_scan_run(
-        pairs_tested=0, cointegrated=0,
-        opportunities=len(opportunities), duration=duration,
-    )
-
-    signal_ids = []
-    for opp in opportunities:
-        try:
-            sid = db.save_signal(opp)
-            signal_ids.append(sid)
-        except Exception as e:
-            log.warning("Failed to save signal: %s", e)
-
-    log.info("Fast scan complete: %d opportunities in %.1fs", len(opportunities), duration)
-
-    return {
-        "opportunities": len(opportunities),
-        "signal_ids": signal_ids,
-        "duration_secs": round(duration, 1),
-        "signals": opportunities,
+    params = {
+        "z_threshold": z_threshold,
+        "p_threshold": p_threshold,
+        "min_liquidity": min_liquidity,
+        "interval": interval,
     }
+    log.info("Queued fast scan job: %s", params)
+
+    def work():
+        t0 = time.time()
+        result = asyncio.run(async_scanner.scan(verbose=False, include_stats=True, **params))
+        return _save_pairs_scan_run(result, time.time() - t0)
+
+    return _start_job("fast_scan", params, work)
 
 
 # --- Weather Edge ---
@@ -178,47 +224,37 @@ async def run_weather_scan(
     min_edge: float = 0.06,
     min_liquidity: float = 200,
 ):
-    """Scan Polymarket temperature markets for edge vs NOAA forecasts.
-
-    Parses market questions to extract city/threshold/date, fetches NOAA
-    hourly forecast, converts to probability, flags divergences ≥ min_edge.
-    """
+    """Queue the weather scan and return a persisted job id."""
     import weather_scanner
-    t0 = time.time()
-    log.info("Weather scan started: min_edge=%.2f min_liq=%.0f", min_edge, min_liquidity)
 
-    try:
-        opportunities, meta = weather_scanner.scan(
-            min_edge=min_edge,
-            min_liquidity=min_liquidity,
-            verbose=False,
-        )
-    except Exception as e:
-        log.error("Weather scan failed: %s", e)
-        return JSONResponse(status_code=500, content={"error": str(e), "opportunities": 0})
-
-    duration = time.time() - t0
-
-    saved_ids = []
-    for opp in opportunities:
-        try:
-            row_id = db.save_weather_signal(opp)
-            saved_ids.append(row_id)
-        except Exception as e:
-            log.warning("Failed to save weather signal: %s", e)
-
-    tradeable = sum(1 for o in opportunities if o.get("tradeable"))
-    log.info("Weather scan complete: %d opps (%d tradeable) in %.1fs", len(opportunities), tradeable, duration)
-
-    return {
-        "opportunities": len(opportunities),
-        "tradeable": tradeable,
-        "saved_ids": saved_ids,
-        "duration_secs": round(duration, 1),
-        "markets_checked": meta.get("markets_checked", 0),
-        "weather_found": meta.get("weather_found", 0),
-        "results": opportunities,
+    params = {
+        "min_edge": min_edge,
+        "min_liquidity": min_liquidity,
     }
+    log.info("Queued weather scan job: %s", params)
+
+    def work():
+        t0 = time.time()
+        opportunities, meta = weather_scanner.scan(verbose=False, **params)
+        saved_ids = []
+        for opp in opportunities:
+            try:
+                saved_ids.append(db.save_weather_signal(opp))
+            except Exception as e:
+                log.warning("Failed to save weather signal: %s", e)
+
+        tradeable = sum(1 for o in opportunities if o.get("tradeable"))
+        return {
+            "opportunities": len(opportunities),
+            "tradeable": tradeable,
+            "saved_ids": saved_ids,
+            "duration_secs": round(time.time() - t0, 1),
+            "markets_checked": meta.get("markets_checked", 0),
+            "weather_found": meta.get("weather_found", 0),
+            "results": opportunities,
+        }
+
+    return _start_job("weather_scan", params, work)
 
 
 @app.get("/api/weather")
@@ -236,47 +272,37 @@ async def run_locked_scan(
     check_slippage: bool = True,
     trade_size_usd: float = 100,
 ):
-    """Scan all active binary markets for locked-market arbitrage.
-
-    Flags markets where YES + NO prices sum to < $1.00 after fees,
-    giving a guaranteed profit by buying both sides.
-    """
+    """Queue the locked-market scan and return a persisted job id."""
     import locked_scanner
-    t0 = time.time()
-    log.info("Locked-arb scan started: min_gap=%.3f min_liq=%.0f", min_net_gap, min_liquidity)
 
-    try:
-        opportunities = locked_scanner.scan(
-            min_net_gap=min_net_gap,
-            min_liquidity=min_liquidity,
-            check_slippage=check_slippage,
-            trade_size_usd=trade_size_usd,
-            verbose=False,
-        )
-    except Exception as e:
-        log.error("Locked scan failed: %s", e)
-        return JSONResponse(status_code=500, content={"error": str(e), "opportunities": 0})
-
-    duration = time.time() - t0
-
-    saved_ids = []
-    for opp in opportunities:
-        try:
-            row_id = db.save_locked_arb(opp)
-            saved_ids.append(row_id)
-        except Exception as e:
-            log.warning("Failed to save locked arb: %s", e)
-
-    tradeable = sum(1 for o in opportunities if o.get("tradeable"))
-    log.info("Locked scan complete: %d opps (%d tradeable) in %.1fs", len(opportunities), tradeable, duration)
-
-    return {
-        "opportunities": len(opportunities),
-        "tradeable": tradeable,
-        "saved_ids": saved_ids,
-        "duration_secs": round(duration, 1),
-        "results": opportunities,
+    params = {
+        "min_net_gap": min_net_gap,
+        "min_liquidity": min_liquidity,
+        "check_slippage": check_slippage,
+        "trade_size_usd": trade_size_usd,
     }
+    log.info("Queued locked scan job: %s", params)
+
+    def work():
+        t0 = time.time()
+        opportunities = locked_scanner.scan(verbose=False, **params)
+        saved_ids = []
+        for opp in opportunities:
+            try:
+                saved_ids.append(db.save_locked_arb(opp))
+            except Exception as e:
+                log.warning("Failed to save locked arb: %s", e)
+
+        tradeable = sum(1 for o in opportunities if o.get("tradeable"))
+        return {
+            "opportunities": len(opportunities),
+            "tradeable": tradeable,
+            "saved_ids": saved_ids,
+            "duration_secs": round(time.time() - t0, 1),
+            "results": opportunities,
+        }
+
+    return _start_job("locked_scan", params, work)
 
 
 @app.get("/api/locked")
@@ -355,6 +381,14 @@ async def trade_snapshots(trade_id: int):
 @app.get("/api/scan-runs")
 async def scan_runs(limit: int = 20):
     return db.get_scan_runs(limit=limit)
+
+
+@app.get("/api/jobs/{job_id}")
+async def get_job(job_id: int):
+    job = db.get_scan_job(job_id)
+    if not job:
+        raise HTTPException(404, "Job not found")
+    return job
 
 
 # --- Logs ---

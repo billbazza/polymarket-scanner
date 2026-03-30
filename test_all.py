@@ -92,7 +92,7 @@ def test_db():
     conn.close()
 
     for tbl in ["signals", "trades", "snapshots", "scan_runs",
-                "locked_arb", "weather_signals"]:
+                "locked_arb", "weather_signals", "scan_jobs", "schema_migrations"]:
         check(f"table '{tbl}' exists", tbl in tables)
 
     # get_signal_by_id — non-existent ID returns None
@@ -288,6 +288,7 @@ def test_momentum_filter():
     import numpy as np
     import scanner as sc
     import async_scanner as asc
+    from unittest.mock import patch
 
     # Build a cointegrated pair: A and B track each other with some noise,
     # then spread widens at the end (still diverging — spread_retreating = False)
@@ -321,6 +322,31 @@ def test_momentum_filter():
           result3 is not None and "z_prev" in result3)
     check("async _test_pair returns spread_retreating",
           result3 is not None and "spread_retreating" in result3)
+
+    mock_events = [{
+        "title": "Mock Event",
+        "liquidity": 10000,
+        "volume_24h": 500,
+        "markets": [
+            {"question": "A", "yes_token": "tok_a", "yes_price": 0.4, "end_date": "2099-01-01T00:00:00Z"},
+            {"question": "B", "yes_token": "tok_b", "yes_price": 0.6, "end_date": "2099-01-01T00:00:00Z"},
+        ],
+    }]
+    with patch("scanner.find_multi_market_events", return_value=mock_events), \
+         patch("scanner.get_aligned_prices", return_value=(prices_a2, prices_b)), \
+         patch("math_engine.score_opportunity", return_value={
+             "ev": {"ev_pct": 12},
+             "sizing": {"recommended_size": 10},
+             "filters": {},
+             "grade": "A",
+             "grade_label": "A",
+             "tradeable": True,
+         }):
+        stats = sc.scan(include_stats=True, verbose=False)
+    check("scan(include_stats=True) returns dict", isinstance(stats, dict))
+    check("scan stats include opportunities list", isinstance(stats.get("opportunities"), list))
+    check("scan stats include pairs_tested", "pairs_tested" in stats)
+    check("scan stats include pairs_cointegrated", "pairs_cointegrated" in stats)
 
 run("momentum_filter", test_momentum_filter)
 

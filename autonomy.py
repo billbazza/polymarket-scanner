@@ -204,30 +204,34 @@ def run_cycle(state):
     # Step 1: Scan for new signals (use fast async scanner, ~5x faster)
     log.info("Step 1: Scanning for signals (fast mode)...")
     try:
-        opportunities = asyncio.run(async_scanner.scan(
+        scan_result = asyncio.run(async_scanner.scan(
             z_threshold=1.5,
             p_threshold=0.10,
             min_liquidity=5000,
             interval="1w",
             verbose=False,
+            include_stats=True,
         ))
     except Exception as e:
         log.error("Fast scan failed, falling back to sync: %s", e)
         try:
-            opportunities = scanner.scan(
+            scan_result = scanner.scan(
                 z_threshold=1.5,
                 p_threshold=0.10,
                 min_liquidity=5000,
                 interval="1w",
                 verbose=False,
+                include_stats=True,
             )
         except Exception as e2:
             log.error("Scan failed: %s", e2)
             journal({"action": "scan_failed", "reason": str(e2), "level": level})
             return state
 
+    opportunities = scan_result["opportunities"]
+
     # Save scan run
-    db.save_scan_run(pairs_tested=0, cointegrated=0,
+    db.save_scan_run(pairs_tested=scan_result["pairs_tested"], cointegrated=scan_result["pairs_cointegrated"],
                      opportunities=len(opportunities), duration=0)
 
     # Save all signals
