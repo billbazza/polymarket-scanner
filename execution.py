@@ -31,6 +31,7 @@ ORDER_TTL_HOURS = 4
 _paper_state = {
     "balance": PAPER_BALANCE_USD,
     "fills": [],
+    "open_trade_sizes": {},
 }
 
 
@@ -230,6 +231,7 @@ def _execute_paper(signal, size_usd, price_a, price_b,
         return {"ok": False, "error": "DB open_trade failed", "mode": "paper"}
 
     _paper_state["balance"] -= size_usd
+    _paper_state["open_trade_sizes"][trade_id] = size_usd
 
     now = time.time()
     half = size_usd / 2
@@ -273,6 +275,18 @@ def _execute_paper(signal, size_usd, price_a, price_b,
         "size_usd": size_usd,
         "remaining_balance": _paper_state["balance"],
     }
+
+
+def settle_paper_trade(trade_id, pnl_usd):
+    """Credit principal plus realized P&L for tracked paper trades."""
+    size_usd = _paper_state["open_trade_sizes"].pop(trade_id, None)
+    if size_usd is None:
+        return False
+
+    _paper_state["balance"] += size_usd + (pnl_usd or 0)
+    log.info("PAPER CLOSE: trade=%d | pnl=$%.2f | bal=$%.2f",
+             trade_id, pnl_usd or 0, _paper_state["balance"])
+    return True
 
 
 def _execute_live(signal, size_usd, price_a, price_b,

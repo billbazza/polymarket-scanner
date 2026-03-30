@@ -169,6 +169,55 @@ def test_db():
 run("db", test_db)
 
 
+# ── 2b. Paper execution balance lifecycle ───────────────────────────────────
+
+section("2b. Paper execution balance lifecycle")
+
+def test_paper_balance_lifecycle():
+    import db
+    import execution
+
+    execution._paper_state["balance"] = execution.PAPER_BALANCE_USD
+    execution._paper_state["open_trade_sizes"].clear()
+
+    signal = {
+        "event": "Paper Balance Test",
+        "market_a": "Will A happen?",
+        "market_b": "Will B happen?",
+        "price_a": 0.40,
+        "price_b": 0.60,
+        "z_score": -1.8,
+        "coint_pvalue": 0.04,
+        "beta": 1.0,
+        "half_life": 5.0,
+        "spread_mean": 0.0,
+        "spread_std": 0.1,
+        "current_spread": -0.2,
+        "liquidity": 5000,
+        "volume_24h": 1000,
+        "action": "BUY A / SELL B",
+        "token_id_a": "tok-a",
+        "token_id_b": "tok-b",
+    }
+    signal["id"] = db.save_signal(signal)
+
+    result = execution._execute_paper(signal, size_usd=100, price_a=0.40, price_b=0.60)
+    check("paper execute succeeds", result["ok"] is True)
+    check("paper balance debited on open",
+          execution._paper_state["balance"] == execution.PAPER_BALANCE_USD - 100)
+
+    pnl = db.close_trade(result["trade_id"], exit_price_a=0.50, exit_price_b=0.55)
+    expected_balance = execution.PAPER_BALANCE_USD + pnl
+    check("paper close returns pnl", pnl is not None)
+    check("paper balance restored on close",
+          abs(execution._paper_state["balance"] - expected_balance) < 1e-9,
+          f"balance={execution._paper_state['balance']}, expected={expected_balance}")
+    check("paper trade tracking cleared",
+          result["trade_id"] not in execution._paper_state["open_trade_sizes"])
+
+run("paper_balance", test_paper_balance_lifecycle)
+
+
 # ── 3. Math Engine ──────────────────────────────────────────────────────────
 
 section("3. Math engine — EV, Kelly, slippage")

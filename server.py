@@ -130,7 +130,12 @@ def _start_job(job_kind, params, work_fn):
         name=f"{job_kind}-job-{job_id}",
         daemon=True,
     )
-    thread.start()
+    try:
+        thread.start()
+    except Exception as e:
+        db.fail_scan_job(job_id, f"Failed to start background worker: {e}")
+        log.error("Failed to start %s job %d: %s", job_kind, job_id, e)
+        raise HTTPException(500, f"Failed to start {job_kind} job")
     return JSONResponse(status_code=202, content={"job_id": job_id, "status": "queued", "kind": job_kind})
 
 

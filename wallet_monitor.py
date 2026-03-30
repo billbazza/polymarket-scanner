@@ -65,6 +65,14 @@ _poll_thread: threading.Thread | None = None
 _stop_event = threading.Event()
 
 
+def _update_running_status():
+    global _poll_thread, _ws_thread
+    _status["running"] = any(
+        thread and thread.is_alive()
+        for thread in (_poll_thread, _ws_thread)
+    )
+
+
 # ── Scoring ────────────────────────────────────────────────────────────────────
 
 def score_wallet(address: str, label: str, activity_limit: int = 500) -> dict:
@@ -416,8 +424,20 @@ def _ws_thread_target():
     asyncio.set_event_loop(loop)
     try:
         loop.run_until_complete(_ws_price_feed())
+    except Exception as e:
+        log.exception("WS feed thread crashed: %s", e)
     finally:
         loop.close()
+        _update_running_status()
+
+
+def _poll_thread_target():
+    try:
+        _poll_loop()
+    except Exception as e:
+        log.exception("Poll thread crashed: %s", e)
+    finally:
+        _update_running_status()
 
 
 # ── Public API ─────────────────────────────────────────────────────────────────
@@ -426,25 +446,40 @@ def start():
     """Start the wallet monitor (polling + WebSocket). Call once from server.py."""
     global _poll_thread, _ws_thread
 
-    if _status["running"]:
+    poll_alive = _poll_thread is not None and _poll_thread.is_alive()
+    ws_alive = _ws_thread is not None and _ws_thread.is_alive()
+    if poll_alive or ws_alive:
+        _update_running_status()
         log.warning("Monitor already running")
         return
 
     _stop_event.clear()
-    _status["running"] = True
 
-    _poll_thread = threading.Thread(target=_poll_loop, name="wallet-monitor", daemon=True)
+    _poll_thread = threading.Thread(target=_poll_thread_target, name="wallet-monitor", daemon=True)
     _poll_thread.start()
 
     _ws_thread = threading.Thread(target=_ws_thread_target, name="ws-price-feed", daemon=True)
     _ws_thread.start()
 
+    _update_running_status()
     log.info("Wallet monitor started — polling every %ds, WS price feed active", POLL_INTERVAL)
 
 
-def stop():
+def stop(join_timeout: float = 5.0):
+    global _poll_thread, _ws_thread
     _stop_event.set()
-    _status["running"] = False
+    _save_state()
+
+    current = threading.current_thread()
+    for name, thread in (("poll", _poll_thread), ("ws", _ws_thread)):
+        if thread and thread.is_alive() and thread is not current:
+            thread.join(timeout=join_timeout)
+            if thread.is_alive():
+                log.warning("Monitor %s thread did not stop within %.1fs", name, join_timeout)
+
+    _poll_thread = None
+    _ws_thread = None
+    _update_running_status()
     log.info("Wallet monitor stopped")
 
 

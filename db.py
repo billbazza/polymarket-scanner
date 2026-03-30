@@ -569,6 +569,13 @@ def close_trade(trade_id, exit_price_a, exit_price_b=None, notes=""):
     """, (time.time(), exit_price_a, exit_b, pnl_usd, notes, trade_id))
     conn.commit()
     conn.close()
+
+    try:
+        import execution
+        execution.settle_paper_trade(trade_id, pnl_usd)
+    except Exception:
+        pass
+
     return pnl_usd
 
 
