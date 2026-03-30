@@ -21,6 +21,25 @@ MAKER_FEE_PCT  = 0.00   # maker orders: no fee
 # minimum for a z=2 signal to generate meaningful dollar EV.
 MIN_SPREAD_STD = 0.02
 
+# ── Category maker-edge table ───────────────────────────────────────────────
+# Empirical maker edge (%) by market category from research/ideas01.md.
+# Used to adjust the min_ev_pct hurdle in score_opportunity():
+#   - High-edge categories: relax hurdle (easier to pass)
+#   - Low-edge categories: tighten hurdle (require more signal)
+# Edge values represent the average per-trade advantage makers have in each
+# category relative to takers. "finance" barely moves — avoid unless signal
+# is very strong.
+CATEGORY_MAKER_EDGE = {
+    "world_events":  3.66,
+    "entertainment": 2.40,
+    "crypto":        1.34,
+    "sports":        1.11,
+    "politics":      0.51,
+    "finance":       0.08,
+}
+# Default hurdle when category is unknown
+DEFAULT_MIN_EV_PCT = 2.0
+
 
 def expected_value(win_prob, win_payout, loss_amount):
     """Calculate expected value of a trade.
@@ -129,13 +148,21 @@ def kelly_size(bankroll, win_prob, win_payout, loss_amount):
     }
 
 
-def position_size(bankroll, ev_result):
-    """Convenience: compute Kelly size from EV result."""
+def position_size(bankroll, ev_result, correlated_legs=False):
+    """Convenience: compute Kelly size from EV result.
+
+    correlated_legs: set True for pairs trades where both legs are exposed to
+    the same event. Kelly assumes independent bets; correlated legs double-count
+    the edge, so we halve the fraction to correct for it.
+    """
     f = kelly_fraction(ev_result["win_prob"], ev_result["win_payout"], ev_result["loss_amount"])
+    if correlated_legs:
+        f = round(f / 2, 4)
     return {
         "kelly_fraction": f,
         "recommended_size": round(bankroll * f, 2),
         "max_size": round(bankroll * 0.25, 2),  # never more than 25% of bankroll
+        "correlated_legs": correlated_legs,
     }
 
 
@@ -216,14 +243,40 @@ def check_slippage(token_id, trade_size_usd=100, max_slippage_pct=2.0):
     }
 
 
-def score_opportunity(opp, bankroll=1000, min_ev_pct=2.0, max_slippage_pct=2.0,
-                      fee_pct=TAKER_FEE_PCT, min_spread_std=MIN_SPREAD_STD):
+def category_ev_hurdle(category: str, base_min_ev_pct: float = DEFAULT_MIN_EV_PCT) -> float:
+    """Adjust EV hurdle based on market category maker edge.
+
+    High-edge categories (world events, entertainment) get a lower hurdle —
+    the structural maker advantage means we need less signal to have positive
+    expected outcome. Low-edge categories (finance) require stronger signals.
+
+    The adjustment is linear: category_edge / 2.0 subtracted from the hurdle,
+    capped so we never go below 0.5% (we always need some positive EV).
+    """
+    edge = CATEGORY_MAKER_EDGE.get(category, 0.0)
+    adjusted = base_min_ev_pct - (edge / 2.0)
+    return max(0.5, round(adjusted, 2))
+
+
+def score_opportunity(opp, bankroll=1000, min_ev_pct=DEFAULT_MIN_EV_PCT,
+                      max_slippage_pct=2.0, fee_pct=TAKER_FEE_PCT,
+                      min_spread_std=MIN_SPREAD_STD, correlated_legs=False):
     """Score a signal through all Tier 1 filters.
 
-    min_ev_pct is now NET of fees (2% default). Pass fee_pct=MAKER_FEE_PCT
+    min_ev_pct is NET of fees (2% default). Pass fee_pct=MAKER_FEE_PCT
     when executing as a maker to relax the EV hurdle appropriately.
+
+    correlated_legs=True halves Kelly for pairs trades (both legs exposed to
+    the same event — standard Kelly over-sizes correlated positions).
+
+    If opp contains a 'category' key, the EV hurdle is automatically adjusted
+    based on the category's empirical maker edge (CATEGORY_MAKER_EDGE table).
     """
     spread_std = opp.get("spread_std") or 0
+
+    # Adjust EV hurdle by category if available
+    category = opp.get("category", "")
+    effective_min_ev_pct = category_ev_hurdle(category, min_ev_pct) if category else min_ev_pct
 
     # EV calculation (fee-aware)
     ev = ev_from_zscore(
@@ -234,8 +287,8 @@ def score_opportunity(opp, bankroll=1000, min_ev_pct=2.0, max_slippage_pct=2.0,
         fee_pct=fee_pct,
     )
 
-    # Kelly sizing
-    sizing = position_size(bankroll, ev)
+    # Kelly sizing (halved for correlated two-leg pairs trades)
+    sizing = position_size(bankroll, ev, correlated_legs=correlated_legs)
 
     # Price filter: reject if either market is near resolution (outside 5%–95%)
     price_a = float(opp.get("price_a") or 0)
@@ -244,7 +297,7 @@ def score_opportunity(opp, bankroll=1000, min_ev_pct=2.0, max_slippage_pct=2.0,
 
     # Filters
     filters = {
-        "ev_pass":        bool(ev["ev_pct"] >= min_ev_pct),
+        "ev_pass":        bool(ev["ev_pct"] >= effective_min_ev_pct),
         "kelly_pass":     bool(sizing["kelly_fraction"] > 0),
         "z_pass":         bool(abs(opp["z_score"]) >= 1.5),
         "coint_pass":     bool(opp["coint_pvalue"] < 0.10),
@@ -261,9 +314,10 @@ def score_opportunity(opp, bankroll=1000, min_ev_pct=2.0, max_slippage_pct=2.0,
     # 8 filters → need all 8 for A+
     label = ["F", "D", "C", "B", "A", "A", "A", "A", "A+"][min(grade, 8)]
     log.info(
-        "Scored: %s | grade=%s ev=%.2f%%(net) spread_std=%.4f z=%.2f tradeable=%s",
-        opp.get("event", "?")[:40], label, ev["ev_pct"], spread_std,
-        opp["z_score"], all_pass,
+        "Scored: %s | grade=%s ev=%.2f%%(net) hurdle=%.1f%% category=%s "
+        "spread_std=%.4f z=%.2f tradeable=%s",
+        opp.get("event", "?")[:40], label, ev["ev_pct"], effective_min_ev_pct,
+        category or "unknown", spread_std, opp["z_score"], all_pass,
     )
 
     return {
@@ -275,4 +329,6 @@ def score_opportunity(opp, bankroll=1000, min_ev_pct=2.0, max_slippage_pct=2.0,
         "tradeable": all_pass,
         "grade_label": label,
         "fee_pct": fee_pct,
+        "category": category,
+        "effective_min_ev_pct": effective_min_ev_pct,
     }

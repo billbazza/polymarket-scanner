@@ -42,8 +42,8 @@ To activate live features: set keys in `.env` (see `.env.example`).
 ## Remaining (Future)
 - [ ] Telegram bot (aiogram) — alerts to phone
 - [ ] Position dashboard in Telegram — tap to see P&L, close trades
-- [ ] Polygonscan transaction tracing — reverse-engineer winner patterns
-- [ ] Perplexity integration — real-time research during scans
+- [x] Polygonscan transaction tracing — reverse-engineer winner patterns
+- [x] Perplexity integration — real-time research during scans
 - [ ] Production VPS deployment — run deploy/setup.sh on a $5 box
 
 ## Layer Map (article → our system)

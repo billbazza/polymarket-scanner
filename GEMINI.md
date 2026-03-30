@@ -11,7 +11,7 @@ Scores opportunities through math filters (EV, Kelly, slippage), optionally vali
 ## Scope Of This File
 This file is a repo-level guidance document for coding agents and humans working in this project.
 It is not automatically enforced by Codex at runtime unless the agent or workflow explicitly opens and follows it.
-`GEMINI.md` serves the same purpose for this repo.
+`CLAUDE.md` serves the same purpose for this repo.
 
 ## Architecture
 

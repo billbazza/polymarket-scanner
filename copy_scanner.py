@@ -62,6 +62,13 @@ def get_portfolio_value(address: str) -> float:
     val = _get("/value", {"user": address})
     if isinstance(val, (int, float)):
         return float(val)
+    # Try alternative endpoint if /value doesn't work
+    try:
+        data = _get("/positions", {"user": address})
+        if isinstance(data, list):
+            return sum(p.get("currentValue", 0) for p in data)
+    except:
+        pass
     return 0.0
 
 

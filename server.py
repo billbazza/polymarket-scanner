@@ -2,11 +2,15 @@
 from dotenv import load_dotenv
 load_dotenv()
 
+import asyncio
+import json
 import logging
+import re
 import threading
 import time
+from contextlib import asynccontextmanager
+from datetime import datetime
 from pathlib import Path
-import asyncio
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse
@@ -20,11 +24,9 @@ from log_setup import init_logging
 init_logging()
 log = logging.getLogger("scanner.server")
 
-app = FastAPI(title="Polymarket Scanner")
 
-
-@app.on_event("startup")
-async def startup_event():
+@asynccontextmanager
+async def lifespan(app: FastAPI):
     db.init_db()
     try:
         import wallet_monitor
@@ -33,20 +35,23 @@ async def startup_event():
     except Exception as e:
         log.warning("Wallet monitor failed to start: %s", e)
 
-
-@app.on_event("shutdown")
-async def shutdown_event():
     try:
-        import wallet_monitor
-        wallet_monitor.stop()
-    except Exception as e:
-        log.warning("Wallet monitor failed to stop cleanly: %s", e)
+        yield
+    finally:
+        try:
+            import wallet_monitor
+            wallet_monitor.stop()
+        except Exception as e:
+            log.warning("Wallet monitor failed to stop cleanly: %s", e)
 
-    try:
-        import async_api
-        await async_api.close()
-    except Exception as e:
-        log.warning("Async API client failed to close cleanly: %s", e)
+        try:
+            import async_api
+            await async_api.close()
+        except Exception as e:
+            log.warning("Async API client failed to close cleanly: %s", e)
+
+
+app = FastAPI(title="Polymarket Scanner", lifespan=lifespan)
 
 
 @app.middleware("http")
@@ -61,6 +66,7 @@ async def authorize_mutating_routes(request: Request, call_next):
         path.startswith("/api/trades")
         or path.startswith("/api/weather/")
         or path == "/api/copy/mirror"
+        or path == "/api/copy/settings"
         or path == "/api/copy/watch"
         or path.startswith("/api/copy/watch/")
         or path.startswith("/api/copy/candidates/")
@@ -70,6 +76,7 @@ async def authorize_mutating_routes(request: Request, call_next):
         path.startswith("/api/scan")
         or path == "/api/autonomy"
         or path.startswith("/api/brain/validate/")
+        or path.startswith("/api/reports/")
         or path == "/api/copy/score"
         or path == "/api/copy/discover"
     ):
@@ -83,6 +90,257 @@ async def authorize_mutating_routes(request: Request, call_next):
     return await call_next(request)
 
 DASHBOARD_PATH = Path(__file__).parent / "dashboard.html"
+DAILY_REPORTS_DIR = Path(__file__).parent / "reports" / "daily"
+DIAGNOSTICS_DIR = Path(__file__).parent / "reports" / "diagnostics"
+IMPLEMENTATION_PLAN_PATH = Path(__file__).parent / "implementation-plan.md"
+TESTING_IDEAS_PATH = Path(__file__).parent / "testing-ideas.md"
+FIX_LOGS_DIR = Path(__file__).parent / "fix_logs"
+
+
+def _tail_lines(path: Path, limit: int = 80) -> list[str]:
+    if not path.exists():
+        return []
+    try:
+        with open(path, "r") as f:
+            return [line.rstrip() for line in f.readlines()[-limit:]]
+    except Exception as e:
+        log.warning("Failed to read %s: %s", path.name, e)
+        return []
+
+
+def _fallback_daily_report(context: dict) -> dict:
+    stats = context["stats"]
+    working = [
+        f"Dashboard API is serving with {stats['open_trades']} open trades and {stats['closed_trades']} closed trades recorded.",
+        f"Historical win rate is {stats['win_rate']}% with cumulative P&L at ${stats['total_pnl']:.2f}.",
+        f"{len(context['recent_scans'])} recent scan runs were available for review.",
+    ]
+    not_working = []
+    if context["recent_errors"]:
+        not_working.append(f"{len(context['recent_errors'])} recent error log lines need review.")
+    if context["recent_warnings"]:
+        not_working.append(f"{len(context['recent_warnings'])} recent warning log lines indicate degraded dependencies.")
+    if not not_working:
+        not_working.append("No critical failures were detected in the sampled logs, but AI daily reporting was unavailable.")
+
+    improvements = [
+        "Reduce recurring warning and error noise by grouping root causes and adding remediation hints in logs.",
+        "Add trend metrics for scan hit rate, trade open/close velocity, and strategy-level win rates.",
+        "Keep a visible history of generated daily reports in the dashboard.",
+        "Add explicit health summaries for cointegration, whale, weather, and copy-trading subsystems.",
+        "Turn daily report improvement items into tracked implementation tasks automatically.",
+    ]
+    return {
+        "summary": "AI daily report generation was unavailable, so this fallback summary was built from local metrics and logs.",
+        "working": working,
+        "not_working": not_working,
+        "improvements": improvements,
+        "confidence": "low",
+        "model": "fallback",
+    }
+
+
+def _daily_report_context() -> dict:
+    stats = db.get_stats()
+    recent_scans = db.get_scan_runs(limit=10)
+    open_trades = db.get_trades(status="open", limit=10)
+    closed_trades = db.get_trades(status="closed", limit=10)
+    whale_alerts = db.get_whale_alerts(limit=10, min_score=60)
+    scanner_lines = _tail_lines(Path(__file__).parent / "logs" / "scanner.log", limit=120)
+    return {
+        "generated_at": datetime.utcnow().isoformat() + "Z",
+        "stats": stats,
+        "recent_scans": recent_scans,
+        "open_trades": open_trades,
+        "closed_trades": closed_trades,
+        "recent_whales": whale_alerts,
+        "recent_errors": [line for line in scanner_lines if " ERROR " in line][-12:],
+        "recent_warnings": [line for line in scanner_lines if " WARNING " in line][-12:],
+        "recent_brain": [line for line in scanner_lines if "scanner.brain" in line][-12:],
+    }
+
+
+def _render_daily_report_markdown(report_date: str, context: dict, report: dict) -> str:
+    working = "\n".join(f"- {item}" for item in report.get("working", []))
+    not_working = "\n".join(f"- {item}" for item in report.get("not_working", []))
+    improvements = "\n".join(f"{i}. {item}" for i, item in enumerate(report.get("improvements", []), start=1))
+    return f"""# Daily Report - {report_date}
+
+Generated at: {context['generated_at']}
+Model: {report.get('model', 'unknown')}
+Confidence: {report.get('confidence', 'unknown')}
+
+## Summary
+{report.get('summary', '')}
+
+## Working
+{working or '- None recorded'}
+
+## Not Working
+{not_working or '- None recorded'}
+
+## Top 5 Improvements
+{improvements or '1. None recorded'}
+"""
+
+
+def _latest_daily_report_path() -> Path | None:
+    DAILY_REPORTS_DIR.mkdir(parents=True, exist_ok=True)
+    reports = sorted(DAILY_REPORTS_DIR.glob("*-daily-report.md"))
+    return reports[-1] if reports else None
+
+
+def _extract_report_date(path: Path) -> str:
+    match = re.match(r"(\d{4}-\d{2}-\d{2})-daily-report\.md$", path.name)
+    return match.group(1) if match else str(datetime.utcnow().date())
+
+
+def _parse_daily_report_markdown(content: str) -> dict:
+    report = {
+        "summary": "",
+        "working": [],
+        "not_working": [],
+        "improvements": [],
+        "model": "unknown",
+        "confidence": "unknown",
+    }
+    current = None
+    for raw_line in (content or "").splitlines():
+        line = raw_line.strip()
+        if line.startswith("Model:"):
+            report["model"] = line.split(":", 1)[1].strip()
+            continue
+        if line.startswith("Confidence:"):
+            report["confidence"] = line.split(":", 1)[1].strip()
+            continue
+        if line == "## Summary":
+            current = "summary"
+            continue
+        if line == "## Working":
+            current = "working"
+            continue
+        if line == "## Not Working":
+            current = "not_working"
+            continue
+        if line == "## Top 5 Improvements":
+            current = "improvements"
+            continue
+        if line.startswith("## "):
+            current = None
+            continue
+        if not line:
+            continue
+        if current == "summary":
+            report["summary"] = (report["summary"] + "\n" + line).strip()
+        elif current in {"working", "not_working"} and line.startswith("- "):
+            report[current].append(line[2:].strip())
+        elif current == "improvements":
+            item = re.sub(r"^\d+\.\s*", "", line).strip()
+            if item:
+                report["improvements"].append(item)
+    return report
+
+
+def _persist_report_items(report_date: str, report: dict) -> list[dict]:
+    not_working = [item.strip() for item in report.get("not_working", []) if (item or "").strip()]
+    improvements = [item.strip() for item in report.get("improvements", []) if (item or "").strip()]
+    db.save_report_items(report_date, "not_working", not_working)
+    db.save_report_items(report_date, "improvement", improvements)
+    allowed = {("not_working", item) for item in not_working}
+    allowed.update({("improvement", item) for item in improvements})
+    return [
+        item for item in db.get_report_items(report_date)
+        if (item["section"], item["item_text"]) in allowed
+    ]
+
+
+def _visible_report_items(items: list[dict]) -> list[dict]:
+    return [item for item in items if item.get("status") != "completed"]
+
+
+def _write_action_item(
+    path: Path,
+    title: str,
+    report_date: str,
+    item_text: str,
+    section_label: str | None = None,
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    existing = path.read_text() if path.exists() else f"# {title}\n\n"
+    section_header = f"## {section_label or report_date}"
+    bullet = f"- {item_text}"
+    if bullet in existing:
+        return
+    if section_header in existing:
+        head, _, tail = existing.partition(section_header)
+        lines = tail.splitlines()
+        insert_at = len(lines)
+        for idx in range(1, len(lines)):
+            if lines[idx].startswith("## "):
+                insert_at = idx
+                break
+        section_lines = lines[:insert_at]
+        if section_lines and section_lines[-1].strip():
+            section_lines.append("")
+        section_lines.append(bullet)
+        new_tail = "\n".join(section_lines + lines[insert_at:])
+        content = head + section_header + new_tail
+    else:
+        content = existing.rstrip() + f"\n\n{section_header}\n{bullet}\n"
+    path.write_text(content.rstrip() + "\n")
+
+
+def _append_fix_log(item: dict) -> Path:
+    report_date = item["report_date"]
+    path = FIX_LOGS_DIR / f"{report_date}-report-followups.md"
+    _write_action_item(path, "Report Follow-Ups", report_date, item["item_text"], section_label=report_date)
+    return path
+
+
+def _diagnosis_context(item: dict) -> dict:
+    context = _daily_report_context()
+    needle_words = [word.lower() for word in re.findall(r"[A-Za-z0-9_]{4,}", item["item_text"])][:8]
+    relevant_logs = []
+    for line in context["recent_errors"] + context["recent_warnings"] + context["recent_brain"]:
+        lower = line.lower()
+        if not needle_words or any(word in lower for word in needle_words):
+            relevant_logs.append(line)
+    context["relevant_logs"] = relevant_logs[:12]
+    context["report_item"] = item["item_text"]
+    context["report_section"] = item["section"]
+    return context
+
+
+def _write_diagnosis_log(item: dict) -> tuple[Path, str]:
+    DIAGNOSTICS_DIR.mkdir(parents=True, exist_ok=True)
+    path = DIAGNOSTICS_DIR / f"{datetime.utcnow().date()}-report-item-{item['id']}.md"
+    context = _diagnosis_context(item)
+    prompt = f"""You are diagnosing a Polymarket scanner issue from the daily report queue.
+
+Issue:
+{item['item_text']}
+
+Context JSON:
+{json.dumps(context, indent=2)}
+
+Write a concise markdown note with these sections:
+## Item
+## Signals
+## Likely Causes
+## Next Checks
+## Recommendation
+Keep it concrete and operational."""
+    analysis = brain.ask(prompt, model=brain.OPUS_MODEL)
+    if analysis.startswith("Brain unavailable") or analysis.startswith("Brain error:"):
+        analysis = (
+            "## Item\n"
+            f"{item['item_text']}\n\n"
+            "## Signals\n"
+            + ("\n".join(f"- {line}" for line in context["relevant_logs"]) or "- No matching log lines found in the latest sample.")
+            + "\n\n## Likely Causes\n- Further review needed.\n\n## Next Checks\n- Inspect the latest logs and affected endpoint.\n\n## Recommendation\n- Keep this in the diagnostic queue until reproduced."
+        )
+    path.write_text(analysis.rstrip() + "\n")
+    return path, analysis
 
 
 def _save_pairs_scan_run(scan_result, duration):
@@ -143,7 +401,11 @@ def _start_job(job_kind, params, work_fn):
 
 @app.get("/", response_class=HTMLResponse)
 async def dashboard():
-    return DASHBOARD_PATH.read_text()
+    content = DASHBOARD_PATH.read_text()
+    return HTMLResponse(
+        content=content,
+        headers={"Cache-Control": "no-cache, no-store, must-revalidate", "Pragma": "no-cache", "Expires": "0"}
+    )
 
 
 # --- Stats ---
@@ -151,6 +413,167 @@ async def dashboard():
 @app.get("/api/stats")
 async def stats():
     return db.get_stats()
+
+
+@app.get("/api/reports/daily")
+async def get_daily_report():
+    latest = _latest_daily_report_path()
+    if not latest:
+        return {
+            "exists": False,
+            "content": "",
+            "path": str(DAILY_REPORTS_DIR / f"{datetime.utcnow().date()}-daily-report.md"),
+            "implementation_plan_path": str(IMPLEMENTATION_PLAN_PATH),
+            "testing_ideas_path": str(TESTING_IDEAS_PATH),
+        }
+    report_date = _extract_report_date(latest)
+    content = latest.read_text()
+    report = _parse_daily_report_markdown(content)
+    items = _visible_report_items(_persist_report_items(report_date, report))
+    return {
+        "exists": True,
+        "content": content,
+        "path": str(latest),
+        "implementation_plan_path": str(IMPLEMENTATION_PLAN_PATH),
+        "testing_ideas_path": str(TESTING_IDEAS_PATH),
+        "report_date": report_date,
+        "report": report,
+        "items": items,
+    }
+
+
+@app.post("/api/reports/daily")
+async def generate_daily_report():
+    report_date = str(datetime.utcnow().date())
+    DAILY_REPORTS_DIR.mkdir(parents=True, exist_ok=True)
+
+    context = _daily_report_context()
+    report = brain.generate_daily_report(context) or _fallback_daily_report(context)
+    report_path = DAILY_REPORTS_DIR / f"{report_date}-daily-report.md"
+    report_content = _render_daily_report_markdown(report_date, context, report)
+    report_path.write_text(report_content)
+    items = _visible_report_items(_persist_report_items(report_date, report))
+
+    return {
+        "ok": True,
+        "content": report_content,
+        "path": str(report_path),
+        "implementation_plan_path": str(IMPLEMENTATION_PLAN_PATH),
+        "testing_ideas_path": str(TESTING_IDEAS_PATH),
+        "report": report,
+        "items": items,
+    }
+
+
+@app.post("/api/reports/items/{item_id}/fix-log")
+async def add_report_item_to_fix_log(item_id: int):
+    item = db.get_report_item(item_id)
+    if not item:
+        raise HTTPException(404, "Report item not found")
+    path = _append_fix_log(item)
+    updated = db.update_report_item(
+        item_id,
+        status="queued",
+        disposition="implement",
+        action_path=str(path),
+        notes="Logged to dated fix log for implementation follow-up.",
+    )
+    return {"ok": True, "item": updated, "path": str(path)}
+
+
+@app.post("/api/reports/items/{item_id}/diagnose")
+async def diagnose_report_item(item_id: int):
+    item = db.get_report_item(item_id)
+    if not item:
+        raise HTTPException(404, "Report item not found")
+    path, content = _write_diagnosis_log(item)
+    updated = db.update_report_item(
+        item_id,
+        status="needs_review",
+        disposition="diagnose",
+        diagnosis_path=str(path),
+        notes="Diagnosis note generated from latest report context and logs.",
+    )
+    return {"ok": True, "item": updated, "path": str(path), "content": content}
+
+
+@app.post("/api/reports/items/{item_id}/plan")
+async def add_report_item_to_plan(item_id: int):
+    item = db.get_report_item(item_id)
+    if not item:
+        raise HTTPException(404, "Report item not found")
+    _write_action_item(
+        IMPLEMENTATION_PLAN_PATH,
+        "Implementation Plan",
+        item["report_date"],
+        item["item_text"],
+        section_label=f"{item['report_date']} Report Queue",
+    )
+    updated = db.update_report_item(
+        item_id,
+        status="planned",
+        disposition="implement",
+        action_path=str(IMPLEMENTATION_PLAN_PATH),
+        notes="Promoted to implementation plan.",
+    )
+    return {"ok": True, "item": updated, "path": str(IMPLEMENTATION_PLAN_PATH)}
+
+
+@app.post("/api/reports/items/{item_id}/testing")
+async def add_report_item_to_testing(item_id: int):
+    item = db.get_report_item(item_id)
+    if not item:
+        raise HTTPException(404, "Report item not found")
+    _write_action_item(
+        TESTING_IDEAS_PATH,
+        "Testing Ideas",
+        item["report_date"],
+        item["item_text"],
+        section_label=f"{item['report_date']} Testing Queue",
+    )
+    updated = db.update_report_item(
+        item_id,
+        status="test_only",
+        disposition="test_only",
+        action_path=str(TESTING_IDEAS_PATH),
+        notes="Saved as a testing-only candidate.",
+    )
+    return {"ok": True, "item": updated, "path": str(TESTING_IDEAS_PATH)}
+
+
+@app.post("/api/reports/items/{item_id}/live-candidate")
+async def mark_report_item_live_candidate(item_id: int):
+    item = db.get_report_item(item_id)
+    if not item:
+        raise HTTPException(404, "Report item not found")
+    _write_action_item(
+        IMPLEMENTATION_PLAN_PATH,
+        "Implementation Plan",
+        item["report_date"],
+        item["item_text"],
+        section_label=f"{item['report_date']} Report Queue",
+    )
+    updated = db.update_report_item(
+        item_id,
+        status="planned",
+        disposition="live_candidate",
+        action_path=str(IMPLEMENTATION_PLAN_PATH),
+        notes="Marked as a live-testing candidate and added to the implementation plan.",
+    )
+    return {"ok": True, "item": updated, "path": str(IMPLEMENTATION_PLAN_PATH)}
+
+
+@app.post("/api/reports/items/{item_id}/complete")
+async def complete_report_item(item_id: int):
+    item = db.get_report_item(item_id)
+    if not item:
+        raise HTTPException(404, "Report item not found")
+    updated = db.update_report_item(
+        item_id,
+        status="completed",
+        notes="Completed and removed from the active review queue.",
+    )
+    return {"ok": True, "item": updated}
 
 
 # --- Signals ---
@@ -270,6 +693,120 @@ async def list_weather_signals(limit: int = 50, tradeable_only: bool = False):
 
 # --- Locked Market Arb ---
 
+@app.post("/api/scan/longshot")
+async def run_longshot_scan(
+    min_liquidity: float = 2000,
+    min_ev_pct: float = 0.5,
+):
+    """Scan all active binary markets for longshot NO bias opportunities.
+
+    Finds YES markets priced 3–15¢ where calibrated NO win rate exceeds the
+    implied price, then scores maker BUY_NO limit orders by EV and Kelly.
+    """
+    import longshot_scanner
+    t0 = time.time()
+    log.info("Longshot scan started: min_liq=%.0f min_ev=%.2f%%", min_liquidity, min_ev_pct)
+
+    try:
+        opportunities, stats = longshot_scanner.scan(
+            min_liquidity=min_liquidity,
+            min_ev_pct=min_ev_pct,
+            verbose=False,
+        )
+    except Exception as e:
+        log.error("Longshot scan failed: %s", e)
+        return JSONResponse(status_code=500, content={"error": str(e), "opportunities": 0})
+
+    duration = time.time() - t0
+
+    saved_ids = []
+    for opp in opportunities:
+        try:
+            row_id = db.save_longshot_signal(opp)
+            saved_ids.append(row_id)
+        except Exception as e:
+            log.warning("Failed to save longshot signal: %s", e)
+
+    tradeable = sum(1 for o in opportunities if o.get("tradeable"))
+    log.info("Longshot scan complete: %d opps (%d tradeable) in %.1fs",
+             len(opportunities), tradeable, duration)
+
+    return {
+        "opportunities": len(opportunities),
+        "tradeable": tradeable,
+        "saved_ids": saved_ids,
+        "duration_secs": round(duration, 1),
+        "stats": stats,
+        "results": opportunities,
+    }
+
+
+@app.get("/api/longshot")
+async def get_longshot_signals(limit: int = 50, tradeable_only: bool = False):
+    """Fetch recent longshot scanner results."""
+    signals = db.get_longshot_signals(limit=limit, tradeable_only=tradeable_only)
+    return {"signals": signals, "count": len(signals)}
+
+
+@app.post("/api/scan/near-certainty")
+async def run_near_certainty_scan(
+    min_liquidity: float = 5000,
+    min_ev_pct: float = 0.10,
+    use_brain: bool = True,
+):
+    """Scan for near-certain YES markets (85–99¢) with calibration edge.
+
+    Calibrated data shows YES at 90¢ wins 91.5% (not 90%), giving a structural
+    1.5pp edge. Brain validation via Claude filters out cases where doubt is
+    legitimate. Net EV is positive even after 2% taker fee.
+    """
+    import near_certainty_scanner
+    t0 = time.time()
+    log.info("Near-certainty scan started: min_liq=%.0f min_ev=%.2f%% brain=%s",
+             min_liquidity, min_ev_pct, use_brain)
+
+    try:
+        opportunities, stats = near_certainty_scanner.scan(
+            min_liquidity=min_liquidity,
+            min_ev_pct=min_ev_pct,
+            use_brain=use_brain,
+            verbose=False,
+        )
+    except Exception as e:
+        log.error("Near-certainty scan failed: %s", e)
+        return JSONResponse(status_code=500, content={"error": str(e), "opportunities": 0})
+
+    duration = time.time() - t0
+
+    saved_ids = []
+    for opp in opportunities:
+        try:
+            row_id = db.save_near_certainty_signal(opp)
+            saved_ids.append(row_id)
+        except Exception as e:
+            log.warning("Failed to save near-certainty signal: %s", e)
+
+    tradeable = sum(1 for o in opportunities if o.get("tradeable"))
+    log.info("Near-certainty scan complete: %d opps (%d tradeable) in %.1fs",
+             len(opportunities), tradeable, duration)
+
+    return {
+        "opportunities": len(opportunities),
+        "tradeable": tradeable,
+        "saved_ids": saved_ids,
+        "duration_secs": round(duration, 1),
+        "stats": stats,
+        "results": opportunities,
+    }
+
+
+@app.get("/api/near-certainty")
+async def get_near_certainty_signals(limit: int = 50, tradeable_only: bool = False):
+    """Fetch recent near-certainty scanner results."""
+    signals = db.get_near_certainty_signals(limit=limit, tradeable_only=tradeable_only)
+    return {"signals": signals, "count": len(signals)}
+
+
 @app.post("/api/scan/locked")
 async def run_locked_scan(
     min_net_gap: float = 0.005,
@@ -316,6 +853,82 @@ async def list_locked_arb(limit: int = 50, tradeable_only: bool = False):
     return db.get_locked_arb(limit=limit, tradeable_only=tradeable_only)
 
 
+# --- Whale / Insider Detection ---
+
+_whale_status = {"running": False, "last_result": None}
+
+
+def _run_whale_background(min_score, auto_trade=False):
+    """Run whale scan in background thread — avoids blocking the event loop."""
+    import whale_detector
+    _whale_status["running"] = True
+    t0 = time.time()
+    try:
+        alerts, stats = whale_detector.scan(min_score=min_score, verbose=True, auto_trade=auto_trade)
+        saved_ids = []
+        for alert in alerts:
+            try:
+                row_id = db.save_whale_alert(alert)
+                if row_id:
+                    saved_ids.append(row_id)
+            except Exception as e:
+                log.warning("Failed to save whale alert: %s", e)
+
+        duration = round(time.time() - t0, 1)
+        _whale_status["last_result"] = {
+            "ok": True,
+            "alerts": len(alerts),
+            "new_saved": len(saved_ids),
+            "trades_created": stats.get("trades_created", 0),
+            "duration_secs": duration,
+            "stats": stats,
+        }
+        log.info("Whale scan complete: %d alerts (%d new, %d trades) in %.1fs",
+                 len(alerts), len(saved_ids), stats.get("trades_created", 0), duration)
+    except Exception as e:
+        log.error("Whale scan failed: %s", e)
+        _whale_status["last_result"] = {"ok": False, "error": str(e)}
+    finally:
+        _whale_status["running"] = False
+
+
+@app.post("/api/scan/whales")
+async def run_whale_scan(min_score: int = 50, auto_trade: bool = False):
+    """Kick off whale scan in background — returns immediately."""
+    import threading
+    if _whale_status["running"]:
+        return {"ok": False, "error": "Whale scan already running — check Console tab for progress"}
+    thread = threading.Thread(target=_run_whale_background, args=(min_score, auto_trade), daemon=True)
+    thread.start()
+    log.info("Whale scan triggered from dashboard (background, min_score=%d, auto_trade=%s)", min_score, auto_trade)
+    return {"ok": True, "message": "Whale scan started — watch Console tab for progress"}
+
+
+@app.get("/api/scan/whales/status")
+async def whale_scan_status():
+    """Check if whale scan is running and get last result."""
+    return {"running": _whale_status["running"], "last_result": _whale_status["last_result"]}
+
+
+@app.get("/api/whales")
+async def list_whale_alerts(limit: int = 50, min_score: int = 0, undismissed_only: bool = False):
+    """Return recent whale/insider alerts."""
+    return db.get_whale_alerts(limit=limit, min_score=min_score, undismissed_only=undismissed_only)
+
+
+@app.get("/api/whales/count")
+async def whale_alert_count():
+    """Count of new (undismissed) whale alerts in last 24h — used for popup badge."""
+    return {"count": db.get_new_whale_count()}
+
+
+@app.post("/api/whales/{alert_id}/dismiss")
+async def dismiss_whale(alert_id: int):
+    """Dismiss a whale alert."""
+    db.dismiss_whale_alert(alert_id)
+    return {"ok": True, "id": alert_id}
+
+
 # --- Brain (Claude AI) ---
 
 @app.post("/api/brain/validate/{signal_id}")
@@ -330,6 +943,32 @@ async def brain_validate(signal_id: int):
                 "reasoning": reasoning,
             }
     raise HTTPException(404, "Signal not found")
+
+
+@app.post("/api/brain/whale/{alert_id}")
+async def brain_validate_whale(alert_id: int):
+    """Ask Claude to analyze a whale alert for trading opportunities."""
+    alert = db.get_whale_alert_by_id(alert_id)
+    if not alert:
+        raise HTTPException(404, "Whale alert not found")
+    result = brain.validate_whale(alert) or {}
+    verdict = (result.get("verdict") or "").lower()
+    reasoning = result.get("reasoning") or "Brain unavailable"
+    risk_flags = result.get("risk_flags") or []
+    if risk_flags:
+        reasoning = f"{reasoning} Risk flags: {', '.join(risk_flags[:3])}"
+    should_trade = verdict == "suspicious"
+    return {
+        "alert_id": alert_id,
+        "should_trade": should_trade,
+        "reasoning": reasoning,
+        "verdict": verdict or "unavailable",
+    }
+
+
+@app.get("/api/copy/latest")
+async def copy_latest_trades(limit: int = 5):
+    return {"trades": db.get_latest_copy_trades(limit)}
 
 
 # --- Trades ---
@@ -372,6 +1011,33 @@ async def open_weather_trade(signal_id: int, size_usd: float = 20):
     if not trade_id:
         raise HTTPException(404, "Weather signal not found or already traded")
     return {"trade_id": trade_id, "signal_id": signal_id, "status": "open"}
+
+
+@app.post("/api/whales/{alert_id}/trade")
+async def open_whale_trade_endpoint(alert_id: int, size_usd: float = 20):
+    """Open a paper trade from a whale alert."""
+    log.info("Whale trade request for alert ID: %d", alert_id)
+    try:
+        import whale_detector
+        # Get alert from DB
+        alerts = db.get_whale_alerts(limit=1000)
+        alert = next((a for a in alerts if a["id"] == alert_id), None)
+        if not alert:
+            log.warning("Whale alert %d not found in last 1000 alerts", alert_id)
+            raise HTTPException(404, f"Whale alert {alert_id} not found")
+
+        trade_id = whale_detector.create_whale_trade(alert, size_usd=size_usd)
+        if not trade_id:
+            log.error("whale_detector.create_whale_trade returned None for alert %d", alert_id)
+            raise HTTPException(500, "Failed to create whale trade")
+
+        log.info("Whale trade opened: ID %d from alert %d", trade_id, alert_id)
+        return {"ok": True, "trade_id": trade_id, "status": "open"}
+    except Exception as e:
+        log.error("Whale trade endpoint error: %s", e)
+        if isinstance(e, HTTPException):
+            raise e
+        raise HTTPException(500, str(e))
 
 
 # --- Snapshots ---
@@ -509,6 +1175,26 @@ async def copy_positions():
     return out
 
 
+@app.get("/api/copy/settings")
+async def get_copy_settings():
+    return db.get_copy_trade_settings()
+
+
+@app.post("/api/copy/settings")
+async def update_copy_settings(
+    cap_enabled: bool = False,
+    per_wallet_cap: int = 3,
+    total_open_cap: int = 25,
+):
+    settings = {
+        "cap_enabled": bool(cap_enabled),
+        "per_wallet_cap": max(1, int(per_wallet_cap)),
+        "total_open_cap": max(1, int(total_open_cap)),
+    }
+    db.set_setting("copy_trade_limits", settings)
+    return {"ok": True, "settings": settings}
+
+
 @app.post("/api/copy/mirror")
 async def mirror_position(wallet: str, condition_id: str, size_usd: float = 20.0):
     """Open a paper copy trade mirroring a watched wallet's position."""
@@ -519,8 +1205,22 @@ async def mirror_position(wallet: str, condition_id: str, size_usd: float = 20.0
     pos = next((p for p in positions if p.get("conditionId") == condition_id), None)
     if not pos:
         raise HTTPException(404, f"Position {condition_id} not found for wallet {wallet}")
-    trade_id = db.open_copy_trade(wallet, label, pos, size_usd=size_usd)
+    copy_settings = db.get_copy_trade_settings()
+    trade_id = db.open_copy_trade(
+        wallet,
+        label,
+        pos,
+        size_usd=size_usd,
+        max_wallet_open=(copy_settings["per_wallet_cap"] if copy_settings["cap_enabled"] else None),
+        max_total_open=(copy_settings["total_open_cap"] if copy_settings["cap_enabled"] else None),
+    )
     if trade_id is None:
+        wallet_open = db.count_open_copy_trades(wallet)
+        total_open = db.count_open_trades()
+        if copy_settings["cap_enabled"] and wallet_open >= copy_settings["per_wallet_cap"]:
+            return {"ok": False, "error": f"Wallet cap reached ({wallet_open}/{copy_settings['per_wallet_cap']})"}
+        if copy_settings["cap_enabled"] and total_open >= copy_settings["total_open_cap"]:
+            return {"ok": False, "error": f"Global open trade cap reached ({total_open}/{copy_settings['total_open_cap']})"}
         return {"ok": False, "error": "Already have an open copy trade for this position"}
     return {"ok": True, "trade_id": trade_id, "label": label,
             "market": pos.get("title"), "outcome": pos.get("outcome"),

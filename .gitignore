@@ -1,4 +1,5 @@
 scanner.db
+polymarket.db
 .env
 logs/
 __pycache__/
@@ -7,3 +8,7 @@ __pycache__/
 .DS_Store
 wallet_state.json
 logs/wallet_state.json
+NTHROPIC_API_KEY
+NTHROPIC_AUTH_TOKEN
+NTHROPIC_BASE_URL
+.fuse_hidden*

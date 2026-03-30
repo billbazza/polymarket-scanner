@@ -141,6 +141,7 @@ def main():
     parser = argparse.ArgumentParser(description="Polymarket Leaderboard Analysis")
     parser.add_argument("--top", type=int, default=20, help="Number of top traders to fetch")
     parser.add_argument("--analyze", type=str, help="Analyze a specific trader address")
+    parser.add_argument("--trace", action="store_true", help="Include on-chain transaction tracing")
     args = parser.parse_args()
 
     if args.analyze:
@@ -156,6 +157,19 @@ def main():
             print(f"Avg entry price: {patterns['avg_entry_price']:.4f}")
         else:
             print("No position data available.")
+
+        if args.trace:
+            print("\n--- On-Chain Trace (Alchemy) ---")
+            import blockchain
+            trace = blockchain.reverse_engineer_patterns(args.analyze)
+            if trace.get("ok"):
+                print(f"Polymarket Interactions: {trace['polymarket_interactions']}")
+                print(f"Redemptions (Winnings):  {trace['redemption_count']}")
+                print(f"Uses Proxy Wallet:       {'Yes' if trace['uses_proxy'] else 'No'}")
+                print(f"Common Tokens:           {', '.join(trace['common_tokens'])}")
+                print(f"Avg Tx Frequency:        {trace['avg_tx_frequency_blocks']:.1f} blocks")
+            else:
+                print(f"Trace failed: {trace.get('error', 'unknown error')}")
     else:
         traders = get_top_traders(limit=args.top)
         if traders:

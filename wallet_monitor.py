@@ -217,16 +217,24 @@ def _check_wallet(address: str, label: str, will_copy: bool) -> tuple[int, int]:
     _known_positions[address] = current_cids
 
     if prev_cids is None:
-        # First time seeing this wallet — record state, don't trade
-        log.info("Monitor: %s — initial snapshot: %d positions", label, len(current_cids))
+        # First time seeing this wallet — record state, don't trade.
+        # Also set the DB baseline if not already set (forward-only copy trading).
+        baseline = db.get_wallet_baseline(address)
+        if baseline is None:
+            db.set_wallet_baseline(address, list(current_cids))
+            log.info("Monitor: %s — baseline set: %d existing positions (skipped)",
+                     label, len(current_cids))
+        else:
+            log.info("Monitor: %s — initial snapshot: %d positions", label, len(current_cids))
         return 0, 0
 
     opened = 0
     closed = 0
     pos_by_cid = {p["conditionId"]: p for p in positions if p.get("conditionId")}
 
-    # New positions
-    for cid in current_cids - prev_cids:
+    # New positions (skip any in the baseline — pre-existing when wallet was added)
+    baseline = db.get_wallet_baseline(address) or set()
+    for cid in current_cids - prev_cids - baseline:
         pos = pos_by_cid.get(cid)
         if not pos:
             continue
@@ -236,14 +244,33 @@ def _check_wallet(address: str, label: str, will_copy: bool) -> tuple[int, int]:
                  pos.get("curPrice", 0), f"${size:,.0f}")
 
         if will_copy:
-            t_id = db.open_copy_trade(address, label, pos, size_usd=COPY_SIZE_USD)
+            copy_settings = db.get_copy_trade_settings()
+            max_wallet_open = copy_settings["per_wallet_cap"] if copy_settings["cap_enabled"] else None
+            max_total_open = copy_settings["total_open_cap"] if copy_settings["cap_enabled"] else None
+            t_id = db.open_copy_trade(
+                address,
+                label,
+                pos,
+                size_usd=COPY_SIZE_USD,
+                max_wallet_open=max_wallet_open,
+                max_total_open=max_total_open,
+            )
             if t_id:
                 opened += 1
                 log.info("Monitor: AUTO-MIRRORED %s → trade #%d ($%.0f paper)",
                          label, t_id, COPY_SIZE_USD)
                 _status["new_trades_found"] += 1
             else:
-                log.debug("Monitor: dedup — copy trade already open for %s", cid[:16])
+                wallet_open = db.count_open_copy_trades(address)
+                total_open = db.count_open_trades()
+                if copy_settings["cap_enabled"] and max_wallet_open is not None and wallet_open >= max_wallet_open:
+                    log.info("Monitor: skipped %s — copy wallet cap reached (%d/%d)",
+                             label, wallet_open, max_wallet_open)
+                elif copy_settings["cap_enabled"] and max_total_open is not None and total_open >= max_total_open:
+                    log.info("Monitor: skipped %s — max open trade cap reached (%d/%d)",
+                             label, total_open, max_total_open)
+                else:
+                    log.debug("Monitor: dedup — copy trade already open for %s", cid[:16])
         else:
             log.info("Monitor: %s scored below copy threshold — not mirroring", label)
 

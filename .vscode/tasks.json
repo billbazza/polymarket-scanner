@@ -28,6 +28,20 @@
         "panel": "dedicated",
         "clear": false
       }
+    },
+    {
+      "label": "🌌 Grok 4.1 Fast - Reasoning (Cheap & Good for Coding)",
+      "type": "shell",
+      "command": "unset ANTHROPIC_BASE_URL ANTHROPIC_AUTH_TOKEN ANTHROPIC_API_KEY && export XAI_API_KEY=\"${env:XAI_API_KEY}\" && claude --model grok-4-1-fast-reasoning",
+      "group": "build",
+      "problemMatcher": [],
+      "presentation": {
+        "echo": true,
+        "reveal": "always",
+        "focus": true,
+        "panel": "dedicated",
+        "clear": false
+      }
     }
   ]
 }

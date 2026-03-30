@@ -1,13 +1,30 @@
 {
   "level": "paper",
   "promoted_at": null,
-  "trades_at_level": 2,
-  "wins_at_level": 2,
-  "losses_at_level": 0,
-  "pnl_at_level": 7.369999999999999,
+  "trades_at_level": 19,
+  "wins_at_level": 17,
+  "losses_at_level": 2,
+  "pnl_at_level": 100.64999999999999,
   "returns_at_level": [
-    6.77,
-    0.6
+    6.56,
+    20.76,
+    -19.74,
+    7.43,
+    6.56,
+    6.68,
+    6.71,
+    6.45,
+    17.14,
+    10.81,
+    6.84,
+    6.68,
+    6.67,
+    6.68,
+    6.68,
+    4.29,
+    -19.75,
+    6.49,
+    6.71
   ],
-  "last_discovery": 1774642702.963443
+  "last_discovery": 1774891401.003139
 }

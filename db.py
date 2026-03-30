@@ -212,8 +212,34 @@ def _migration_001_base_schema(conn):
             expires_at   REAL NOT NULL
         );
 
-        CREATE INDEX IF NOT EXISTS idx_open_orders_status ON open_orders(status);
-        CREATE INDEX IF NOT EXISTS idx_open_orders_trade ON open_orders(trade_id);
+        CREATE TABLE IF NOT EXISTS longshot_signals (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp REAL NOT NULL,
+            event TEXT NOT NULL,
+            market TEXT NOT NULL,
+            market_id TEXT,
+            yes_token TEXT,
+            no_token TEXT,
+            yes_price REAL,
+            no_price REAL,
+            calibrated_no_prob REAL,
+            calibration_edge REAL,
+            best_yes_bid REAL,
+            best_yes_ask REAL,
+            spread_pct REAL,
+            limit_price REAL,
+            no_cost REAL,
+            ev_pct REAL,
+            kelly_fraction REAL,
+            fill_prob REAL,
+            liquidity REAL,
+            action TEXT DEFAULT 'SELL_YES',
+            tradeable INTEGER DEFAULT 0,
+            status TEXT DEFAULT 'new'
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_open_orders_status   ON open_orders(status);
+        CREATE INDEX IF NOT EXISTS idx_open_orders_trade    ON open_orders(trade_id);
         CREATE INDEX IF NOT EXISTS idx_wallet_candidates_status ON wallet_candidates(status);
         CREATE INDEX IF NOT EXISTS idx_signals_ts ON signals(timestamp);
         CREATE INDEX IF NOT EXISTS idx_trades_status ON trades(status);
@@ -221,8 +247,60 @@ def _migration_001_base_schema(conn):
         CREATE INDEX IF NOT EXISTS idx_weather_signals_ts ON weather_signals(timestamp);
         CREATE INDEX IF NOT EXISTS idx_locked_arb_ts ON locked_arb(timestamp);
         CREATE INDEX IF NOT EXISTS idx_watched_wallets_active ON watched_wallets(active);
-    """)
+        CREATE INDEX IF NOT EXISTS idx_longshot_signals_ts ON longshot_signals(timestamp);
 
+        CREATE TABLE IF NOT EXISTS near_certainty_signals (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp REAL NOT NULL,
+            event TEXT NOT NULL,
+            market TEXT NOT NULL,
+            market_id TEXT,
+            yes_token TEXT,
+            no_token TEXT,
+            yes_price REAL,
+            calibrated_yes REAL,
+            calibration_edge REAL,
+            ev_pct REAL,
+            ev REAL,
+            cost REAL,
+            fee REAL,
+            kelly_fraction REAL,
+            liquidity REAL,
+            brain_prob REAL,
+            brain_confirmed INTEGER DEFAULT 0,
+            action TEXT DEFAULT 'BUY_YES',
+            tradeable INTEGER DEFAULT 0,
+            status TEXT DEFAULT 'new'
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_near_certainty_ts ON near_certainty_signals(timestamp);
+
+        CREATE TABLE IF NOT EXISTS whale_alerts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp REAL NOT NULL,
+            event TEXT NOT NULL,
+            market TEXT NOT NULL,
+            market_id TEXT,
+            token_id TEXT,
+            current_price REAL,
+            volume_24h REAL,
+            liquidity REAL,
+            volume_ratio REAL,
+            biggest_order_usd REAL,
+            dominant_side TEXT,
+            suspicion_score INTEGER NOT NULL,
+            score_volume INTEGER DEFAULT 0,
+            score_price INTEGER DEFAULT 0,
+            score_book INTEGER DEFAULT 0,
+            score_thinness INTEGER DEFAULT 0,
+            analysis TEXT,
+            status TEXT DEFAULT 'new',
+            dismissed INTEGER DEFAULT 0
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_whale_alerts_ts ON whale_alerts(timestamp);
+        CREATE INDEX IF NOT EXISTS idx_whale_alerts_score ON whale_alerts(suspicion_score);
+    """)
 
 def _migration_002_backfill_columns(conn):
     for col, coltype in [
@@ -234,7 +312,6 @@ def _migration_002_backfill_columns(conn):
         ("token_id_b", "TEXT"),
     ]:
         _add_column_if_missing(conn, "signals", col, coltype)
-
     for col, coltype in [
         ("trade_type", "TEXT DEFAULT 'pairs'"),
         ("weather_signal_id", "INTEGER"),
@@ -244,8 +321,17 @@ def _migration_002_backfill_columns(conn):
         ("copy_label", "TEXT"),
         ("copy_condition_id", "TEXT"),
         ("copy_outcome", "TEXT"),
+        ("whale_alert_id", "INTEGER"),
+        ("event", "TEXT"),
+        ("market_a", "TEXT"),
     ]:
         _add_column_if_missing(conn, "trades", col, coltype)
+
+    for col, coltype in [("baseline_positions", "TEXT")]:
+        _add_column_if_missing(conn, "watched_wallets", col, coltype)
+
+    for col, coltype in [("analysis", "TEXT")]:
+        _add_column_if_missing(conn, "whale_alerts", col, coltype)
 
 
 def _migration_003_scan_jobs(conn):
@@ -268,10 +354,45 @@ def _migration_003_scan_jobs(conn):
     """)
 
 
+def _migration_004_report_items(conn):
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS report_items (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            report_date TEXT NOT NULL,
+            section TEXT NOT NULL,
+            item_text TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'new',
+            disposition TEXT,
+            notes TEXT,
+            diagnosis_path TEXT,
+            action_path TEXT,
+            created_at REAL NOT NULL,
+            updated_at REAL NOT NULL,
+            UNIQUE(report_date, section, item_text)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_report_items_report_date ON report_items(report_date);
+        CREATE INDEX IF NOT EXISTS idx_report_items_section ON report_items(section);
+        CREATE INDEX IF NOT EXISTS idx_report_items_status ON report_items(status);
+    """)
+
+
+def _migration_005_settings(conn):
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS scanner_settings (
+            key TEXT PRIMARY KEY,
+            value_json TEXT,
+            updated_at REAL NOT NULL
+        );
+    """)
+
+
 _MIGRATIONS = [
     ("001_base_schema", _migration_001_base_schema),
     ("002_backfill_columns", _migration_002_backfill_columns),
     ("003_scan_jobs", _migration_003_scan_jobs),
+    ("004_report_items", _migration_004_report_items),
+    ("005_settings", _migration_005_settings),
 ]
 
 
@@ -458,14 +579,49 @@ def has_open_copy_trade(wallet: str, condition_id: str) -> bool:
     return row is not None
 
 
-def open_copy_trade(wallet: str, label: str, position: dict, size_usd: float = 20.0) -> int | None:
+def count_open_copy_trades(wallet: str | None = None) -> int:
+    conn = get_conn()
+    if wallet:
+        row = conn.execute(
+            "SELECT COUNT(*) FROM trades WHERE copy_wallet=? AND trade_type='copy' AND status='open'",
+            (wallet.lower(),)
+        ).fetchone()
+    else:
+        row = conn.execute(
+            "SELECT COUNT(*) FROM trades WHERE trade_type='copy' AND status='open'"
+        ).fetchone()
+    conn.close()
+    return int(row[0] if row else 0)
+
+
+def count_open_trades() -> int:
+    conn = get_conn()
+    row = conn.execute("SELECT COUNT(*) FROM trades WHERE status='open'").fetchone()
+    conn.close()
+    return int(row[0] if row else 0)
+
+
+def open_copy_trade(
+    wallet: str,
+    label: str,
+    position: dict,
+    size_usd: float = 20.0,
+    *,
+    max_wallet_open: int | None = None,
+    max_total_open: int | None = None,
+) -> int | None:
     """Open a paper copy trade mirroring a watched wallet's position.
 
     position dict should have: conditionId, outcome, curPrice, title, asset
     Returns trade_id or None if duplicate.
     """
+    wallet = wallet.lower()
     condition_id = position.get("conditionId", "")
     if has_open_copy_trade(wallet, condition_id):
+        return None
+    if max_wallet_open is not None and count_open_copy_trades(wallet) >= max_wallet_open:
+        return None
+    if max_total_open is not None and count_open_trades() >= max_total_open:
         return None
 
     outcome = position.get("outcome", "")
@@ -555,11 +711,21 @@ def close_trade(trade_id, exit_price_a, exit_price_b=None, notes=""):
     else:
         if exit_price_b is None:
             exit_price_b = trade["entry_price_b"]
-        if trade["side_a"] == "BUY":
-            pnl_pct = (exit_price_a - trade["entry_price_a"]) + (trade["entry_price_b"] - exit_price_b)
+        entry_a = trade["entry_price_a"] or 0
+        entry_b = trade["entry_price_b"] or 0
+        if entry_a <= 0 or entry_b <= 0:
+            pnl_usd = 0.0
         else:
-            pnl_pct = (trade["entry_price_a"] - exit_price_a) + (exit_price_b - trade["entry_price_b"])
-        pnl_usd = pnl_pct * trade["size_usd"]
+            half = trade["size_usd"] / 2
+            shares_a = half / entry_a
+            shares_b = half / entry_b
+            if trade["side_a"] == "BUY":
+                pnl_a = shares_a * (exit_price_a - entry_a)
+                pnl_b = shares_b * (entry_b - exit_price_b)
+            else:
+                pnl_a = shares_a * (entry_a - exit_price_a)
+                pnl_b = shares_b * (exit_price_b - entry_b)
+            pnl_usd = pnl_a + pnl_b
         exit_b = exit_price_b
 
     conn.execute("""
@@ -580,11 +746,15 @@ def close_trade(trade_id, exit_price_a, exit_price_b=None, notes=""):
 
 
 _TRADES_SELECT = """
-    SELECT t.*,
-        COALESCE(s.event,    ws.event,  t.copy_label)  AS event,
-        COALESCE(s.market_a, ws.market, t.copy_outcome) AS market_a,
+    SELECT t.id, t.signal_id, t.opened_at, t.closed_at, t.side_a, t.side_b,
+        t.entry_price_a, t.entry_price_b, t.exit_price_a, t.exit_price_b,
+        t.size_usd, t.pnl, t.status, t.notes, t.trade_type, t.weather_signal_id,
+        t.token_id_a, t.token_id_b, t.copy_wallet, t.copy_label, t.copy_condition_id,
+        t.copy_outcome, t.whale_alert_id,
+        COALESCE(s.event, ws.event, t.copy_label, t.event) AS event,
+        COALESCE(s.market_a, ws.market, t.copy_outcome, t.market_a) AS market_a,
         s.market_b,
-        COALESCE(s.action,   ws.action) AS action,
+        COALESCE(s.action, ws.action) AS action,
         ws.city, ws.target_date, ws.threshold_f, ws.direction,
         ws.combined_edge_pct, ws.combined_prob
     FROM trades t
@@ -740,7 +910,6 @@ def get_locked_arb(limit=50, tradeable_only=False):
     conn.close()
     return [dict(r) for r in rows]
 
-
 # --- Jobs ---
 
 def create_scan_job(kind: str, params: dict | None = None) -> int:
@@ -795,6 +964,349 @@ def get_scan_job(job_id: int) -> dict | None:
     job["params"] = json.loads(job.pop("params_json")) if job.get("params_json") else None
     job["result"] = json.loads(job.pop("result_json")) if job.get("result_json") else None
     return job
+
+
+# --- Daily Report Items ---
+
+def _report_item_dict(row):
+    return dict(row) if row else None
+
+
+def save_report_items(report_date: str, section: str, items: list[str]) -> None:
+    conn = get_conn()
+    now = time.time()
+    for item_text in items:
+        text = (item_text or "").strip()
+        if not text:
+            continue
+        conn.execute(
+            """
+            INSERT INTO report_items (
+                report_date, section, item_text, status, created_at, updated_at
+            ) VALUES (?, ?, ?, 'new', ?, ?)
+            ON CONFLICT(report_date, section, item_text)
+            DO UPDATE SET updated_at=excluded.updated_at
+            """,
+            (report_date, section, text, now, now),
+        )
+    conn.commit()
+    conn.close()
+
+
+def get_report_items(report_date: str | None = None) -> list[dict]:
+    conn = get_conn()
+    if report_date:
+        rows = conn.execute(
+            """
+            SELECT * FROM report_items
+            WHERE report_date=?
+            ORDER BY section, id
+            """,
+            (report_date,),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            """
+            SELECT * FROM report_items
+            ORDER BY report_date DESC, section, id
+            """
+        ).fetchall()
+    conn.close()
+    return [_report_item_dict(row) for row in rows]
+
+
+def get_report_item(item_id: int) -> dict | None:
+    conn = get_conn()
+    row = conn.execute("SELECT * FROM report_items WHERE id=?", (item_id,)).fetchone()
+    conn.close()
+    return _report_item_dict(row)
+
+
+def update_report_item(
+    item_id: int,
+    *,
+    status: str | None = None,
+    disposition: str | None = None,
+    notes: str | None = None,
+    diagnosis_path: str | None = None,
+    action_path: str | None = None,
+) -> dict | None:
+    updates = []
+    params = []
+    if status is not None:
+        updates.append("status=?")
+        params.append(status)
+    if disposition is not None:
+        updates.append("disposition=?")
+        params.append(disposition)
+    if notes is not None:
+        updates.append("notes=?")
+        params.append(notes)
+    if diagnosis_path is not None:
+        updates.append("diagnosis_path=?")
+        params.append(diagnosis_path)
+    if action_path is not None:
+        updates.append("action_path=?")
+        params.append(action_path)
+    updates.append("updated_at=?")
+    params.append(time.time())
+    params.append(item_id)
+
+    conn = get_conn()
+    conn.execute(
+        f"UPDATE report_items SET {', '.join(updates)} WHERE id=?",
+        tuple(params),
+    )
+    conn.commit()
+    row = conn.execute("SELECT * FROM report_items WHERE id=?", (item_id,)).fetchone()
+    conn.close()
+    return _report_item_dict(row)
+
+
+def get_report_items_for_latest_statuses(report_date: str, item_texts: list[str], section: str) -> list[dict]:
+    if not item_texts:
+        return []
+    placeholders = ",".join("?" for _ in item_texts)
+    conn = get_conn()
+    rows = conn.execute(
+        f"""
+        SELECT * FROM report_items
+        WHERE report_date=? AND section=? AND item_text IN ({placeholders})
+        ORDER BY id DESC
+        """,
+        (report_date, section, *item_texts),
+    ).fetchall()
+    conn.close()
+    latest = {}
+    for row in rows:
+        item = dict(row)
+        latest.setdefault(item["item_text"], item)
+    return list(latest.values())
+
+
+# --- Settings ---
+
+def get_setting(key: str, default=None):
+    conn = get_conn()
+    row = conn.execute(
+        "SELECT value_json FROM scanner_settings WHERE key=?",
+        (key,),
+    ).fetchone()
+    conn.close()
+    if not row:
+        return default
+    try:
+        return json.loads(row["value_json"])
+    except Exception:
+        return default
+
+
+def set_setting(key: str, value) -> None:
+    conn = get_conn()
+    conn.execute(
+        """
+        INSERT INTO scanner_settings (key, value_json, updated_at)
+        VALUES (?, ?, ?)
+        ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json, updated_at=excluded.updated_at
+        """,
+        (key, json.dumps(value), time.time()),
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_copy_trade_settings() -> dict:
+    settings = get_setting("copy_trade_limits", default=None) or {}
+    return {
+        "cap_enabled": bool(settings.get("cap_enabled", False)),
+        "per_wallet_cap": int(settings.get("per_wallet_cap", 3) or 3),
+        "total_open_cap": int(settings.get("total_open_cap", 25) or 25),
+    }
+
+# --- Longshot Signals ---
+
+def save_longshot_signal(opp):
+    """Save a longshot-bias opportunity."""
+    conn = get_conn()
+    conn.execute("""
+        INSERT INTO longshot_signals (
+            timestamp, event, market, market_id, yes_token, no_token,
+            yes_price, no_price, calibrated_no_prob, calibration_edge,
+            best_yes_bid, best_yes_ask, spread_pct,
+            limit_price, no_cost, ev_pct, kelly_fraction, fill_prob,
+            liquidity, action, tradeable
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        time.time(), opp["event"], opp["market"], opp.get("market_id"),
+        opp.get("yes_token"), opp.get("no_token"),
+        opp["yes_price"], opp["no_price"],
+        opp.get("calibrated_no_prob"), opp.get("calibration_edge"),
+        opp.get("best_yes_bid"), opp.get("best_yes_ask"), opp.get("spread_pct"),
+        opp.get("limit_price"), opp.get("no_cost"),
+        opp.get("ev_pct"), opp.get("kelly_fraction"), opp.get("fill_prob"),
+        opp.get("liquidity"),
+        opp.get("action", "SELL_YES"),
+        1 if opp.get("tradeable") else 0,
+    ))
+    row_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+    conn.commit()
+    conn.close()
+    return row_id
+
+
+def get_longshot_signals(limit=50, tradeable_only=False):
+    """Fetch recent longshot-bias opportunities."""
+    conn = get_conn()
+    if tradeable_only:
+        rows = conn.execute(
+            "SELECT * FROM longshot_signals WHERE tradeable=1 ORDER BY timestamp DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT * FROM longshot_signals ORDER BY timestamp DESC LIMIT ?", (limit,)
+        ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+# --- Near-Certainty Signals ---
+
+def save_near_certainty_signal(opp):
+    """Save a near-certainty YES edge opportunity."""
+    conn = get_conn()
+    conn.execute("""
+        INSERT INTO near_certainty_signals (
+            timestamp, event, market, market_id, yes_token, no_token,
+            yes_price, calibrated_yes, calibration_edge,
+            ev_pct, ev, cost, fee, kelly_fraction,
+            liquidity, brain_prob, brain_confirmed, action, tradeable
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        time.time(), opp["event"], opp["market"], opp.get("market_id"),
+        opp.get("yes_token"), opp.get("no_token"),
+        opp["yes_price"], opp.get("calibrated_yes"), opp.get("calibration_edge"),
+        opp.get("ev_pct"), opp.get("ev"), opp.get("cost"), opp.get("fee"),
+        opp.get("kelly_fraction"), opp.get("liquidity"),
+        opp.get("brain_prob"),
+        1 if opp.get("brain_confirmed") else 0,
+        opp.get("action", "BUY_YES"),
+        1 if opp.get("tradeable") else 0,
+    ))
+    row_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+    conn.commit()
+    conn.close()
+    return row_id
+
+
+def get_near_certainty_signals(limit=50, tradeable_only=False):
+    """Fetch recent near-certainty edge opportunities."""
+    conn = get_conn()
+    if tradeable_only:
+        rows = conn.execute(
+            "SELECT * FROM near_certainty_signals WHERE tradeable=1 ORDER BY timestamp DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT * FROM near_certainty_signals ORDER BY timestamp DESC LIMIT ?", (limit,)
+        ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+# --- Whale Alerts ---
+
+def save_whale_alert(alert):
+    """Save a whale/insider alert. Deduplicates by market_id within 1 hour."""
+    conn = get_conn()
+    # Skip if we already flagged this market in the last hour
+    cutoff = time.time() - 3600
+    existing = conn.execute(
+        "SELECT id FROM whale_alerts WHERE market_id=? AND timestamp > ?",
+        (alert.get("market_id", ""), cutoff)
+    ).fetchone()
+    if existing:
+        conn.close()
+        return None
+
+    conn.execute("""
+        INSERT INTO whale_alerts (timestamp, event, market, market_id, token_id,
+            current_price, volume_24h, liquidity, volume_ratio,
+            biggest_order_usd, dominant_side,
+            suspicion_score, score_volume, score_price, score_book, score_thinness,
+            analysis, status)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        alert["timestamp"], alert["event"], alert["market"],
+        alert.get("market_id", ""), alert.get("token_id", ""),
+        alert.get("current_price"), alert.get("volume_24h", 0),
+        alert.get("liquidity", 0), alert.get("volume_ratio", 0),
+        alert.get("biggest_order_usd", 0), alert.get("dominant_side"),
+        alert["suspicion_score"],
+        alert.get("score_volume", 0), alert.get("score_price", 0),
+        alert.get("score_book", 0), alert.get("score_thinness", 0),
+        alert.get("analysis", ""),
+        "new",
+    ))
+    row_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+    conn.commit()
+    conn.close()
+    return row_id
+
+
+def get_whale_alerts(limit=50, min_score=0, undismissed_only=False):
+    conn = get_conn()
+    where = "WHERE suspicion_score >= ?"
+    params = [min_score]
+    if undismissed_only:
+        where += " AND dismissed = 0"
+    rows = conn.execute(
+        f"SELECT * FROM whale_alerts {where} ORDER BY timestamp DESC LIMIT ?",
+        (*params, limit)
+    ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def get_whale_alert_by_id(alert_id: int):
+    conn = get_conn()
+    row = conn.execute("SELECT * FROM whale_alerts WHERE id=?", (alert_id,)).fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def get_latest_copy_trades(limit=5):
+    conn = get_conn()
+    rows = conn.execute("""
+        SELECT id, opened_at, status, copy_wallet, copy_label,
+               copy_condition_id, copy_outcome, size_usd
+        FROM trades
+        WHERE trade_type='copy'
+        ORDER BY opened_at DESC
+        LIMIT ?
+    """, (limit,)).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def dismiss_whale_alert(alert_id):
+    conn = get_conn()
+    conn.execute("UPDATE whale_alerts SET dismissed = 1 WHERE id = ?", (alert_id,))
+    conn.commit()
+    conn.close()
+
+
+def get_new_whale_count():
+    """Count undismissed whale alerts from the last 24h."""
+    conn = get_conn()
+    cutoff = time.time() - 86400
+    row = conn.execute(
+        "SELECT COUNT(*) FROM whale_alerts WHERE dismissed = 0 AND timestamp > ?",
+        (cutoff,)
+    ).fetchone()
+    conn.close()
+    return row[0] if row else 0
 
 
 # --- Scan Runs ---
@@ -916,6 +1428,36 @@ def get_watched_wallets(active_only: bool = True) -> list[dict]:
                     pass
         out.append(d)
     return out
+
+
+def get_wallet_baseline(address: str) -> set:
+    """Return the set of condition IDs that existed when this wallet was first scanned.
+
+    If no baseline exists yet, returns None (meaning baseline needs to be set).
+    """
+    conn = get_conn()
+    row = conn.execute(
+        "SELECT baseline_positions FROM watched_wallets WHERE address=?",
+        (address.lower(),)
+    ).fetchone()
+    conn.close()
+    if not row or not row["baseline_positions"]:
+        return None
+    try:
+        return set(json.loads(row["baseline_positions"]))
+    except Exception:
+        return None
+
+
+def set_wallet_baseline(address: str, condition_ids: list) -> None:
+    """Store the baseline positions for a wallet — these will be skipped for copy trading."""
+    conn = get_conn()
+    conn.execute(
+        "UPDATE watched_wallets SET baseline_positions=? WHERE address=?",
+        (json.dumps(list(condition_ids)), address.lower())
+    )
+    conn.commit()
+    conn.close()
 
 
 def update_wallet_score(address: str, score_result: dict) -> None:
@@ -1081,3 +1623,39 @@ def cancel_open_order(row_id: int, reason: str = "expired") -> None:
     )
     conn.commit()
     conn.close()
+
+
+def open_whale_trade(trade_data):
+    """Open a paper trade from a whale alert."""
+    conn = get_conn()
+    try:
+        # Insert trade record
+        conn.execute("""
+            INSERT INTO trades (trade_type, opened_at, side_a, side_b,
+                entry_price_a, entry_price_b, token_id_a, size_usd, status,
+                whale_alert_id, event, market_a, notes)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            trade_data['trade_type'],
+            trade_data['opened_at'],
+            trade_data['side_a'],
+            trade_data['side_b'],
+            trade_data['entry_price_a'],
+            trade_data['entry_price_b'],
+            trade_data['token_id_a'],
+            trade_data['size_usd'],
+            trade_data['status'],
+            trade_data.get('whale_alert_id'),
+            trade_data['event'],
+            trade_data['market_a'],
+            f"Suspicion: {trade_data.get('suspicion_score', 0)}/100"
+        ))
+        trade_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+        conn.commit()
+        return trade_id
+    except Exception as e:
+        print(f"Failed to open whale trade: {e}")
+        conn.rollback()
+        return None
+    finally:
+        conn.close()

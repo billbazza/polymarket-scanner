@@ -28,7 +28,7 @@
     font-size: 13px;
     line-height: 1.5;
   }
-  .container { max-width: 1600px; margin: 0 auto; padding: 20px; }
+  .container { margin: 0 auto; padding: 20px; }
 
   header {
     display: flex;
@@ -127,8 +127,10 @@
     border: 1px solid var(--border);
     border-radius: 8px;
     overflow-x: auto;
+    min-width: 0;
   }
-  table { width: 100%; border-collapse: collapse; }
+  .table-wrap table { min-width: max-content; }
+  table { width: 100%; border-collapse: collapse; table-layout: auto; }
   th {
     text-align: left;
     padding: 10px 12px;
@@ -171,8 +173,16 @@
   .grade-d  { color: var(--red); }
   .grade-f  { color: #6b7280; }
 
-  .event-name  { max-width: 180px; overflow: hidden; text-overflow: ellipsis; }
-  .market-name { max-width: 220px; overflow: hidden; text-overflow: ellipsis; font-size: 12px; }
+  .event-name  { min-width: 120px; width: 25%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .market-name { min-width: 180px; width: 35%; overflow: hidden; text-overflow: ellipsis; font-size: 12px; white-space: nowrap; }
+  .actions-col {
+    position: sticky;
+    right: 0;
+    background: var(--surface);
+    z-index: 2;
+    box-shadow: -10px 0 14px rgba(10, 14, 23, 0.35);
+  }
+  tr:hover .actions-col { background: var(--surface2); }
 
   .chart-container {
     background: var(--surface);
@@ -221,7 +231,9 @@
     color: var(--text);
     font-size: 13px;
     z-index: 1000;
-    max-width: 420px;
+    max-width: 640px;
+    line-height: 1.5;
+    white-space: normal;
     transform: translateY(100px);
     opacity: 0;
     transition: all 0.3s;
@@ -287,6 +299,10 @@
       <div class="value sky" id="statWeather" style="color:var(--sky);">—</div>
     </div>
     <div class="stat-card">
+      <div class="label">Whale Alerts</div>
+      <div class="value red" id="statWhales">0</div>
+    </div>
+    <div class="stat-card">
       <div class="label">Scans Run</div>
       <div class="value" id="statScans">0</div>
     </div>
@@ -302,15 +318,25 @@
   <div class="tabs">
     <div class="tab active" data-tab="signals"  onclick="switchTab('signals')">Cointegration <span class="badge-count" id="cntSignals">0</span></div>
     <div class="tab"        data-tab="weather"  onclick="switchTab('weather')">Weather <span class="badge-count" id="cntWeather">0</span></div>
+    <div class="tab"        data-tab="whales"   onclick="switchTab('whales')">Whales <span class="badge-count" id="cntWhales" style="background:rgba(239,68,68,0.2);color:var(--red)">0</span></div>
     <div class="tab"        data-tab="copy"     onclick="switchTab('copy')">Copy Trader <span class="badge-count" id="cntCopy">0</span></div>
     <div class="tab"        data-tab="trades"   onclick="switchTab('trades')">Open Trades</div>
     <div class="tab"        data-tab="history"  onclick="switchTab('history')">Trade History</div>
     <div class="tab"        data-tab="scans"    onclick="switchTab('scans')">Scan Log</div>
+    <div class="tab"        data-tab="reports"  onclick="switchTab('reports')">Daily Reports</div>
     <div class="tab"        data-tab="console"  onclick="switchTab('console')">Console</div>
   </div>
 
   <!-- ── Cointegration Signals ── -->
   <div id="panel-signals" class="table-wrap">
+    <div class="panel-toolbar" style="border-bottom:1px solid var(--border);padding:10px 12px;">
+      <span class="info" id="signalsInfo">Recent cointegration signals.</span>
+      <div style="display:flex;gap:8px;align-items:center;">
+        <label style="color:var(--text2);font-size:12px;display:flex;align-items:center;gap:4px;">
+          <input type="checkbox" id="signalHideSports" onchange="persistUiPrefs(); loadSignals()"> Hide sports
+        </label>
+      </div>
+    </div>
     <table>
       <thead>
         <tr>
@@ -329,7 +355,7 @@
       <span class="info" id="lockedInfo">Run a Locked Arb scan to find opportunities.</span>
       <div style="display:flex;gap:8px;">
         <label style="color:var(--text2);font-size:12px;display:flex;align-items:center;gap:4px;">
-          <input type="checkbox" id="lockedTradeableOnly" onchange="loadLocked()"> Tradeable only
+          <input type="checkbox" id="lockedTradeableOnly" onchange="persistUiPrefs(); loadLocked()"> Tradeable only
         </label>
         <button class="btn sm teal" onclick="runLockedScan()">Scan Now</button>
       </div>
@@ -355,7 +381,7 @@
       <span class="info" id="weatherInfo">Run a Weather scan to compare NOAA + Open-Meteo vs market prices.</span>
       <div style="display:flex;gap:8px;">
         <label style="color:var(--text2);font-size:12px;display:flex;align-items:center;gap:4px;">
-          <input type="checkbox" id="weatherTradeableOnly" onchange="loadWeather()"> Tradeable only
+          <input type="checkbox" id="weatherTradeableOnly" onchange="persistUiPrefs(); loadWeather()"> Tradeable only
         </label>
         <button class="btn sm sky" onclick="runWeatherScan()">Scan Now</button>
       </div>
@@ -370,6 +396,52 @@
           </tr>
         </thead>
         <tbody id="weatherBody"></tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- ── Whale / Insider Alerts ── -->
+  <div id="panel-whales" style="display:none">
+    <div class="panel-toolbar">
+      <span class="info" id="whaleInfo">Scan for unusual large trades in low-liquidity markets.</span>
+      <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
+        <label style="color:var(--text2);font-size:12px;display:flex;align-items:center;gap:4px;">
+          Min score: <input type="number" id="whaleMinScore" value="60" min="0" max="100" step="10"
+            onchange="persistUiPrefs(); loadWhales()"
+            style="width:50px;background:var(--bg);border:1px solid var(--border);border-radius:4px;padding:3px 6px;color:var(--text);font-size:12px;font-family:inherit">
+        </label>
+        <label style="color:var(--text2);font-size:12px;display:flex;align-items:center;gap:4px;">
+          <input type="checkbox" id="whaleHideSports" onchange="persistUiPrefs(); loadWhales()"> Hide sports
+        </label>
+        <label style="color:var(--text2);font-size:12px;display:flex;align-items:center;gap:4px;">
+          <input type="checkbox" id="whaleHideDismissed" onchange="persistUiPrefs(); loadWhales()"> Hide dismissed
+        </label>
+        <label style="color:var(--text2);font-size:12px;display:flex;align-items:center;gap:4px;">
+          Min order $ <input type="number" id="whaleMinOrderSize" value="0" min="0" step="100"
+            onchange="persistUiPrefs(); loadWhales()"
+            style="width:84px;background:var(--bg);border:1px solid var(--border);border-radius:4px;padding:3px 6px;color:var(--text);font-size:12px;font-family:inherit">
+        </label>
+        <label style="color:var(--text2);font-size:12px;display:flex;align-items:center;gap:4px;">
+          Order $ <input type="number" id="whaleOrderValue" value="20" min="1" step="1"
+            onchange="persistUiPrefs(); loadWhales()"
+            style="width:64px;background:var(--bg);border:1px solid var(--border);border-radius:4px;padding:3px 6px;color:var(--text);font-size:12px;font-family:inherit">
+        </label>
+        <label style="color:var(--text2);font-size:12px;display:flex;align-items:center;gap:4px;">
+          <input type="checkbox" id="whaleAutoTrade" onchange="persistUiPrefs()"> Auto-trade high-confidence
+        </label>
+        <button class="btn sm" style="background:var(--red);color:#fff;font-weight:600" id="whaleScanBtn" onclick="runWhaleScan()">Whale Scan</button>
+      </div>
+    </div>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>Time</th><th>Score</th><th>Event</th><th>Market</th>
+            <th>Price</th><th>Vol 24h</th><th>Liquidity</th><th>Vol/Liq</th>
+            <th>Big Order</th><th>Breakdown</th><th>Actions</th>
+          </tr>
+        </thead>
+        <tbody id="whaleBody"></tbody>
       </table>
     </div>
   </div>
@@ -391,8 +463,24 @@
   <div id="panel-copy" class="table-wrap" style="display:none">
     <div style="display:flex;gap:12px;align-items:center;padding:8px 0 12px;flex-wrap:wrap">
       <span id="copyInfo" style="color:var(--text2);font-size:13px">Loading watched wallets...</span>
+      <label style="color:var(--text2);font-size:12px;display:flex;align-items:center;gap:4px;">
+        <input type="checkbox" id="copyCapEnabled" onchange="persistUiPrefs(); saveCopySettings()"> Cap trades
+      </label>
+      <label style="color:var(--text2);font-size:12px;display:flex;align-items:center;gap:6px;">
+        Wallet
+        <input id="copyPerWalletCap" type="number" min="1" step="1" value="3"
+          onchange="persistUiPrefs(); saveCopySettings()"
+          style="width:62px;background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:5px 8px;color:var(--text1);font-size:12px">
+      </label>
+      <label style="color:var(--text2);font-size:12px;display:flex;align-items:center;gap:6px;">
+        Total
+        <input id="copyTotalCap" type="number" min="1" step="1" value="25"
+          onchange="persistUiPrefs(); saveCopySettings()"
+          style="width:62px;background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:5px 8px;color:var(--text1);font-size:12px">
+      </label>
       <button class="btn sm sky" onclick="loadCopy()">Refresh</button>
     </div>
+    <div id="copyLatest" style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:16px"></div>
 
     <!-- Discover / Score new wallet -->
     <div style="background:var(--card);border:1px solid var(--border);border-radius:8px;padding:14px;margin-bottom:16px">
@@ -450,6 +538,24 @@
     </table>
   </div>
 
+  <div id="panel-reports" style="display:none">
+    <div class="panel-toolbar">
+      <span class="info" id="reportsInfo">Generate a saved AI daily report, then route issues into fix logs, diagnostics, implementation, or testing.</span>
+      <div style="display:flex;gap:8px;align-items:center;">
+        <button class="btn sm" id="dailyReportBtn" onclick="generateDailyReport()">Generate Report</button>
+        <button class="btn sm sky" onclick="loadDailyReport()">Refresh</button>
+      </div>
+    </div>
+    <div class="table-wrap" style="padding:14px;">
+      <div id="dailyReportMeta" style="color:var(--text2);font-size:12px;margin-bottom:10px"></div>
+      <div id="dailyReportQueues"></div>
+      <details style="margin-top:14px">
+        <summary style="cursor:pointer;color:var(--text2);font-size:12px;">Raw markdown report</summary>
+        <pre id="dailyReportContent" style="margin:10px 0 0;white-space:pre-wrap;word-break:break-word;font-family:'SF Mono','Fira Code',monospace;font-size:12px;line-height:1.6;color:var(--text);"></pre>
+      </details>
+    </div>
+  </div>
+
   <!-- ── Console ── -->
   <div id="panel-console" style="display:none">
     <div class="panel-toolbar">
@@ -463,6 +569,7 @@
         <button class="btn sm" onclick="setConsoleFilter('TRADE')"  style="color:var(--green);">Trades</button>
         <button class="btn sm" onclick="setConsoleFilter('weather')" style="color:var(--sky);">Weather</button>
         <button class="btn sm" onclick="setConsoleFilter('locked')" style="color:var(--teal);">Locked</button>
+        <button class="btn sm" onclick="setConsoleFilter('whale')"   style="color:var(--red);">Whales</button>
         <button class="btn sm" onclick="setConsoleFilter('Brain')"  style="color:var(--purple);">Brain</button>
       </div>
     </div>
@@ -484,7 +591,8 @@
 
 <script>
 const API = '';
-const ALL_PANELS = ['signals','locked','weather','copy','trades','history','scans','console'];
+const ALL_PANELS = ['signals','locked','weather','whales','copy','trades','history','scans','reports','console'];
+const UI_PREFS_KEY = 'polymarket-scanner-ui-prefs-v1';
 
 // ── Utilities ──────────────────────────────────────────────────────────────
 
@@ -498,12 +606,75 @@ function fmtUsd(v) { return '$' + Number(v || 0).toLocaleString('en-US', {minimu
 function fmtNum(v, dp=3) { return v != null ? Number(v).toFixed(dp) : '-'; }
 function esc(s) { const d = document.createElement('div'); d.textContent = String(s||''); return d.innerHTML; }
 
+function getEl(id) { return document.getElementById(id); }
+
+function isSportsEvent(text) {
+  const t = String(text || '').toLowerCase();
+  return [
+    'nba', 'nfl', 'mlb', 'nhl', 'soccer', 'football', 'tennis', 'baseball',
+    'basketball', 'hockey', 'ufc', 'boxing', 'fifa', 'world cup', 'premier league',
+    'champions league', 'serie a', 'serie b', 'la liga', 'bundesliga', 'ligue 1',
+    'championship', 'fa cup', 'carabao cup', 'uefa', 'super bowl', 'world series',
+    'stanley cup', 'olympics', 'formula 1', 'nascar', 'golf', 'pga', 'masters',
+    'wimbledon', 'cricket', 'rugby'
+  ].some(keyword => t.includes(keyword));
+}
+
+function persistUiPrefs() {
+  const prefs = {
+    signalHideSports: !!getEl('signalHideSports')?.checked,
+    lockedTradeableOnly: !!getEl('lockedTradeableOnly')?.checked,
+    weatherTradeableOnly: !!getEl('weatherTradeableOnly')?.checked,
+    whaleHideSports: !!getEl('whaleHideSports')?.checked,
+    whaleHideDismissed: !!getEl('whaleHideDismissed')?.checked,
+    whaleMinOrderSize: getEl('whaleMinOrderSize')?.value || '0',
+    whaleAutoTrade: !!getEl('whaleAutoTrade')?.checked,
+    whaleMinScore: getEl('whaleMinScore')?.value || '60',
+    whaleOrderValue: getEl('whaleOrderValue')?.value || '20',
+    copyCapEnabled: !!getEl('copyCapEnabled')?.checked,
+    copyPerWalletCap: getEl('copyPerWalletCap')?.value || '3',
+    copyTotalCap: getEl('copyTotalCap')?.value || '25',
+  };
+  localStorage.setItem(UI_PREFS_KEY, JSON.stringify(prefs));
+}
+
+function loadUiPrefs() {
+  try {
+    const prefs = JSON.parse(localStorage.getItem(UI_PREFS_KEY) || '{}');
+    if (getEl('signalHideSports')) getEl('signalHideSports').checked = !!prefs.signalHideSports;
+    if (getEl('lockedTradeableOnly')) getEl('lockedTradeableOnly').checked = !!prefs.lockedTradeableOnly;
+    if (getEl('weatherTradeableOnly')) getEl('weatherTradeableOnly').checked = !!prefs.weatherTradeableOnly;
+    if (getEl('whaleHideSports')) getEl('whaleHideSports').checked = !!prefs.whaleHideSports;
+    if (getEl('whaleHideDismissed')) getEl('whaleHideDismissed').checked = prefs.whaleHideDismissed !== false;
+    if (getEl('whaleMinOrderSize') && prefs.whaleMinOrderSize != null) getEl('whaleMinOrderSize').value = prefs.whaleMinOrderSize;
+    if (getEl('whaleAutoTrade')) getEl('whaleAutoTrade').checked = !!prefs.whaleAutoTrade;
+    if (getEl('whaleMinScore') && prefs.whaleMinScore != null) getEl('whaleMinScore').value = prefs.whaleMinScore;
+    if (getEl('whaleOrderValue') && prefs.whaleOrderValue != null) getEl('whaleOrderValue').value = prefs.whaleOrderValue;
+    if (getEl('copyCapEnabled')) getEl('copyCapEnabled').checked = !!prefs.copyCapEnabled;
+    if (getEl('copyPerWalletCap') && prefs.copyPerWalletCap != null) getEl('copyPerWalletCap').value = prefs.copyPerWalletCap;
+    if (getEl('copyTotalCap') && prefs.copyTotalCap != null) getEl('copyTotalCap').value = prefs.copyTotalCap;
+  } catch(e) {
+    console.warn('Failed to load UI prefs', e);
+  }
+}
+
 function toast(msg, duration=4000) {
   const el = document.getElementById('toast');
+  const timeout = typeof duration === 'number'
+    ? duration
+    : duration === true
+      ? 7000
+      : 4000;
   el.textContent = msg;
   el.classList.add('show');
   clearTimeout(el._t);
-  el._t = setTimeout(() => el.classList.remove('show'), duration);
+  el._t = setTimeout(() => el.classList.remove('show'), timeout);
+}
+
+function brainToast(prefix, shouldTrade, reasoning) {
+  const msg = `${prefix}: ${shouldTrade ? 'TRADE' : 'SKIP'} — ${reasoning}`;
+  const duration = Math.min(20000, Math.max(10000, 5000 + String(reasoning || '').length * 20));
+  toast(msg, duration);
 }
 
 // ── Tabs ───────────────────────────────────────────────────────────────────
@@ -517,8 +688,10 @@ function switchTab(name) {
   if (name === 'trades')  loadTrades();
   if (name === 'history') loadHistory();
   if (name === 'scans')   loadScans();
+  if (name === 'reports') loadDailyReport();
   if (name === 'locked')  loadLocked();
   if (name === 'weather') loadWeather();
+  if (name === 'whales')  loadWhales();
   if (name === 'copy')    { loadCopy(); loadCandidates(); }
 }
 
@@ -606,13 +779,23 @@ async function loadSignals() {
   try {
     const r = await fetch(API + '/api/signals?limit=50');
     const signals = await r.json();
-    document.getElementById('cntSignals').textContent = signals.length;
-    const body = document.getElementById('signalsBody');
-    if (!signals.length) {
-      body.innerHTML = '<tr><td colspan="12" class="empty"><div class="icon">◎</div>No signals yet — run a scan.</td></tr>';
+    const hideSports = !!getEl('signalHideSports')?.checked;
+    const filtered = hideSports
+      ? signals.filter(s => !isSportsEvent(`${s.event || ''} ${s.market_a || ''} ${s.market_b || ''}`))
+      : signals;
+    getEl('cntSignals').textContent = filtered.length;
+    getEl('signalsInfo').textContent = hideSports
+      ? `${filtered.length} signals shown · ${signals.length - filtered.length} sports rows hidden`
+      : `${signals.length} recent cointegration signals`;
+    const body = getEl('signalsBody');
+    if (!filtered.length) {
+      const msg = signals.length
+        ? 'No signals match the active filters.'
+        : 'No signals yet — run a scan.';
+      body.innerHTML = `<tr><td colspan="12" class="empty"><div class="icon">◎</div>${msg}</td></tr>`;
       return;
     }
-    body.innerHTML = signals.map(s => {
+    body.innerHTML = filtered.map(s => {
       const gl = s.grade_label || '-';
       const gc = gl.startsWith('A') ? 'grade-a' : gl==='B' ? 'grade-b' : gl==='C' ? 'grade-c' : gl==='D' ? 'grade-d' : 'grade-f';
       const evPct     = s.ev     && s.ev.ev_pct     != null ? s.ev.ev_pct.toFixed(1) + '%' : '-';
@@ -620,8 +803,8 @@ async function loadSignals() {
       return `<tr>
         <td>${fmt(s.timestamp)}</td>
         <td class="event-name" title="${esc(s.event)}">${esc(s.event)}</td>
-        <td class="market-name" title="${esc(s.market_a)}">${esc((s.market_a||'').slice(0,38))}</td>
-        <td class="market-name" title="${esc(s.market_b)}">${esc((s.market_b||'').slice(0,38))}</td>
+        <td class="market-name" title="${esc(s.market_a)}">${esc(s.market_a||'')}</td>
+        <td class="market-name" title="${esc(s.market_b)}">${esc(s.market_b||'')}</td>
         <td class="${s.z_score>0?'z-pos':'z-neg'}">${s.z_score>0?'+':''}${s.z_score.toFixed(2)}</td>
         <td>${s.coint_pvalue.toFixed(4)}</td>
         <td><span class="grade ${gc}">${gl}</span></td>
@@ -629,7 +812,7 @@ async function loadSignals() {
         <td>${kellySize}</td>
         <td>${fmtUsd(s.liquidity)}</td>
         <td><span class="badge ${s.status}">${s.status}</span></td>
-        <td>${s.status==='new'
+        <td class="actions-col">${s.status==='new'
           ? `<button class="btn sm" onclick="paperTrade(${s.id})">Trade</button>
              <button class="btn sm" onclick="brainValidate(${s.id})" title="Ask Claude">Brain</button>`
           : ''}</td>
@@ -666,7 +849,7 @@ async function loadLocked() {
       return `<tr>
         <td>${fmt(row.timestamp)}</td>
         <td class="event-name" title="${esc(row.event)}">${esc(row.event)}</td>
-        <td class="market-name" title="${esc(row.market)}">${esc((row.market||'').slice(0,45))}</td>
+        <td class="market-name" title="${esc(row.market)}">${esc(row.market||'')}</td>
         <td>${fmtNum(row.yes_price)}</td>
         <td>${fmtNum(row.no_price)}</td>
         <td style="${row.sum_price<1?'color:var(--amber);font-weight:600':''}">${fmtNum(row.sum_price)}</td>
@@ -768,6 +951,18 @@ async function loadTrades() {
           <td>${fmtUsd(t.size_usd)}</td>
           <td><button class="btn sm" onclick="closeTrade(${t.id})">Close</button></td>
         </tr>`;
+      }    if (t.trade_type === 'whale') {
+        const actionBadge = `<span class="badge ${t.side_a==='BUY_YES'?'yes':'no'}">${t.side_a}</span>`;
+        return `<tr>
+          <td>${fmt(t.opened_at)}</td>
+          <td><span class="pill" style="background:var(--red);color:#fff">whale</span></td>
+          <td class="event-name" title="${esc(t.event)}">${esc(t.event)}</td>
+          <td>${actionBadge}</td>
+          <td>${fmtPct(t.entry_price_a)}</td>
+          <td style="color:var(--text2);font-size:12px">${esc(t.market_a||'')}</td>
+          <td>${fmtUsd(t.size_usd)}</td>
+          <td><button class="btn sm" onclick="closeTrade(${t.id})">Close</button></td>
+        </tr>`;
       }
       if (t.trade_type === 'weather') {
         const actionBadge = `<span class="badge ${t.side_a==='BUY_YES'?'yes':'no'}">${t.side_a}</span>`;
@@ -846,6 +1041,7 @@ function colorLine(line) {
   if (line.includes('PAPER FILL') || line.includes('LIVE FILL')) return `<span style="color:var(--green);font-weight:bold">${e}</span>`;
   if (line.includes('scanner.weather') || line.includes('Weather scan') || line.includes('Open-Meteo')) return `<span style="color:var(--sky)">${e}</span>`;
   if (line.includes('scanner.locked') || line.includes('Locked scan') || line.includes('locked_arb')) return `<span style="color:var(--teal)">${e}</span>`;
+  if (line.includes('WHALE ALERT') || line.includes('scanner.whale') || line.includes('Whale scan')) return `<span style="color:var(--red);font-weight:bold">${e}</span>`;
   if (line.includes('Brain') || line.includes('brain')) return `<span style="color:var(--purple)">${e}</span>`;
   if (line.includes('WARNING'))  return `<span style="color:var(--amber)">${e}</span>`;
   if (line.includes('Scan complete') || line.includes('scan:') || line.includes('Autonomy')) return `<span style="color:var(--blue)">${e}</span>`;
@@ -1017,7 +1213,24 @@ async function brainValidate(signalId) {
   try {
     const r = await fetch(API + `/api/brain/validate/${signalId}`, { method: 'POST' });
     const data = await r.json();
-    toast(`Brain: ${data.should_trade ? 'TRADE' : 'SKIP'} — ${data.reasoning}`);
+    if (!r.ok) {
+      toast('Brain error: ' + (data.detail || data.error || 'Request failed'), true);
+      return;
+    }
+    brainToast('Brain', data.should_trade, data.reasoning);
+  } catch(e) { toast('Brain error: ' + e.message); }
+}
+
+async function brainValidateWhale(alertId) {
+  toast('Asking Claude about whale alert...');
+  try {
+    const r = await fetch(API + `/api/brain/whale/${alertId}`, { method: 'POST' });
+    const data = await r.json();
+    if (!r.ok) {
+      toast('Brain error: ' + (data.detail || data.error || 'Request failed'), true);
+      return;
+    }
+    brainToast('Brain', data.should_trade, data.reasoning);
   } catch(e) { toast('Brain error: ' + e.message); }
 }
 
@@ -1028,7 +1241,7 @@ async function paperTrade(signalId) {
     const r = await fetch(API + `/api/trades?signal_id=${signalId}&size_usd=${size}`, { method: 'POST' });
     const data = await r.json();
     toast(`Paper trade opened (ID: ${data.trade_id})`);
-    loadSignals(); loadStats();
+    loadSignals(); loadTrades(); loadStats();
   } catch(e) { toast('Failed: ' + e.message); }
 }
 
@@ -1042,6 +1255,321 @@ async function closeTrade(tradeId) {
     toast(`Trade closed. P&L: ${fmtUsd(data.pnl)}`);
     loadTrades(); loadStats();
   } catch(e) { toast('Failed: ' + e.message); }
+}
+
+// ── Whale / Insider Detection ────────────────────────────────────────────────
+
+function suspicionBar(score) {
+  const pct = Math.min(score, 100);
+  const col = pct >= 70 ? 'var(--red)' : pct >= 50 ? 'var(--amber)' : 'var(--text2)';
+  return `<div style="display:flex;align-items:center;gap:6px">
+    <span style="font-weight:700;color:${col}">${score}</span>
+    <div style="width:60px;height:6px;background:var(--surface2);border-radius:3px;overflow:hidden">
+      <div style="width:${pct}%;height:100%;background:${col};border-radius:3px"></div>
+    </div>
+  </div>`;
+}
+
+function scoreBreakdown(a) {
+  const parts = [];
+  if (a.score_volume)   parts.push(`vol:${a.score_volume}`);
+  if (a.score_price)    parts.push(`price:${a.score_price}`);
+  if (a.score_book)     parts.push(`book:${a.score_book}`);
+  if (a.score_thinness) parts.push(`thin:${a.score_thinness}`);
+  return `<span style="color:var(--text2);font-size:11px">${parts.join(' ')}</span>`;
+}
+
+async function loadWhales() {
+  try {
+    const minScore = document.getElementById('whaleMinScore').value || 40;
+    const hideSports = !!getEl('whaleHideSports')?.checked;
+    const hideDismissed = !!getEl('whaleHideDismissed')?.checked;
+    const minOrderSize = Number(getEl('whaleMinOrderSize')?.value || 0);
+    const orderValue = Number(getEl('whaleOrderValue')?.value || 20);
+    const r = await fetch(API + `/api/whales?limit=100&min_score=${minScore}`);
+    const rows = await r.json();
+    const filtered = rows.filter(a => {
+      if (hideDismissed && a.dismissed) return false;
+      if (hideSports && isSportsEvent(`${a.event || ''} ${a.market || ''}`)) return false;
+      if ((a.biggest_order_usd || 0) < minOrderSize) return false;
+      return true;
+    });
+    document.getElementById('cntWhales').textContent = rows.filter(r => !r.dismissed).length;
+    const body = document.getElementById('whaleBody');
+    if (!rows.length) {
+      body.innerHTML = '<tr><td colspan="11" class="empty"><div class="icon" style="font-size:24px">&#9888;</div>No whale alerts yet. Run a Whale Scan to monitor for suspicious activity.</td></tr>';
+      document.getElementById('whaleInfo').textContent = 'No alerts — click "Whale Scan" to check all active markets.';
+      return;
+    }
+    const active = rows.filter(r => !r.dismissed).length;
+    const hidden = rows.length - filtered.length;
+    document.getElementById('whaleInfo').textContent =
+      `${filtered.length} shown · ${active} active total · ${hidden} hidden by filters · min order $${minOrderSize.toFixed(0)} · trade size $${orderValue.toFixed(0)} · last scan ${fmt(rows[0].timestamp)}`;
+
+    if (!filtered.length) {
+      body.innerHTML = '<tr><td colspan="11" class="empty"><div class="icon" style="font-size:24px">&#9888;</div>No whale alerts match the active filters.</td></tr>';
+      return;
+    }
+
+    body.innerHTML = filtered.map(a => {
+      const dimStyle = a.dismissed ? 'opacity:0.4;' : '';
+      const volRatio = a.volume_ratio != null ? `${a.volume_ratio.toFixed(1)}x` : '-';
+      const volColor = a.volume_ratio >= 3 ? 'color:var(--red);font-weight:600' : a.volume_ratio >= 1.5 ? 'color:var(--amber)' : '';
+      const bigOrder = a.biggest_order_usd > 0
+        ? `${fmtUsd(a.biggest_order_usd)} <span style="color:var(--text2);font-size:10px">${a.dominant_side||''}</span>`
+        : '-';
+      const dismissBtn = a.dismissed
+        ? '<span style="color:var(--text2);font-size:11px">dismissed</span>'
+        : `<button class="btn sm" onclick="dismissWhale(${a.id}, this)" style="font-size:10px">Dismiss</button>`;
+      const tradeBtn = `<button class="btn sm sky" onclick="tradeWhaleAlert(${a.id}, this)" title="Open paper trade" style="font-size:10px">Trade $${orderValue.toFixed(0)}</button>`;
+      const analysisRow = a.analysis
+        ? `<tr style="${dimStyle}"><td colspan="11" style="padding:4px 12px 10px;border-bottom:2px solid var(--border)">
+             <div style="color:var(--text2);font-size:11px;line-height:1.6;max-width:900px;padding-left:4px">${esc(a.analysis)}</div>
+           </td></tr>`
+        : '';
+      return `<tr style="${dimStyle};border-bottom:${a.analysis?'none':''}">
+        <td>${fmt(a.timestamp)}</td>
+        <td>${suspicionBar(a.suspicion_score)}</td>
+        <td class="event-name" title="${esc(a.event)}">${esc(a.event)}</td>
+        <td class="market-name" title="${esc(a.market)}">${esc(a.market||'')}</td>
+        <td>${a.current_price != null ? (a.current_price * 100).toFixed(0) + '%' : '-'}</td>
+        <td>${fmtUsd(a.volume_24h)}</td>
+        <td>${fmtUsd(a.liquidity)}</td>
+        <td style="${volColor}">${volRatio}</td>
+        <td>${bigOrder}</td>
+        <td>${scoreBreakdown(a)}</td>
+        <td class="actions-col" style="display:flex;gap:4px">${tradeBtn}<button class="btn sm" onclick="brainValidateWhale(${a.id})" title="Ask Claude">Brain</button>${dismissBtn}</td>
+      </tr>${analysisRow}`;
+    }).join('');
+  } catch(e) { console.error('Whale error:', e); }
+}
+
+async function runWhaleScan() {
+  const btn = document.getElementById('whaleScanBtn');
+  const minScore = document.getElementById('whaleMinScore').value || 50;
+  const autoTrade = document.getElementById('whaleAutoTrade').checked;
+  btn.disabled = true;
+  btn.innerHTML = '<span class="spinner"></span>Scanning...';
+  try {
+    const r = await fetch(API + `/api/scan/whales?min_score=${minScore}&auto_trade=${autoTrade}`, { method: 'POST' });
+    const data = await r.json();
+    if (!data.ok) {
+      toast('Whale scan: ' + (data.error || 'failed'));
+      btn.disabled = false; btn.innerHTML = 'Whale Scan'; return;
+    }
+    toast('Whale scan started — watch Console tab...');
+    const poll = setInterval(async () => {
+      try {
+        const sr = await fetch(API + '/api/scan/whales/status');
+        const status = await sr.json();
+        if (!status.running) {
+          clearInterval(poll);
+          btn.disabled = false; btn.innerHTML = 'Whale Scan';
+          const res = status.last_result;
+          if (res && res.ok) {
+            const tradeMsg = res.trades_created ? ` · ${res.trades_created} trades created` : '';
+            toast(`Whale scan: ${res.alerts} alerts (${res.new_saved} new)${tradeMsg} — ${res.stats.markets_checked} markets in ${res.duration_secs}s`);
+          } else if (res) {
+            toast('Whale scan error: ' + (res.error || 'unknown'));
+          }
+          loadWhales();
+          checkWhaleAlerts();
+        }
+      } catch(e) { clearInterval(poll); btn.disabled = false; btn.innerHTML = 'Whale Scan'; }
+    }, 3000);
+  } catch(e) {
+    toast('Whale scan failed: ' + e.message);
+    btn.disabled = false; btn.innerHTML = 'Whale Scan';
+  }
+}
+
+async function tradeWhaleAlert(alertId, btn) {
+  const sizeUsd = Number(getEl('whaleOrderValue')?.value || 20);
+  btn.disabled = true;
+  btn.textContent = '…';
+  try {
+    const r = await fetch(API + `/api/whales/${alertId}/trade?size_usd=${encodeURIComponent(sizeUsd)}`, { method: 'POST' });
+    const data = await r.json();
+    if (r.ok && data.ok) {
+      toast(`Whale trade #${data.trade_id} opened`);
+      btn.textContent = 'Traded';
+      btn.style.background = 'var(--green)';
+      btn.style.color = '#000';
+      loadTrades(); loadStats();
+    } else {
+      toast('Error: ' + (data.detail || data.error || 'Failed'), true);
+      btn.disabled = false;
+      btn.textContent = `Trade $${sizeUsd.toFixed(0)}`;
+    }
+  } catch(e) {
+    toast('Error: ' + e.message, true);
+    btn.disabled = false;
+    btn.textContent = `Trade $${sizeUsd.toFixed(0)}`;
+  }
+}
+
+async function dismissWhale(id, btn) {
+  btn.disabled = true;
+  try {
+    await fetch(API + `/api/whales/${id}/dismiss`, { method: 'POST' });
+    loadWhales();
+  } catch(e) { toast('Error: ' + e, true); btn.disabled = false; }
+}
+
+async function checkWhaleAlerts() {
+  try {
+    const r = await fetch(API + '/api/whales/count');
+    const data = await r.json();
+    const count = data.count || 0;
+    document.getElementById('cntWhales').textContent = count;
+    document.getElementById('statWhales').textContent = count;
+  } catch(e) {}
+}
+
+async function loadDailyReport() {
+  const meta = getEl('dailyReportMeta');
+  const content = getEl('dailyReportContent');
+  const queues = getEl('dailyReportQueues');
+  if (!meta || !content || !queues) return;
+  try {
+    const r = await fetch(API + '/api/reports/daily');
+    const data = await r.json();
+    if (!data.exists) {
+      meta.textContent = `No daily report yet. Implementation plan: ${data.implementation_plan_path} · Testing ideas: ${data.testing_ideas_path}`;
+      queues.innerHTML = '';
+      content.textContent = 'Generate the first report to create a dated report and actionable queues.';
+      return;
+    }
+    meta.textContent = `Saved report: ${data.path} · Implementation plan: ${data.implementation_plan_path} · Testing ideas: ${data.testing_ideas_path}`;
+    renderDailyReportQueues(data.report || {}, data.items || []);
+    content.textContent = data.content || '';
+  } catch(e) {
+    meta.textContent = 'Failed to load daily report';
+    queues.innerHTML = '';
+    content.textContent = String(e);
+  }
+}
+
+async function generateDailyReport() {
+  const btn = getEl('dailyReportBtn');
+  const meta = getEl('dailyReportMeta');
+  const content = getEl('dailyReportContent');
+  const queues = getEl('dailyReportQueues');
+  if (btn) { btn.disabled = true; btn.textContent = 'Generating…'; }
+  if (meta) meta.textContent = 'Generating report…';
+  if (queues) queues.innerHTML = '';
+  try {
+    const r = await fetch(API + '/api/reports/daily', { method: 'POST' });
+    const data = await r.json();
+    if (!r.ok || !data.ok) {
+      toast('Daily report error: ' + (data.detail || data.error || 'Request failed'), true);
+      return;
+    }
+    if (meta) meta.textContent = `Saved report: ${data.path} · Implementation plan: ${data.implementation_plan_path} · Testing ideas: ${data.testing_ideas_path}`;
+    if (queues) renderDailyReportQueues(data.report || {}, data.items || []);
+    if (content) content.textContent = data.content || '';
+    toast('Daily report generated and report items queued', 10000);
+  } catch(e) {
+    toast('Daily report error: ' + e.message, true);
+    if (meta) meta.textContent = 'Daily report generation failed';
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = 'Generate Report'; }
+  }
+}
+
+function reportItemBadge(item) {
+  const label = item.disposition || item.status || 'new';
+  const palette = {
+    implement: ['rgba(16,185,129,0.18)', 'var(--green)'],
+    live_candidate: ['rgba(56,189,248,0.18)', 'var(--sky)'],
+    diagnose: ['rgba(245,158,11,0.18)', 'var(--amber)'],
+    test_only: ['rgba(148,163,184,0.18)', 'var(--text2)'],
+    planned: ['rgba(16,185,129,0.18)', 'var(--green)'],
+    queued: ['rgba(245,158,11,0.18)', 'var(--amber)'],
+    needs_review: ['rgba(239,68,68,0.18)', 'var(--red)'],
+    new: ['rgba(148,163,184,0.18)', 'var(--text2)'],
+  }[label] || ['rgba(148,163,184,0.18)', 'var(--text2)'];
+  return `<span style="display:inline-block;padding:2px 8px;border-radius:999px;background:${palette[0]};color:${palette[1]};font-size:11px;font-weight:700;text-transform:capitalize">${esc(label.replaceAll('_', ' '))}</span>`;
+}
+
+function dailyReportItemCard(item, buttons) {
+  const notes = item.notes ? `<div style="color:var(--text2);font-size:11px;margin-top:6px">${esc(item.notes)}</div>` : '';
+  const diag = item.diagnosis_path ? `<div style="color:var(--text2);font-size:11px;margin-top:4px">Diagnosis log: ${esc(item.diagnosis_path)}</div>` : '';
+  const action = item.action_path ? `<div style="color:var(--text2);font-size:11px;margin-top:4px">Tracked in: ${esc(item.action_path)}</div>` : '';
+  return `
+    <div style="border:1px solid var(--border);border-radius:10px;padding:12px;background:rgba(15,23,42,0.35);margin-bottom:10px">
+      <div style="display:flex;justify-content:space-between;gap:10px;align-items:flex-start">
+        <div style="font-size:13px;line-height:1.5">${esc(item.item_text)}</div>
+        ${reportItemBadge(item)}
+      </div>
+      <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:10px">${buttons}</div>
+      ${notes}${diag}${action}
+    </div>`;
+}
+
+function renderDailyReportQueues(report, items) {
+  const queues = getEl('dailyReportQueues');
+  if (!queues) return;
+  const bySection = (section) => items.filter(item => item.section === section);
+  const notWorking = bySection('not_working');
+  const improvements = bySection('improvement');
+  const working = (report.working || []).map(item =>
+    `<li style="margin:0 0 6px 18px">${esc(item)}</li>`
+  ).join('');
+  const notWorkingCards = notWorking.map(item => dailyReportItemCard(
+    item,
+    `
+      <button class="btn sm" onclick="runReportItemAction(${item.id}, 'fix-log')">Add to Fix Log</button>
+      <button class="btn sm sky" onclick="runReportItemAction(${item.id}, 'diagnose')">Diagnose</button>
+    `
+  )).join('');
+  const improvementCards = improvements.map(item => dailyReportItemCard(
+    item,
+    `
+      <button class="btn sm" onclick="runReportItemAction(${item.id}, 'plan')">Add to Plan</button>
+      <button class="btn sm" onclick="runReportItemAction(${item.id}, 'testing')">Mark Test Only</button>
+      <button class="btn sm sky" onclick="runReportItemAction(${item.id}, 'live-candidate')">Mark Live Candidate</button>
+    `
+  )).join('');
+  queues.innerHTML = `
+    <div style="margin-bottom:14px;padding:12px;border:1px solid var(--border);border-radius:10px;background:rgba(16,185,129,0.06)">
+      <div style="font-size:12px;color:var(--text2);margin-bottom:6px">Summary</div>
+      <div style="font-size:13px;line-height:1.6">${esc(report.summary || 'No summary available.')}</div>
+      <div style="font-size:12px;color:var(--text2);margin-top:8px">Confidence: ${esc(report.confidence || 'unknown')} · Model: ${esc(report.model || 'unknown')}</div>
+    </div>
+    <div style="margin-bottom:14px;padding:12px;border:1px solid var(--border);border-radius:10px;">
+      <div style="font-size:12px;color:var(--text2);margin-bottom:8px">Working</div>
+      <ul style="margin:0;padding:0">${working || '<li style="margin:0 0 6px 18px">No working items recorded.</li>'}</ul>
+    </div>
+    <div style="margin-bottom:14px">
+      <div style="font-size:12px;color:var(--text2);margin-bottom:8px">Not Working</div>
+      ${notWorkingCards || '<div style="color:var(--text2);font-size:12px">No issues recorded.</div>'}
+    </div>
+    <div>
+      <div style="font-size:12px;color:var(--text2);margin-bottom:8px">Top 5 Improvements</div>
+      ${improvementCards || '<div style="color:var(--text2);font-size:12px">No improvement items recorded.</div>'}
+    </div>
+  `;
+}
+
+async function runReportItemAction(itemId, action) {
+  try {
+    const r = await fetch(API + `/api/reports/items/${itemId}/${action}`, { method: 'POST' });
+    const data = await r.json();
+    if (!r.ok || !data.ok) {
+      throw new Error(data.detail || data.error || 'Request failed');
+    }
+    if (action === 'diagnose' && data.path) {
+      toast(`Diagnosis saved: ${data.path}`, 10000);
+    } else if (data.path) {
+      toast(`Saved: ${data.path}`, 8000);
+    } else {
+      toast('Report item updated', 6000);
+    }
+    loadDailyReport();
+  } catch(e) {
+    toast('Report item action failed: ' + e.message, true);
+  }
 }
 
 // ── Copy Trader ─────────────────────────────────────────────────────────────
@@ -1092,20 +1620,48 @@ function walletScoreCard(w, showRemove) {
 
 async function loadCopyScores() {
   try {
-    const [monR, wlR] = await Promise.all([
+    const [monR, wlR, settingsR] = await Promise.all([
       fetch(API + '/api/copy/monitor'),
       fetch(API + '/api/copy/watchlist'),
+      fetch(API + '/api/copy/settings'),
     ]);
     const mon = await monR.json();
     const watchlist = await wlR.json();
+    const settings = await settingsR.json();
 
     const lastPoll = mon.last_poll ? fmt(mon.last_poll) : 'never';
+    if (getEl('copyCapEnabled')) getEl('copyCapEnabled').checked = !!settings.cap_enabled;
+    if (getEl('copyPerWalletCap')) getEl('copyPerWalletCap').value = settings.per_wallet_cap ?? 3;
+    if (getEl('copyTotalCap')) getEl('copyTotalCap').value = settings.total_open_cap ?? 25;
+    persistUiPrefs();
     document.getElementById('copyInfo').textContent =
-      `Monitor: ${mon.running ? '● live' : '○ stopped'} · last poll ${lastPoll} · ${mon.polls_run||0} polls · ${mon.new_trades_found||0} auto-opened`;
+      `Monitor: ${mon.running ? '● live' : '○ stopped'} · last poll ${lastPoll} · ${mon.polls_run||0} polls · ${mon.new_trades_found||0} auto-opened · caps ${settings.cap_enabled ? `on (${settings.per_wallet_cap}/wallet, ${settings.total_open_cap} total)` : 'off'}`;
 
     const scoresEl = document.getElementById('copyScores');
     scoresEl.innerHTML = watchlist.map(w => walletScoreCard(w, true)).join('');
   } catch(e) { console.error('loadCopyScores:', e); }
+}
+
+async function saveCopySettings() {
+  try {
+    const enabled = !!getEl('copyCapEnabled')?.checked;
+    const perWallet = Math.max(1, Number(getEl('copyPerWalletCap')?.value || 3));
+    const totalCap = Math.max(1, Number(getEl('copyTotalCap')?.value || 25));
+    const params = new URLSearchParams({
+      cap_enabled: String(enabled),
+      per_wallet_cap: String(perWallet),
+      total_open_cap: String(totalCap),
+    });
+    const r = await fetch(API + '/api/copy/settings?' + params.toString(), { method: 'POST' });
+    const data = await r.json();
+    if (!r.ok || !data.ok) {
+      throw new Error(data.detail || data.error || 'Failed to save settings');
+    }
+    toast(`Copy trade caps ${enabled ? 'enabled' : 'disabled'}`, 5000);
+    loadCopyScores();
+  } catch(e) {
+    toast('Copy settings error: ' + e.message, true);
+  }
 }
 
 async function scoreWallet() {
@@ -1292,7 +1848,40 @@ async function dismissCandidate(id, btn) {
   } catch(e) { toast('Error: ' + e, true); btn.disabled = false; }
 }
 
+async function loadCopyLatest() {
+  const latestEl = getEl('copyLatest');
+  if (!latestEl) return;
+  try {
+    const r = await fetch(API + '/api/copy/latest');
+    if (!r.ok) throw new Error('Failed to load mirrors');
+    const payload = await r.json();
+    const trades = payload.trades || [];
+    if (!trades.length) {
+      latestEl.textContent = 'No mirrored trades yet.';
+      return;
+    }
+    latestEl.innerHTML = trades.map(t => {
+      const label = t.copy_label || (t.copy_wallet ? `${t.copy_wallet.slice(0,8)}...` : 'Wallet');
+      const outcome = t.copy_outcome ? `· ${esc(t.copy_outcome)}` : '';
+      const size = t.size_usd ? `$${Number(t.size_usd).toFixed(0)}` : '-';
+      return `<div style="border:1px solid var(--border);border-radius:8px;padding:6px 10px;background:var(--surface2);font-size:12px;min-width:180px">
+        <div style="font-weight:600">${esc(label)}</div>
+        <div style="color:var(--text2);font-size:11px">Trade #${t.id} · ${fmt(t.opened_at)} ${outcome}</div>
+        <div style="color:var(--text2);font-size:11px">size ${size}</div>
+      </div>`;
+    }).join('');
+  } catch(e) {
+    latestEl.textContent = 'Latest mirrors unavailable';
+    console.error('loadCopyLatest error', e);
+  }
+}
+
 async function loadCopy() {
+  const latestEl = getEl('copyLatest');
+  if (latestEl) {
+    latestEl.textContent = 'Checking latest mirrored trades…';
+  }
+  loadCopyLatest();
   document.getElementById('copyInfo').textContent = 'Fetching wallet positions...';
   loadCopyScores();
   try {
@@ -1340,8 +1929,10 @@ async function loadCopy() {
     }).join('');
 
     document.getElementById('cntCopy').textContent = totalPositions;
+    const existingText = document.getElementById('copyInfo').textContent;
+    const monitorPart = existingText.split(' · ')[0] || 'Monitor: ○ stopped';
     document.getElementById('copyInfo').textContent =
-      `${wallets.length} wallets · ${totalPositions} open positions · updated ${new Date().toLocaleTimeString('en-GB')}`;
+      `${monitorPart} · ${wallets.length} wallets · ${totalPositions} positions · updated ${new Date().toLocaleTimeString('en-GB')}`;
   } catch(e) { console.error('loadCopy error:', e); document.getElementById('copyInfo').textContent = 'Error loading wallets'; }
 }
 
@@ -1356,18 +1947,32 @@ async function mirrorTrade(wallet, conditionId, btn) {
       toast(`Mirror trade #${data.trade_id}: ${data.outcome} on ${(data.market||'').slice(0,40)}`);
       loadTrades(); loadStats();
     } else {
-      toast(data.error || 'Mirror failed', true);
-      btn.disabled = false; btn.textContent = 'Mirror $20';
+      // Handle specific error cases
+      if (data.error && data.error.includes('Already have an open copy trade')) {
+        btn.textContent = '✓ Already Mirrored';
+        btn.style.background = 'var(--teal)'; btn.style.color = '#000';
+        toast('Position already mirrored', true);
+      } else {
+        toast(data.error || 'Mirror failed', true);
+        btn.disabled = false; btn.textContent = 'Mirror $20';
+      }
     }
-  } catch(e) { toast('Error: ' + e, true); btn.disabled = false; btn.textContent = 'Mirror $20'; }
+  } catch(e) { 
+    toast('Error: ' + e, true); 
+    btn.disabled = false; 
+    btn.textContent = 'Mirror $20'; 
+  }
 }
 
 // ── Init ───────────────────────────────────────────────────────────────────
 
+loadUiPrefs();
 loadStats();
 loadSignals();
+checkWhaleAlerts();
 setInterval(loadStats, 60000);
 setInterval(loadTrades, 60000);
+setInterval(checkWhaleAlerts, 60000);
 setInterval(() => { if (document.querySelector('.tab[data-tab="copy"]')?.classList.contains('active')) loadCopy(); }, 120000);
 </script>
 </body>

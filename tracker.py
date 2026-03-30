@@ -6,6 +6,7 @@ import api
 import db
 
 log = logging.getLogger("scanner.tracker")
+WEATHER_STOP_LOSS_PCT = 0.20
 
 
 def refresh_open_trades():
@@ -26,7 +27,7 @@ def refresh_open_trades():
         trade_id   = trade["id"]
         trade_type = trade.get("trade_type") or "pairs"
 
-        if trade_type == "weather":
+        if trade_type in {"weather", "copy", "whale"}:
             updates += _refresh_weather_trade(trade)
         else:
             updates += _refresh_pairs_trade(trade)
@@ -36,7 +37,7 @@ def refresh_open_trades():
 
 
 def _refresh_weather_trade(trade):
-    """Refresh a single-leg weather trade. Returns list of 0 or 1 update dicts."""
+    """Refresh a single-leg trade. Used for weather, copy, and whale positions."""
     trade_id = trade["id"]
     token_a  = trade.get("token_id_a")
     if not token_a:
@@ -65,7 +66,7 @@ def _refresh_weather_trade(trade):
 
     return [{
         "trade_id":        trade_id,
-        "trade_type":      "weather",
+        "trade_type":      trade.get("trade_type") or "weather",
         "action":          trade.get("side_a", ""),
         "event":           trade.get("event", ""),
         "entry_price_a":   entry,
@@ -75,17 +76,35 @@ def _refresh_weather_trade(trade):
 
 
 def _pairs_pnl(entry_a, exit_a, entry_b, exit_b, side_a, size_usd):
-    """Arithmetic spread P&L — matches db.close_trade exactly.
+    """Shares-based P&L for a two-leg pairs trade.
 
-    Treats size_usd as a spread-unit multiplier: P&L = spread_change * size_usd.
-    Consistent for both unrealized and realized tracking.
+    size_usd is split equally (size/2 per leg). Each leg's dollar P&L is:
+        shares = (size/2) / entry_price
+        pnl    = shares × price_change_in_our_favour
+
+    This correctly handles cheap tokens (e.g. 4¢ entry → 250 shares × price move)
+    vs expensive ones (e.g. 90¢ entry → 5.5 shares × price move). The old
+    arithmetic formula (price_diff × size_usd) under/over-stated P&L by up to
+    10× when the two legs had very different entry prices.
     """
+    if entry_a <= 0 or entry_b <= 0:
+        return {"pnl_usd": 0.0, "pnl_pct": 0.0}
+
+    half = size_usd / 2
+    shares_a = half / entry_a
+    shares_b = half / entry_b
+
     if side_a == "BUY":
-        pnl_pct = (exit_a - entry_a) + (entry_b - exit_b)
+        pnl_a = shares_a * (exit_a - entry_a)   # long A: profit when A rises
+        pnl_b = shares_b * (entry_b - exit_b)   # short B: profit when B falls
     else:
-        pnl_pct = (entry_a - exit_a) + (exit_b - entry_b)
-    pnl_usd = pnl_pct * size_usd
-    return {"pnl_usd": round(pnl_usd, 2), "pnl_pct": round(pnl_pct * 100, 2)}
+        pnl_a = shares_a * (entry_a - exit_a)   # short A: profit when A falls
+        pnl_b = shares_b * (exit_b - entry_b)   # long B: profit when B rises
+
+    pnl_usd = pnl_a + pnl_b
+    pnl_pct  = pnl_usd / size_usd * 100 if size_usd > 0 else 0
+
+    return {"pnl_usd": round(pnl_usd, 2), "pnl_pct": round(pnl_pct, 2)}
 
 
 def _refresh_pairs_trade(trade):
@@ -168,6 +187,8 @@ def auto_close_trades(z_threshold=0.5):
         trade_type = trade.get("trade_type") or "pairs"
         if trade_type == "weather":
             result = _auto_close_weather(trade)
+        elif trade_type in {"copy", "whale"}:
+            result = None
         else:
             result = _auto_close_pairs(trade, z_threshold)
         if result:
@@ -193,6 +214,23 @@ def _auto_close_weather(trade):
         return None
 
     if current_a <= 0:
+        return None
+
+    entry_price = trade.get("entry_price_a") or 0
+    stop_loss_floor = entry_price * (1 - WEATHER_STOP_LOSS_PCT) if entry_price > 0 else 0
+    if entry_price > 0 and current_a <= stop_loss_floor:
+        reason = f"stop-loss hit ({current_a:.3f} <= {stop_loss_floor:.3f})"
+        pnl_usd = db.close_trade(trade_id, current_a, notes=f"Auto-closed: {reason}")
+        if pnl_usd is not None:
+            log.info("AUTO-CLOSE weather: trade=%d %s pnl=$%.2f event=%s",
+                     trade_id, reason, pnl_usd, trade.get("event", "?")[:40])
+            return {
+                "trade_id": trade_id,
+                "trade_type": "weather",
+                "exit_price_a": current_a,
+                "pnl_usd": round(pnl_usd, 2),
+                "reason": reason,
+            }
         return None
 
     price_resolved = current_a >= 0.99 or current_a <= 0.01

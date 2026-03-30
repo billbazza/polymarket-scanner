@@ -64,7 +64,7 @@ LEVELS = {
         "description": "Auto paper-trade A+ signals",
         "can_trade": True,
         "size_usd": 20,
-        "max_open": 100,
+        "max_open": 25,
         "graduation": {
             "min_trades": 50,
             "min_win_rate": 55.0,
@@ -203,6 +203,7 @@ def run_cycle(state):
 
     # Step 1: Scan for new signals (use fast async scanner, ~5x faster)
     log.info("Step 1: Scanning for signals (fast mode)...")
+    scan_started = time.time()
     try:
         scan_result = asyncio.run(async_scanner.scan(
             z_threshold=1.5,
@@ -229,10 +230,11 @@ def run_cycle(state):
             return state
 
     opportunities = scan_result["opportunities"]
+    scan_duration = round(time.time() - scan_started, 1)
 
     # Save scan run
     db.save_scan_run(pairs_tested=scan_result["pairs_tested"], cointegrated=scan_result["pairs_cointegrated"],
-                     opportunities=len(opportunities), duration=0)
+                     opportunities=len(opportunities), duration=scan_duration)
 
     # Save all signals
     new_signal_ids = []
@@ -389,7 +391,9 @@ def run_cycle(state):
         # Determine size for this trade
         if level == "book":
             ev = opp.get("ev", {})
-            sizing = math_engine.position_size(bankroll, ev) if ev else None
+            # correlated_legs=True: pairs trades expose both legs to the same event;
+            # Kelly assumes independent bets, so halve fraction to compensate.
+            sizing = math_engine.position_size(bankroll, ev, correlated_legs=True) if ev else None
             trade_size = sizing["recommended_size"] if sizing else 50
             trade_size = max(5, min(trade_size, bankroll * 0.25))
         else:
@@ -397,6 +401,26 @@ def run_cycle(state):
 
         # Execute
         mode = "paper" if level in ("paper", "scout") else "live"
+
+        # Step 4.5: Brain validation (if available)
+        # Ask Claude + Perplexity if this signal makes sense in the real world
+        try:
+            import brain
+            should_trade, brain_reasoning = brain.validate_signal(opp)
+            if not should_trade:
+                log.info("  Brain REJECTED trade: %s", brain_reasoning)
+                journal({
+                    "action": "brain_reject",
+                    "level": level,
+                    "event": event_name[:60],
+                    "reason": brain_reasoning,
+                })
+                continue
+            log.info("  Brain VALIDATED trade: %s", brain_reasoning)
+            opp["brain_reasoning"] = brain_reasoning
+        except Exception as e:
+            log.warning("  Brain validation failed (defaulting to math-only): %s", e)
+
         log.info("  Opening %s trade: %s | $%.2f", mode, event_name[:40], trade_size)
 
         try:
@@ -471,9 +495,65 @@ def run_cycle(state):
         except Exception as e:
             log.debug("Weather scan skipped: %s", e)
 
-    # Step 4c: Auto-mirror copy trader positions
+    # Step 4c: Longshot bias scanner (scan for NO maker opportunities on 3–15¢ markets)
+    try:
+        import longshot_scanner
+        import db as _db
+        longshot_opps, ls_stats = longshot_scanner.scan(verbose=False)
+        tradeable_longshots = [o for o in longshot_opps if o.get("tradeable")]
+        for opp in tradeable_longshots:
+            try:
+                _db.save_longshot_signal(opp)
+            except Exception:
+                pass
+        if tradeable_longshots:
+            log.info("Step 4c: Longshot scan — %d tradeable (of %d) | top EV=%.2f%%",
+                     len(tradeable_longshots), len(longshot_opps),
+                     tradeable_longshots[0].get("ev_pct", 0))
+            journal({
+                "action": "longshot_scan",
+                "level": level,
+                "tradeable": len(tradeable_longshots),
+                "total": len(longshot_opps),
+                "top_ev_pct": tradeable_longshots[0].get("ev_pct", 0) if tradeable_longshots else 0,
+            })
+        else:
+            log.debug("Step 4c: Longshot scan — %d candidates, none tradeable", len(longshot_opps))
+    except Exception as e:
+        log.debug("Longshot scan step skipped: %s", e)
+
+    # Step 4d: Near-certainty scanner (85–99¢ YES markets with calibration edge)
+    try:
+        import near_certainty_scanner
+        nc_opps, nc_stats = near_certainty_scanner.scan(use_brain=False, verbose=False)
+        tradeable_nc = [o for o in nc_opps if o.get("tradeable")]
+        for opp in tradeable_nc:
+            try:
+                db.save_near_certainty_signal(opp)
+            except Exception:
+                pass
+        if tradeable_nc:
+            log.info("Step 4d: Near-certainty — %d tradeable (of %d) | top EV=%.2f%%",
+                     len(tradeable_nc), len(nc_opps),
+                     tradeable_nc[0].get("ev_pct", 0))
+            journal({
+                "action": "near_certainty_scan",
+                "level": level,
+                "tradeable": len(tradeable_nc),
+                "total": len(nc_opps),
+                "top_ev_pct": tradeable_nc[0].get("ev_pct", 0) if tradeable_nc else 0,
+            })
+        else:
+            log.debug("Step 4d: Near-certainty — %d candidates, none tradeable", len(nc_opps))
+    except Exception as e:
+        log.debug("Near-certainty scan step skipped: %s", e)
+
+    # Step 4e: Auto-mirror copy trader positions
     try:
         import copy_scanner
+        copy_trade_settings = db.get_copy_trade_settings()
+        max_copy_wallet_open = copy_trade_settings["per_wallet_cap"] if copy_trade_settings["cap_enabled"] else None
+        max_copy_total_open = copy_trade_settings["total_open_cap"] if copy_trade_settings["cap_enabled"] else None
         copy_opened = 0
         copy_closed = 0
 
@@ -493,15 +573,43 @@ def run_cycle(state):
                 log.warning("Copy: failed to fetch positions for %s: %s", label, e)
                 continue
 
+            # Forward-only: on first scan after adding a wallet, snapshot all
+            # existing positions as baseline and skip them. Only mirror NEW
+            # positions that appear in subsequent cycles.
+            baseline = db.get_wallet_baseline(address)
+            if baseline is None:
+                # First scan — record current positions as baseline, don't mirror
+                baseline_ids = [p.get("conditionId", "") for p in positions if p.get("conditionId")]
+                db.set_wallet_baseline(address, baseline_ids)
+                log.info("Step 4e: Baseline set for %s — %d existing positions (skipped)",
+                         label, len(baseline_ids))
+                # Still track live IDs for close detection on OTHER wallets
+                for pos in positions:
+                    cid = pos.get("conditionId", "")
+                    if cid:
+                        live_condition_ids.add(cid)
+                continue
+
             for pos in positions:
                 cid = pos.get("conditionId", "")
                 if not cid:
                     continue
                 live_condition_ids.add(cid)
 
+                # Skip positions that existed before we started watching
+                if cid in baseline:
+                    continue
+
                 # New position — not yet mirrored
                 if cid not in open_copy:
-                    t_id = db.open_copy_trade(address, label, pos, size_usd=20)
+                    t_id = db.open_copy_trade(
+                        address,
+                        label,
+                        pos,
+                        size_usd=20,
+                        max_wallet_open=max_copy_wallet_open,
+                        max_total_open=max_copy_total_open,
+                    )
                     if t_id:
                         copy_opened += 1
                         journal({
@@ -514,7 +622,7 @@ def run_cycle(state):
                             "size_usd": 20,
                             "reason": f"Copy {label} — {pos.get('outcome','')} @{pos.get('curPrice',0):.3f}",
                         })
-                        log.info("Step 4c: Mirrored %s — %s %s @%.3f",
+                        log.info("Step 4e: Mirrored %s — %s %s @%.3f",
                                  label, pos.get("outcome"), pos.get("title","")[:40], pos.get("curPrice", 0))
 
         # Watched wallet has exited a position — close our mirror
@@ -531,30 +639,57 @@ def run_cycle(state):
                     "pnl": pnl,
                     "reason": f"Watched wallet {trade.get('copy_label','')} exited position",
                 })
-                log.info("Step 4c: Auto-closed copy trade %d (wallet exited) pnl=$%.2f",
+                log.info("Step 4e: Auto-closed copy trade %d (wallet exited) pnl=$%.2f",
                          trade["id"], pnl or 0)
 
         if copy_opened or copy_closed:
-            log.info("Step 4c: Copy trader — %d opened, %d closed", copy_opened, copy_closed)
+            log.info("Step 4e: Copy trader — %d opened, %d closed", copy_opened, copy_closed)
     except Exception as e:
         log.debug("Copy trader step skipped: %s", e)
 
-    # Step 4d: Wallet discovery (every 6 hours)
+    # Step 4f: Wallet discovery (every 6 hours)
     try:
         import wallet_discovery
         last_discovery = state.get("last_discovery", 0)
         if time.time() - last_discovery > 6 * 3600:
-            log.info("Step 4d: Running wallet discovery...")
+            log.info("Step 4f: Running wallet discovery...")
             result = wallet_discovery.run_discovery(auto_add=True, verbose=False)
             state["last_discovery"] = time.time()
-            log.info("Step 4d: Discovery — %d candidates, %d auto-added",
+            log.info("Step 4f: Discovery — %d candidates, %d auto-added",
                      result.get("candidates_pending", 0), result.get("auto_added", 0))
         else:
             hrs = (time.time() - last_discovery) / 3600
-            log.info("Step 4d: Discovery skipped (ran %.1fh ago, next in %.1fh)",
+            log.info("Step 4f: Discovery skipped (ran %.1fh ago, next in %.1fh)",
                      hrs, 6 - hrs)
     except Exception as e:
         log.debug("Wallet discovery step skipped: %s", e)
+
+    # Step 4g: Whale / insider detection
+    try:
+        import whale_detector
+        whale_alerts, whale_stats = whale_detector.scan(min_score=60, verbose=False)
+        new_whale_ids = []
+        for alert in whale_alerts:
+            try:
+                row_id = db.save_whale_alert(alert)
+                if row_id:
+                    new_whale_ids.append(row_id)
+            except Exception:
+                pass
+        if new_whale_ids:
+            log.info("Step 4g: Whale scan — %d alerts (%d new) from %d markets",
+                     len(whale_alerts), len(new_whale_ids), whale_stats["markets_checked"])
+            journal({
+                "action": "whale_scan",
+                "level": level,
+                "alerts": len(whale_alerts),
+                "new_saved": len(new_whale_ids),
+                "markets_checked": whale_stats["markets_checked"],
+            })
+        else:
+            log.debug("Step 4g: Whale scan — %d alerts, none new", len(whale_alerts))
+    except Exception as e:
+        log.debug("Whale scan step skipped: %s", e)
 
     # Step 5: Check graduation eligibility
     perf = get_performance(state)
