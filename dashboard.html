@@ -1193,10 +1193,10 @@ async function loadWeather() {
         ? `<span class="badge ${row.action==='BUY_YES'?'yes':'no'}">${row.action}</span>`
         : '-';
       let tradeBtn;
-      if (row.open_trade_id) {
-        tradeBtn = '<span style="color:var(--green);font-size:11px;font-weight:600">● open</span>';
-      } else if (row.status === 'traded') {
-        tradeBtn = '<span style="color:var(--text2);font-size:11px">closed</span>';
+      if (row.has_open_trade && row.open_trade_id) {
+        tradeBtn = `<span style="color:var(--green);font-size:11px;font-weight:600" title="${esc(row.status_detail || '')}">● open</span>`;
+      } else if (row.status === 'closed') {
+        tradeBtn = `<span style="color:var(--text2);font-size:11px" title="${esc(row.status_detail || '')}">closed</span>`;
       } else if (row.can_open_trade) {
         tradeBtn = `<button class="btn sm sky" onclick="openWeatherTrade(${row.id}, this)" style="margin-left:6px">Trade</button>`;
       } else if (row.tradeable && row.blocking_reason) {

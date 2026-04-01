@@ -2161,6 +2161,30 @@ def inspect_weather_trade_open(weather_signal_id, size_usd=100, max_total_open=N
                 **_paper_position_policy_dict(),
             }
 
+        latest_signal_trade = conn.execute(
+            """
+            SELECT id, status, closed_at, exit_reason
+            FROM trades
+            WHERE weather_signal_id=?
+            ORDER BY opened_at DESC, id DESC
+            LIMIT 1
+            """,
+            (weather_signal_id,),
+        ).fetchone()
+        if latest_signal_trade and latest_signal_trade["status"] == "closed":
+            trade_id = int(latest_signal_trade["id"])
+            detail = latest_signal_trade["exit_reason"] or "Weather signal already completed."
+            return {
+                "ok": False,
+                "reason_code": "signal_already_closed",
+                "reason": f"Weather signal {weather_signal_id} already completed as trade #{trade_id}.",
+                "existing_trade_id": trade_id,
+                "latest_trade_status": "closed",
+                "latest_trade_exit_reason": detail,
+                "entry_token": entry_token,
+                **_paper_position_policy_dict(),
+            }
+
         existing_token_trade = None
         if entry_token:
             existing_token_trade = conn.execute(
@@ -2408,6 +2432,11 @@ def close_trade(trade_id, exit_price_a, exit_price_b=None, notes=""):
             pnl=?, status='closed', notes=?, exit_reason=?, closed_z_score=?
         WHERE id=?
     """, (time.time(), exit_price_a, exit_b, pnl_usd, notes, exit_reason, closed_z_score, trade_id))
+    if trade_type == "weather" and trade["weather_signal_id"]:
+        conn.execute(
+            "UPDATE weather_signals SET status='closed' WHERE id=?",
+            (trade["weather_signal_id"],),
+        )
     conn.commit()
     conn.close()
 
@@ -2614,9 +2643,8 @@ def get_weather_signals(limit=50, tradeable_only=False):
     """Fetch recent weather-edge opportunities, annotated with open trade id if one exists."""
     limit = _normalize_query_limit(limit, "get_weather_signals")
     base = """
-        SELECT ws.*, t.id AS exact_open_trade_id
+        SELECT ws.*
         FROM weather_signals ws
-        LEFT JOIN trades t ON t.weather_signal_id = ws.id AND t.status = 'open'
     """
     conn = get_conn()
     if tradeable_only and limit is None:
@@ -2639,13 +2667,58 @@ def get_weather_signals(limit=50, tradeable_only=False):
     try:
         for row in rows:
             item = dict(row)
+            latest_trade = conn.execute(
+                """
+                SELECT id, status, closed_at, exit_reason
+                FROM trades
+                WHERE weather_signal_id=?
+                ORDER BY opened_at DESC, id DESC
+                LIMIT 1
+                """,
+                (item["id"],),
+            ).fetchone()
+            exact_open_trade = conn.execute(
+                """
+                SELECT id
+                FROM trades
+                WHERE weather_signal_id=? AND status='open'
+                ORDER BY opened_at DESC, id DESC
+                LIMIT 1
+                """,
+                (item["id"],),
+            ).fetchone()
             decision = inspect_weather_trade_open(item["id"], size_usd=20, conn=conn)
-            item["open_trade_id"] = decision.get("existing_trade_id") or item.get("exact_open_trade_id")
+            exact_open_trade_id = int(exact_open_trade["id"]) if exact_open_trade else None
+            latest_trade_id = int(latest_trade["id"]) if latest_trade else None
+            latest_trade_status = latest_trade["status"] if latest_trade else None
+            item["open_trade_id"] = exact_open_trade_id
+            item["has_open_trade"] = exact_open_trade_id is not None
+            item["blocked_by_trade_id"] = (
+                decision.get("existing_trade_id")
+                if not decision["ok"] and decision.get("reason_code") in {"signal_already_open", "token_already_open"}
+                and decision.get("existing_trade_id") != exact_open_trade_id
+                else None
+            )
+            item["latest_trade_id"] = latest_trade_id
+            item["latest_trade_status"] = latest_trade_status
+            item["latest_trade_exit_reason"] = latest_trade["exit_reason"] if latest_trade else None
+            item["latest_trade_closed_at"] = latest_trade["closed_at"] if latest_trade else None
             item["can_open_trade"] = bool(item.get("tradeable")) and decision["ok"]
             item["blocking_reason"] = None if decision["ok"] else decision.get("reason")
             item["blocking_reason_code"] = None if decision["ok"] else decision.get("reason_code")
             item["entry_token"] = decision.get("entry_token")
-            item.pop("exact_open_trade_id", None)
+            if exact_open_trade_id is not None:
+                item["status"] = "open"
+                item["status_detail"] = f"Open as trade #{exact_open_trade_id}."
+            elif latest_trade_status == "closed":
+                item["status"] = "closed"
+                item["status_detail"] = latest_trade["exit_reason"] or f"Closed as trade #{latest_trade_id}."
+            elif item.get("blocking_reason"):
+                item["status"] = "blocked"
+                item["status_detail"] = item["blocking_reason"]
+            else:
+                item["status"] = item.get("status") or "new"
+                item["status_detail"] = None
             results.append(item)
     finally:
         conn.close()
