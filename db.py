@@ -21,6 +21,16 @@ RECONCILIATION_INTERNAL = "internal_simulation"
 RECONCILIATION_WALLET = "wallet_position"
 RECONCILIATION_ORDERS = "exchange_orders"
 
+_WATCHED_WALLET_MONITOR_COLUMNS = [
+    ("baseline_positions", "TEXT"),
+    ("last_checked_at", "REAL"),
+    ("last_positions_count", "INTEGER"),
+    ("last_event_at", "REAL"),
+    ("last_event_type", "TEXT"),
+    ("last_event_status", "TEXT"),
+    ("last_event_reason", "TEXT"),
+]
+
 
 def _connect():
     conn = sqlite3.connect(str(DB_PATH))
@@ -37,6 +47,13 @@ def _table_columns(conn, table_name):
 def _add_column_if_missing(conn, table_name, column_name, column_type):
     if column_name not in _table_columns(conn, table_name):
         conn.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_type}")
+
+
+def _ensure_columns_if_table_exists(conn, table_name, columns):
+    if not _table_exists(conn, table_name):
+        return
+    for column_name, column_type in columns:
+        _add_column_if_missing(conn, table_name, column_name, column_type)
 
 
 def _table_exists(conn, table_name):
@@ -422,16 +439,7 @@ def _migration_002_backfill_columns(conn):
     ]:
         _add_column_if_missing(conn, "trades", col, coltype)
 
-    for col, coltype in [
-        ("baseline_positions", "TEXT"),
-        ("last_checked_at", "REAL"),
-        ("last_positions_count", "INTEGER"),
-        ("last_event_at", "REAL"),
-        ("last_event_type", "TEXT"),
-        ("last_event_status", "TEXT"),
-        ("last_event_reason", "TEXT"),
-    ]:
-        _add_column_if_missing(conn, "watched_wallets", col, coltype)
+    _ensure_columns_if_table_exists(conn, "watched_wallets", _WATCHED_WALLET_MONITOR_COLUMNS)
 
     for col, coltype in [("analysis", "TEXT")]:
         _add_column_if_missing(conn, "whale_alerts", col, coltype)
@@ -777,6 +785,17 @@ def get_conn():
     return _connect()
 
 
+def _repair_schema_gaps(conn):
+    """Heal forward-compatible columns even if prior migrations were marked applied.
+
+    Older local DBs can already have `schema_migrations` rows recorded while still
+    missing watched-wallet monitoring columns added later in development. Run a
+    lightweight repair pass on every startup so operator-facing copy-trader tabs
+    work without manual SQLite intervention.
+    """
+    _ensure_columns_if_table_exists(conn, "watched_wallets", _WATCHED_WALLET_MONITOR_COLUMNS)
+
+
 def init_db():
     """Create or migrate the database schema."""
     global _DB_INITIALIZED
@@ -807,6 +826,7 @@ def init_db():
                     "INSERT INTO schema_migrations (name, applied_at) VALUES (?, ?)",
                     (name, time.time()),
                 )
+            _repair_schema_gaps(conn)
             conn.commit()
             _DB_INITIALIZED = True
         finally:

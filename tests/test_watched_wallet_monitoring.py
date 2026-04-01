@@ -1,5 +1,6 @@
 import importlib
 import os
+import sqlite3
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -146,6 +147,84 @@ class WatchedWalletMonitoringTests(unittest.TestCase):
         self.assertTrue(payload["available"])
         self.assertEqual(payload["events"][0]["status"], "blocked")
         self.assertEqual(payload["summary"]["status_counts"]["blocked"], 1)
+
+    def test_init_db_repairs_missing_watched_wallet_monitor_columns_when_backfill_marked_applied(self):
+        current_db_path = os.environ["SCANNER_DB_PATH"]
+        legacy_db_path = os.path.join(self.tmpdir.name, "legacy-scanner.db")
+        os.environ["SCANNER_DB_PATH"] = legacy_db_path
+
+        import db
+        legacy_db = importlib.reload(db)
+
+        conn = sqlite3.connect(legacy_db_path)
+        conn.executescript(
+            """
+            CREATE TABLE schema_migrations (
+                name TEXT PRIMARY KEY,
+                applied_at REAL NOT NULL
+            );
+
+            CREATE TABLE watched_wallets (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                address TEXT NOT NULL UNIQUE,
+                label TEXT NOT NULL,
+                added_at REAL NOT NULL,
+                added_by TEXT DEFAULT 'manual',
+                active INTEGER DEFAULT 1,
+                score REAL,
+                classification TEXT,
+                will_copy INTEGER DEFAULT 0,
+                score_breakdown TEXT,
+                scored_at REAL,
+                ai_verdict TEXT,
+                ai_reasoning TEXT,
+                ai_risk_flags TEXT,
+                ai_validated_at REAL,
+                auto_drop_reason TEXT
+            );
+            """
+        )
+        conn.executemany(
+            "INSERT INTO schema_migrations (name, applied_at) VALUES (?, ?)",
+            [
+                ("001_base_schema", 1),
+                ("002_backfill_columns", 2),
+                ("003_scan_jobs", 3),
+                ("004_report_items", 4),
+                ("005_settings", 5),
+                ("006_paper_account", 6),
+                ("007_copy_no_entry_price_fix", 7),
+                ("008_cointegration_trial_fields", 8),
+                ("009_paper_trade_attempts", 9),
+                ("010_wallet_monitor_events", 10),
+                ("011_trade_monitor_events", 11),
+                ("012_trade_state_modes", 12),
+            ],
+        )
+        conn.commit()
+        conn.close()
+
+        legacy_db._DB_INITIALIZED = False
+        legacy_db.init_db()
+
+        try:
+            wallet_id = legacy_db.add_watched_wallet("0xrepair0000000000000000000000000000000001", "Repair Wallet")
+            self.assertIsNotNone(wallet_id)
+            legacy_db.update_watched_wallet_poll_status(
+                "0xrepair0000000000000000000000000000000001",
+                checked_at=123.45,
+                positions_count=2,
+            )
+
+            wallet = next(
+                w for w in legacy_db.get_watched_wallets(active_only=True)
+                if w["address"] == "0xrepair0000000000000000000000000000000001"
+            )
+            self.assertEqual(wallet["last_checked_at"], 123.45)
+            self.assertEqual(wallet["last_positions_count"], 2)
+        finally:
+            os.environ["SCANNER_DB_PATH"] = current_db_path
+            self.db = importlib.reload(db)
 
 
 if __name__ == "__main__":
