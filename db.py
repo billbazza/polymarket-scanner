@@ -54,10 +54,18 @@ def _migration_001_base_schema(conn):
             status TEXT DEFAULT 'new',
             grade_label TEXT,
             tradeable INTEGER DEFAULT 0,
+            paper_tradeable INTEGER DEFAULT 0,
             ev_json TEXT,
             sizing_json TEXT,
+            filters_json TEXT,
             token_id_a TEXT,
-            token_id_b TEXT
+            token_id_b TEXT,
+            admission_path TEXT,
+            experiment_name TEXT,
+            experiment_status TEXT,
+            experiment_reason_code TEXT,
+            experiment_reason TEXT,
+            experiment_guardrails_json TEXT
         );
 
         CREATE TABLE IF NOT EXISTS trades (
@@ -82,7 +90,28 @@ def _migration_001_base_schema(conn):
             copy_wallet TEXT,
             copy_label TEXT,
             copy_condition_id TEXT,
-            copy_outcome TEXT
+            copy_outcome TEXT,
+            strategy_name TEXT DEFAULT 'unknown',
+            entry_grade_label TEXT,
+            admission_path TEXT,
+            experiment_name TEXT,
+            experiment_status TEXT,
+            entry_z_score REAL,
+            entry_ev_pct REAL,
+            entry_half_life REAL,
+            entry_liquidity REAL,
+            entry_slippage_pct_a REAL,
+            entry_slippage_pct_b REAL,
+            reversion_exit_z REAL,
+            stop_z_threshold REAL,
+            max_hold_hours REAL,
+            closed_z_score REAL,
+            exit_reason TEXT,
+            max_unrealized_profit REAL DEFAULT 0,
+            max_unrealized_drawdown REAL DEFAULT 0,
+            regime_break_threshold REAL,
+            regime_break_flag INTEGER DEFAULT 0,
+            regime_break_notes TEXT
         );
 
         CREATE TABLE IF NOT EXISTS snapshots (
@@ -309,10 +338,18 @@ def _migration_002_backfill_columns(conn):
     for col, coltype in [
         ("grade_label", "TEXT"),
         ("tradeable", "INTEGER DEFAULT 0"),
+        ("paper_tradeable", "INTEGER DEFAULT 0"),
         ("ev_json", "TEXT"),
         ("sizing_json", "TEXT"),
+        ("filters_json", "TEXT"),
         ("token_id_a", "TEXT"),
         ("token_id_b", "TEXT"),
+        ("admission_path", "TEXT"),
+        ("experiment_name", "TEXT"),
+        ("experiment_status", "TEXT"),
+        ("experiment_reason_code", "TEXT"),
+        ("experiment_reason", "TEXT"),
+        ("experiment_guardrails_json", "TEXT"),
     ]:
         _add_column_if_missing(conn, "signals", col, coltype)
     for col, coltype in [
@@ -327,6 +364,27 @@ def _migration_002_backfill_columns(conn):
         ("whale_alert_id", "INTEGER"),
         ("event", "TEXT"),
         ("market_a", "TEXT"),
+        ("strategy_name", "TEXT DEFAULT 'unknown'"),
+        ("entry_grade_label", "TEXT"),
+        ("admission_path", "TEXT"),
+        ("experiment_name", "TEXT"),
+        ("experiment_status", "TEXT"),
+        ("entry_z_score", "REAL"),
+        ("entry_ev_pct", "REAL"),
+        ("entry_half_life", "REAL"),
+        ("entry_liquidity", "REAL"),
+        ("entry_slippage_pct_a", "REAL"),
+        ("entry_slippage_pct_b", "REAL"),
+        ("reversion_exit_z", "REAL"),
+        ("stop_z_threshold", "REAL"),
+        ("max_hold_hours", "REAL"),
+        ("closed_z_score", "REAL"),
+        ("exit_reason", "TEXT"),
+        ("max_unrealized_profit", "REAL DEFAULT 0"),
+        ("max_unrealized_drawdown", "REAL DEFAULT 0"),
+        ("regime_break_threshold", "REAL"),
+        ("regime_break_flag", "INTEGER DEFAULT 0"),
+        ("regime_break_notes", "TEXT"),
     ]:
         _add_column_if_missing(conn, "trades", col, coltype)
 
@@ -438,6 +496,10 @@ def _migration_007_copy_no_entry_price_fix(conn):
     )
 
 
+def _migration_008_cointegration_trial_fields(conn):
+    _migration_002_backfill_columns(conn)
+
+
 _MIGRATIONS = [
     ("001_base_schema", _migration_001_base_schema),
     ("002_backfill_columns", _migration_002_backfill_columns),
@@ -446,6 +508,7 @@ _MIGRATIONS = [
     ("005_settings", _migration_005_settings),
     ("006_paper_account", _migration_006_paper_account),
     ("007_copy_no_entry_price_fix", _migration_007_copy_no_entry_price_fix),
+    ("008_cointegration_trial_fields", _migration_008_cointegration_trial_fields),
 ]
 
 
@@ -499,17 +562,26 @@ def save_signal(opp):
         INSERT INTO signals (timestamp, event, market_a, market_b, price_a, price_b,
             z_score, coint_pvalue, beta, half_life, spread_mean, spread_std,
             current_spread, liquidity, volume_24h, action,
-            grade_label, tradeable, ev_json, sizing_json, token_id_a, token_id_b)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            grade_label, tradeable, paper_tradeable, ev_json, sizing_json, filters_json,
+            token_id_a, token_id_b, admission_path, experiment_name,
+            experiment_status, experiment_reason_code, experiment_reason,
+            experiment_guardrails_json)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (
         time.time(), opp["event"], opp["market_a"], opp["market_b"],
         opp["price_a"], opp["price_b"], opp["z_score"], opp["coint_pvalue"],
         opp["beta"], opp["half_life"], opp["spread_mean"], opp["spread_std"],
         opp["current_spread"], opp["liquidity"], opp["volume_24h"], opp["action"],
         opp.get("grade_label"), 1 if opp.get("tradeable") else 0,
+        1 if opp.get("paper_tradeable") else 0,
         json.dumps(opp.get("ev")) if opp.get("ev") else None,
         json.dumps(opp.get("sizing")) if opp.get("sizing") else None,
+        json.dumps(opp.get("filters")) if opp.get("filters") else None,
         opp.get("token_id_a"), opp.get("token_id_b"),
+        opp.get("admission_path"), opp.get("experiment_name"),
+        opp.get("experiment_status"), opp.get("experiment_reason_code"),
+        opp.get("experiment_reason"),
+        json.dumps(opp.get("experiment_guardrails")) if opp.get("experiment_guardrails") else None,
     ))
     signal_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
     conn.commit()
@@ -527,6 +599,11 @@ def get_signal_by_id(signal_id):
     d = dict(row)
     d["ev"]     = json.loads(d.pop("ev_json"))     if d.get("ev_json")     else None
     d["sizing"] = json.loads(d.pop("sizing_json")) if d.get("sizing_json") else None
+    d["filters"] = json.loads(d.pop("filters_json")) if d.get("filters_json") else None
+    d["experiment_guardrails"] = (
+        json.loads(d.pop("experiment_guardrails_json"))
+        if d.get("experiment_guardrails_json") else None
+    )
     return d
 
 
@@ -554,8 +631,18 @@ def get_signals(limit=50, status=None):
             d["sizing"] = json.loads(d["sizing_json"])
         else:
             d["sizing"] = None
+        if d.get("filters_json"):
+            d["filters"] = json.loads(d["filters_json"])
+        else:
+            d["filters"] = None
+        if d.get("experiment_guardrails_json"):
+            d["experiment_guardrails"] = json.loads(d["experiment_guardrails_json"])
+        else:
+            d["experiment_guardrails"] = None
         del d["ev_json"]
         del d["sizing_json"]
+        del d["filters_json"]
+        del d["experiment_guardrails_json"]
         results.append(d)
     return results
 
@@ -898,6 +985,9 @@ def inspect_pairs_trade_open(signal_id, size_usd=100, conn=None):
             "reason": "Ready to open paper pairs trade.",
             "signal": dict(sig),
             "requested_size_usd": round(float(size_usd), 2),
+            "admission_path": sig["admission_path"],
+            "experiment_name": sig["experiment_name"],
+            "experiment_status": sig["experiment_status"],
             **_paper_position_policy_dict(),
         }
     finally:
@@ -1010,7 +1100,7 @@ def inspect_copy_trade_open(
 
 # --- Trades ---
 
-def open_trade(signal_id, size_usd=100):
+def open_trade(signal_id, size_usd=100, metadata=None):
     """Open a paper trade from a signal.
 
     DB-level guard: returns None (no insert) if an open trade already exists
@@ -1030,13 +1120,39 @@ def open_trade(signal_id, size_usd=100):
     else:
         side_a, side_b = "SELL", "BUY"
 
+    metadata = metadata or {}
+    ev = metadata.get("ev") or {}
+    slippage = metadata.get("slippage") or {}
+    guardrails = metadata.get("guardrails") or {}
+
     conn.execute("""
         INSERT INTO trades (signal_id, opened_at, side_a, side_b,
-            entry_price_a, entry_price_b, size_usd, status)
-        VALUES (?, ?, ?, ?, ?, ?, ?, 'open')
+            entry_price_a, entry_price_b, size_usd, status, strategy_name,
+            entry_grade_label, admission_path, experiment_name, experiment_status,
+            entry_z_score, entry_ev_pct, entry_half_life, entry_liquidity,
+            entry_slippage_pct_a, entry_slippage_pct_b,
+            reversion_exit_z, stop_z_threshold, max_hold_hours,
+            regime_break_threshold, regime_break_flag)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (
         signal_id, time.time(), side_a, side_b,
-        sig["price_a"], sig["price_b"], size_usd,
+        sig["price_a"], sig["price_b"], size_usd, "open",
+        metadata.get("strategy_name", "cointegration"),
+        metadata.get("entry_grade_label") or sig["grade_label"],
+        metadata.get("admission_path") or sig["admission_path"],
+        metadata.get("experiment_name") or sig["experiment_name"],
+        metadata.get("experiment_status") or sig["experiment_status"],
+        metadata.get("entry_z_score", sig["z_score"]),
+        metadata.get("entry_ev_pct", ev.get("ev_pct")),
+        metadata.get("entry_half_life", sig["half_life"]),
+        metadata.get("entry_liquidity", sig["liquidity"]),
+        ((slippage.get("leg_a") or {}).get("slippage_pct")),
+        ((slippage.get("leg_b") or {}).get("slippage_pct")),
+        guardrails.get("reversion_exit_z"),
+        guardrails.get("stop_z_threshold"),
+        guardrails.get("max_hold_hours"),
+        guardrails.get("regime_break_threshold"),
+        0,
     ))
     trade_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
     conn.execute("UPDATE signals SET status=? WHERE id=?", ("traded", signal_id))
@@ -1314,11 +1430,22 @@ def close_trade(trade_id, exit_price_a, exit_price_b=None, notes=""):
         pnl_usd = valuation["pnl_usd"]
         exit_b = exit_price_b
 
+    exit_reason = notes
+    closed_z_score = None
+    if trade_type == "pairs":
+        signal = get_signal_by_id(trade["signal_id"]) if trade["signal_id"] else None
+        if signal:
+            beta = signal.get("beta", 1.0) or 1.0
+            spread = exit_price_a - beta * exit_b
+            spread_mean = signal.get("spread_mean", 0) or 0
+            spread_std = signal.get("spread_std", 1) or 1
+            closed_z_score = round((spread - spread_mean) / spread_std, 4) if spread_std > 0 else 0.0
+
     conn.execute("""
         UPDATE trades SET closed_at=?, exit_price_a=?, exit_price_b=?,
-            pnl=?, status='closed', notes=?
+            pnl=?, status='closed', notes=?, exit_reason=?, closed_z_score=?
         WHERE id=?
-    """, (time.time(), exit_price_a, exit_b, pnl_usd, notes, trade_id))
+    """, (time.time(), exit_price_a, exit_b, pnl_usd, notes, exit_reason, closed_z_score, trade_id))
     conn.commit()
     conn.close()
 
@@ -1338,7 +1465,13 @@ _TRADES_SELECT = """
         t.entry_price_a, t.entry_price_b, t.exit_price_a, t.exit_price_b,
         t.size_usd, t.pnl, t.status, t.notes, t.trade_type, t.weather_signal_id,
         t.token_id_a, t.token_id_b, t.copy_wallet, t.copy_label, t.copy_condition_id,
-        t.copy_outcome, t.whale_alert_id, ww.active AS copy_wallet_active,
+        t.copy_outcome, t.whale_alert_id, t.strategy_name, t.entry_grade_label,
+        t.admission_path, t.experiment_name, t.experiment_status, t.entry_z_score,
+        t.entry_ev_pct, t.entry_half_life, t.entry_liquidity, t.entry_slippage_pct_a,
+        t.entry_slippage_pct_b, t.reversion_exit_z, t.stop_z_threshold, t.max_hold_hours,
+        t.closed_z_score, t.exit_reason, t.max_unrealized_profit, t.max_unrealized_drawdown,
+        t.regime_break_threshold, t.regime_break_flag, t.regime_break_notes,
+        ww.active AS copy_wallet_active,
         ww.auto_drop_reason AS copy_wallet_reason,
         COALESCE(s.event, ws.event, t.copy_label, t.event) AS event,
         COALESCE(s.market_a, ws.market, t.copy_outcome, t.market_a) AS market_a,
@@ -1408,6 +1541,65 @@ def get_snapshots(trade_id, limit=500):
     ).fetchall()
     conn.close()
     return [dict(r) for r in rows]
+
+
+def update_pairs_trade_metrics(
+    trade_id,
+    current_pnl=None,
+    current_z_score=None,
+    regime_break=False,
+    regime_break_note=None,
+):
+    """Track rolling drawdown/profit and regime-break flags for an open pairs trade."""
+    conn = get_conn()
+    row = conn.execute(
+        """
+        SELECT max_unrealized_profit, max_unrealized_drawdown, regime_break_flag, regime_break_notes
+        FROM trades
+        WHERE id=?
+        """,
+        (trade_id,),
+    ).fetchone()
+    if not row:
+        conn.close()
+        return False
+
+    values = {
+        "max_unrealized_profit": row["max_unrealized_profit"] or 0.0,
+        "max_unrealized_drawdown": row["max_unrealized_drawdown"] or 0.0,
+        "regime_break_flag": row["regime_break_flag"] or 0,
+        "regime_break_notes": row["regime_break_notes"],
+    }
+    if current_pnl is not None:
+        values["max_unrealized_profit"] = max(values["max_unrealized_profit"], float(current_pnl))
+        values["max_unrealized_drawdown"] = min(values["max_unrealized_drawdown"], float(current_pnl))
+    if regime_break:
+        values["regime_break_flag"] = 1
+        if regime_break_note and regime_break_note != values["regime_break_notes"]:
+            values["regime_break_notes"] = regime_break_note
+
+    conn.execute(
+        """
+        UPDATE trades
+        SET max_unrealized_profit=?,
+            max_unrealized_drawdown=?,
+            regime_break_flag=?,
+            regime_break_notes=?,
+            closed_z_score=COALESCE(closed_z_score, ?)
+        WHERE id=?
+        """,
+        (
+            round(values["max_unrealized_profit"], 2),
+            round(values["max_unrealized_drawdown"], 2),
+            values["regime_break_flag"],
+            values["regime_break_notes"],
+            current_z_score,
+            trade_id,
+        ),
+    )
+    conn.commit()
+    conn.close()
+    return True
 
 
 # --- Weather Signals ---
@@ -2008,6 +2200,168 @@ def get_stats():
         "total_scans": total_scans,
         "pnl_series": pnl_series,
         "paper_account": paper_account,
+        "cointegration_trial": get_cointegration_trial_summary(),
+    }
+
+
+def _latest_pairs_snapshot_rows(conn):
+    return conn.execute(
+        """
+        SELECT t.id, t.status, t.opened_at, t.closed_at, t.pnl, t.size_usd,
+               t.entry_price_a, t.entry_price_b, t.side_a, t.entry_grade_label,
+               t.admission_path, t.experiment_name, t.experiment_status,
+               t.max_unrealized_profit, t.max_unrealized_drawdown,
+               t.regime_break_flag, t.regime_break_notes,
+               t.closed_z_score, t.exit_reason,
+               s.price_a AS snap_price_a, s.price_b AS snap_price_b
+        FROM trades t
+        LEFT JOIN snapshots s ON s.id = (
+            SELECT s2.id
+            FROM snapshots s2
+            WHERE s2.trade_id = t.id
+            ORDER BY s2.timestamp DESC, s2.id DESC
+            LIMIT 1
+        )
+        WHERE t.trade_type='pairs'
+          AND t.strategy_name='cointegration'
+          AND (
+            t.entry_grade_label='A+'
+            OR (t.entry_grade_label='A' AND t.admission_path='paper_a_trial')
+          )
+        ORDER BY t.opened_at ASC, t.id ASC
+        """
+    ).fetchall()
+
+
+def _empty_trial_bucket(label):
+    return {
+        "label": label,
+        "trade_count": 0,
+        "open_trades": 0,
+        "closed_trades": 0,
+        "wins": 0,
+        "losses": 0,
+        "win_rate": 0.0,
+        "realized_pnl": 0.0,
+        "unrealized_pnl": 0.0,
+        "avg_hold_hours": 0.0,
+        "avg_open_hold_hours": 0.0,
+        "avg_mae_usd": 0.0,
+        "worst_mae_usd": 0.0,
+        "avg_mfe_usd": 0.0,
+        "best_mfe_usd": 0.0,
+        "regime_break_trades": 0,
+        "regime_break_rate": 0.0,
+        "regime_break_notes": [],
+    }
+
+
+def get_cointegration_trial_summary():
+    """Return A-trial vs A+ paper performance and rejection instrumentation."""
+    conn = get_conn()
+    now = time.time()
+    rows = _latest_pairs_snapshot_rows(conn)
+    rejection_rows = conn.execute(
+        """
+        SELECT COALESCE(experiment_reason_code, 'unknown') AS reason_code, COUNT(*) AS count
+        FROM signals
+        WHERE grade_label='A'
+        GROUP BY COALESCE(experiment_reason_code, 'unknown')
+        ORDER BY count DESC, reason_code ASC
+        """
+    ).fetchall()
+    signal_counts = conn.execute(
+        """
+        SELECT
+            SUM(CASE WHEN grade_label='A' THEN 1 ELSE 0 END) AS a_signals,
+            SUM(CASE WHEN grade_label='A' AND experiment_status='eligible' THEN 1 ELSE 0 END) AS a_eligible,
+            SUM(CASE WHEN grade_label='A' AND experiment_status='rejected' THEN 1 ELSE 0 END) AS a_rejected,
+            SUM(CASE WHEN grade_label='A+' THEN 1 ELSE 0 END) AS a_plus_signals
+        FROM signals
+        """
+    ).fetchone()
+    conn.close()
+
+    buckets = {
+        "A+": _empty_trial_bucket("A+"),
+        "A": _empty_trial_bucket("A"),
+    }
+    hold_totals = {"A+": 0.0, "A": 0.0}
+    open_hold_totals = {"A+": 0.0, "A": 0.0}
+    mae_totals = {"A+": 0.0, "A": 0.0}
+    mfe_totals = {"A+": 0.0, "A": 0.0}
+
+    for row in rows:
+        cohort = "A" if row["entry_grade_label"] == "A" else "A+"
+        bucket = buckets[cohort]
+        bucket["trade_count"] += 1
+        mae = min(0.0, float(row["max_unrealized_drawdown"] or 0.0))
+        mfe = max(0.0, float(row["max_unrealized_profit"] or 0.0))
+        mae_totals[cohort] += mae
+        mfe_totals[cohort] += mfe
+        bucket["worst_mae_usd"] = min(bucket["worst_mae_usd"], mae)
+        bucket["best_mfe_usd"] = max(bucket["best_mfe_usd"], mfe)
+        if row["regime_break_flag"]:
+            bucket["regime_break_trades"] += 1
+            note = row["regime_break_notes"]
+            if note and note not in bucket["regime_break_notes"]:
+                bucket["regime_break_notes"].append(note)
+
+        if row["status"] == "closed":
+            bucket["closed_trades"] += 1
+            pnl = float(row["pnl"] or 0.0)
+            bucket["realized_pnl"] += pnl
+            if pnl > 0:
+                bucket["wins"] += 1
+            else:
+                bucket["losses"] += 1
+            hold_hours = ((row["closed_at"] or now) - (row["opened_at"] or now)) / 3600
+            hold_totals[cohort] += max(0.0, hold_hours)
+        else:
+            bucket["open_trades"] += 1
+            hold_hours = (now - (row["opened_at"] or now)) / 3600
+            open_hold_totals[cohort] += max(0.0, hold_hours)
+            if row["snap_price_a"] is not None and row["snap_price_b"] is not None:
+                valuation = calculate_pairs_mark_to_market(
+                    row["size_usd"],
+                    row["entry_price_a"],
+                    row["snap_price_a"],
+                    row["entry_price_b"],
+                    row["snap_price_b"],
+                    row["side_a"],
+                )
+                if valuation["ok"]:
+                    bucket["unrealized_pnl"] += float(valuation["pnl_usd"])
+
+    for cohort, bucket in buckets.items():
+        count = bucket["trade_count"]
+        closed = bucket["closed_trades"]
+        opens = bucket["open_trades"]
+        bucket["win_rate"] = round((bucket["wins"] / closed * 100) if closed else 0.0, 1)
+        bucket["realized_pnl"] = round(bucket["realized_pnl"], 2)
+        bucket["unrealized_pnl"] = round(bucket["unrealized_pnl"], 2)
+        bucket["avg_hold_hours"] = round((hold_totals[cohort] / closed) if closed else 0.0, 2)
+        bucket["avg_open_hold_hours"] = round((open_hold_totals[cohort] / opens) if opens else 0.0, 2)
+        bucket["avg_mae_usd"] = round((mae_totals[cohort] / count) if count else 0.0, 2)
+        bucket["worst_mae_usd"] = round(bucket["worst_mae_usd"], 2)
+        bucket["avg_mfe_usd"] = round((mfe_totals[cohort] / count) if count else 0.0, 2)
+        bucket["best_mfe_usd"] = round(bucket["best_mfe_usd"], 2)
+        bucket["regime_break_rate"] = round((bucket["regime_break_trades"] / count * 100) if count else 0.0, 1)
+
+    rejections = [{"reason_code": row["reason_code"], "count": int(row["count"])} for row in rejection_rows]
+    return {
+        "signals_seen": {
+            "a_plus": int(signal_counts["a_plus_signals"] or 0),
+            "a": int(signal_counts["a_signals"] or 0),
+            "a_trial_eligible": int(signal_counts["a_eligible"] or 0),
+            "a_trial_rejected": int(signal_counts["a_rejected"] or 0),
+        },
+        "cohorts": {
+            "a_plus": buckets["A+"],
+            "a_trial": buckets["A"],
+        },
+        "rejection_reasons": rejections,
+        "summary_generated_at": now,
     }
 
 

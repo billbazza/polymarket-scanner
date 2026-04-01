@@ -224,7 +224,23 @@ def _execute_paper(signal, size_usd, price_a, price_b,
         log.error("Signal missing 'id' field, cannot record trade")
         return {"ok": False, "error": "Signal missing id", "mode": "paper"}
 
-    trade_id = db.open_trade(signal_id, size_usd=size_usd)
+    trade_id = db.open_trade(
+        signal_id,
+        size_usd=size_usd,
+        metadata={
+            "strategy_name": "cointegration",
+            "entry_grade_label": signal.get("grade_label"),
+            "admission_path": signal.get("admission_path"),
+            "experiment_name": signal.get("experiment_name"),
+            "experiment_status": signal.get("experiment_status"),
+            "entry_z_score": signal.get("z_score"),
+            "entry_half_life": signal.get("half_life"),
+            "entry_liquidity": signal.get("liquidity"),
+            "ev": signal.get("ev"),
+            "slippage": signal.get("trial_slippage"),
+            "guardrails": signal.get("experiment_guardrails"),
+        },
+    )
     if not trade_id:
         log.error("Failed to open trade in DB for signal %s", signal_id)
         return {"ok": False, "error": "DB open_trade failed", "mode": "paper"}

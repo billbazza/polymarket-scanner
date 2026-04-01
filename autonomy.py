@@ -45,6 +45,7 @@ import async_scanner
 import tracker
 import execution
 import math_engine
+import cointegration_trial
 
 # --- Configuration ---
 
@@ -269,23 +270,66 @@ def run_cycle(state):
     db.save_scan_run(pairs_tested=scan_result["pairs_tested"], cointegrated=scan_result["pairs_cointegrated"],
                      opportunities=len(opportunities), duration=scan_duration)
 
-    # Save all signals
+    paper_mode = level == "paper"
+    trial_settings = cointegration_trial.get_trial_settings()
+    admitted_signals = []
+    a_trial_candidates = 0
+    a_trial_eligible = 0
+    a_trial_rejected = 0
+    rejection_counts = {}
+    for opp in opportunities:
+        evaluation = cointegration_trial.annotate_opportunity(
+            opp,
+            mode="paper" if paper_mode else "live",
+            settings=trial_settings,
+        )
+        if opp.get("grade_label") == "A":
+            a_trial_candidates += 1
+            if evaluation["admit_trade"]:
+                a_trial_eligible += 1
+            else:
+                a_trial_rejected += 1
+                code = evaluation["reason_code"]
+                rejection_counts[code] = rejection_counts.get(code, 0) + 1
+        if evaluation["admit_trade"]:
+            admitted_signals.append(opp)
+
+    # Save all signals after admission metadata is attached
     new_signal_ids = []
     for opp in opportunities:
         try:
             sid = db.save_signal(opp)
+            opp["id"] = sid
             new_signal_ids.append(sid)
         except Exception as e:
             log.warning("Failed to save signal: %s", e)
 
     tradeable = [o for o in opportunities if o.get("tradeable")]
-    log.info("Scan found %d signals, %d tradeable", len(opportunities), len(tradeable))
+    log.info(
+        "Scan found %d signals, %d A+ tradeable, %d admitted for this level",
+        len(opportunities),
+        len(tradeable),
+        len(admitted_signals),
+    )
+    log.info(
+        "Cointegration A-trial status: enabled=%s paper_only=%s candidates=%d eligible=%d rejected=%d",
+        trial_settings["enabled"],
+        trial_settings["paper_only"],
+        a_trial_candidates,
+        a_trial_eligible,
+        a_trial_rejected,
+    )
 
     journal({
         "action": "scan_complete",
         "level": level,
         "total_signals": len(opportunities),
         "tradeable": len(tradeable),
+        "admitted_signals": len(admitted_signals),
+        "a_trial_candidates": a_trial_candidates,
+        "a_trial_eligible": a_trial_eligible,
+        "a_trial_rejected": a_trial_rejected,
+        "a_trial_rejection_counts": rejection_counts,
         "signal_ids": new_signal_ids,
     })
 
@@ -376,7 +420,7 @@ def run_cycle(state):
     else:
         size_usd = config["size_usd"]
 
-    slots = (max_open - open_count) if max_open is not None else len(tradeable)
+    slots = (max_open - open_count) if max_open is not None else len(admitted_signals)
     traded = 0
 
     # Build dedup sets from currently open trades — keyed by signal_id and event name
@@ -386,7 +430,7 @@ def run_cycle(state):
     this_cycle_signal_ids = set()
     this_cycle_events = set()
 
-    for opp in tradeable:
+    for opp in admitted_signals:
         if traded >= slots:
             break
 
@@ -432,6 +476,11 @@ def run_cycle(state):
         else:
             trade_size = size_usd
 
+        if paper_mode and opp.get("admission_path") == "paper_a_trial":
+            trial_size = opp.get("trial_recommended_size_usd")
+            if trial_size:
+                trade_size = min(trade_size, trial_size) if trade_size else trial_size
+
         # Execute
         mode = "paper" if level in ("paper", "scout") else "live"
 
@@ -473,13 +522,17 @@ def run_cycle(state):
                     "z_score": opp.get("z_score", 0),
                     "grade": opp.get("grade_label", "?"),
                     "ev_pct": opp.get("ev", {}).get("ev_pct", 0),
-                    "reason": f"A+ signal, z={opp.get('z_score', 0):+.2f}",
+                    "admission_path": opp.get("admission_path"),
+                    "experiment_status": opp.get("experiment_status"),
+                    "reason": opp.get("experiment_reason") or f"Signal admitted, z={opp.get('z_score', 0):+.2f}",
                 })
             else:
                 journal({
                     "action": "trade_rejected",
                     "level": level,
                     "event": event_name[:60],
+                    "grade": opp.get("grade_label", "?"),
+                    "admission_path": opp.get("admission_path"),
                     "reason": result.get("error", "unknown"),
                 })
         except Exception as e:
@@ -488,6 +541,9 @@ def run_cycle(state):
                      "event": event_name[:60], "reason": str(e)})
 
     log.info("Step 4: Opened %d new trades", traded)
+
+    for code, count in sorted(rejection_counts.items(), key=lambda item: (-item[1], item[0])):
+        log.info("A-trial rejection summary: %s=%d", code, count)
 
     # Step 4b: Open weather trades (if slots remain)
     open_trades = db.get_trades(status="open", limit=None)

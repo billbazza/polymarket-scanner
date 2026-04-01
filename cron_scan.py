@@ -27,6 +27,7 @@ log = logging.getLogger("scanner.cron")
 
 import db
 import scanner
+import cointegration_trial
 
 
 def main():
@@ -53,6 +54,9 @@ def main():
 
     duration = time.time() - t0
     opportunities = scan_result["opportunities"]
+    trial_settings = cointegration_trial.get_trial_settings()
+    for opp in opportunities:
+        cointegration_trial.annotate_opportunity(opp, mode="paper", settings=trial_settings)
 
     # Save scan run
     db.save_scan_run(

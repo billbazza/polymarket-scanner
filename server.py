@@ -19,6 +19,7 @@ from auth import require_admin, require_operator
 import db
 import scanner
 import brain
+import cointegration_trial
 from log_setup import init_logging
 
 init_logging()
@@ -345,6 +346,9 @@ Keep it concrete and operational."""
 
 def _save_pairs_scan_run(scan_result, duration):
     opportunities = scan_result["opportunities"]
+    trial_settings = cointegration_trial.get_trial_settings()
+    for opp in opportunities:
+        cointegration_trial.annotate_opportunity(opp, mode="paper", settings=trial_settings)
     db.save_scan_run(
         pairs_tested=scan_result["pairs_tested"],
         cointegrated=scan_result["pairs_cointegrated"],
@@ -418,6 +422,34 @@ async def stats():
 @app.get("/api/paper-account")
 async def paper_account():
     return db.get_paper_account_state(refresh_unrealized=True)
+
+
+@app.get("/api/cointegration/trial")
+async def cointegration_trial_status():
+    settings = cointegration_trial.get_trial_settings()
+    summary = db.get_cointegration_trial_summary()
+    recommendation = "keep_experimental"
+    a_trial = summary["cohorts"]["a_trial"]
+    a_plus = summary["cohorts"]["a_plus"]
+    if a_trial["closed_trades"] >= 20:
+        if (
+            a_trial["realized_pnl"] > 0
+            and a_trial["worst_mae_usd"] >= a_plus["worst_mae_usd"]
+            and a_trial["regime_break_rate"] <= max(a_plus["regime_break_rate"], 20.0)
+        ):
+            recommendation = "consider_promoting"
+        elif a_trial["realized_pnl"] <= 0 or a_trial["regime_break_rate"] > max(a_plus["regime_break_rate"] + 15.0, 35.0):
+            recommendation = "reject"
+    return {
+        "trial_name": settings["trial_name"],
+        "status": {
+            "enabled": settings["enabled"],
+            "paper_only": settings["paper_only"],
+            "recommendation": recommendation,
+        },
+        "settings": settings,
+        "summary": summary,
+    }
 
 
 @app.get("/api/reports/daily")

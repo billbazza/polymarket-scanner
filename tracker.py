@@ -326,6 +326,27 @@ def _refresh_pairs_trade(trade):
     except Exception as e:
         log.error("Failed to save snapshot for trade %d: %s", trade_id, e)
 
+    regime_break_threshold = trade.get("regime_break_threshold")
+    regime_break = bool(regime_break_threshold and abs(z_score) >= regime_break_threshold)
+    if regime_break:
+        log.warning(
+            "Regime-break flag: trade=%d | |z|=%.2f threshold=%.2f event=%s",
+            trade_id,
+            abs(z_score),
+            regime_break_threshold,
+            trade.get("event", "?")[:40],
+        )
+    db.update_pairs_trade_metrics(
+        trade_id,
+        current_pnl=pnl["pnl_usd"],
+        current_z_score=round(z_score, 4),
+        regime_break=regime_break,
+        regime_break_note=(
+            f"|z| reached {abs(z_score):.2f} against threshold {regime_break_threshold:.2f}"
+            if regime_break else None
+        ),
+    )
+
     return [{
         "trade_id":        trade_id,
         "trade_type":      "pairs",
@@ -482,16 +503,33 @@ def _auto_close_pairs(trade, z_threshold):
     spread_std  = signal.get("spread_std", 1) or 1
     z_score     = (spread - spread_mean) / spread_std if spread_std > 0 else 0
 
-    price_resolved  = current_a >= 0.99 or current_a <= 0.01 \
-                   or current_b >= 0.99 or current_b <= 0.01
-    spread_reverted = abs(z_score) < z_threshold
+    price_resolved = current_a >= 0.99 or current_a <= 0.01 or current_b >= 0.99 or current_b <= 0.01
+    reversion_exit_z = trade.get("reversion_exit_z")
+    effective_reversion_z = (
+        float(reversion_exit_z)
+        if reversion_exit_z is not None
+        else z_threshold
+    )
+    spread_reverted = abs(z_score) < effective_reversion_z
+    stop_z_threshold = trade.get("stop_z_threshold")
+    stop_hit = bool(stop_z_threshold and abs(z_score) >= stop_z_threshold)
+    max_hold_hours = trade.get("max_hold_hours")
+    hold_hours = ((time.time() - trade["opened_at"]) / 3600) if trade.get("opened_at") else 0
+    timed_out = bool(max_hold_hours and hold_hours >= max_hold_hours)
 
-    if not (spread_reverted or price_resolved):
+    if not (spread_reverted or price_resolved or stop_hit or timed_out):
         log.debug("Trade %d still active: z=%.3f (threshold=%.1f)",
-                  trade_id, z_score, z_threshold)
+                  trade_id, z_score, effective_reversion_z)
         return None
 
-    reason  = "resolved" if price_resolved else f"z={z_score:.3f} reverted"
+    if price_resolved:
+        reason = "resolved"
+    elif stop_hit:
+        reason = f"trial stop hit (|z|={abs(z_score):.3f} >= {float(stop_z_threshold):.3f})"
+    elif timed_out:
+        reason = f"trial max hold reached ({hold_hours:.1f}h >= {float(max_hold_hours):.1f}h)"
+    else:
+        reason = f"z={z_score:.3f} reverted"
     pnl_usd = db.close_trade(trade_id, current_a, current_b,
                               notes=f"Auto-closed: {reason}")
     if pnl_usd is not None:
