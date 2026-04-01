@@ -46,6 +46,7 @@ import tracker
 import execution
 import math_engine
 import cointegration_trial
+import trade_monitor
 
 # --- Configuration ---
 
@@ -453,6 +454,37 @@ def run_cycle(state):
                 "maker_order_management_failed",
                 f"Maker-order management failed: {e}",
                 event="Maker orders",
+                phase=current_stage,
+            )
+
+        # Step 2c: Reconcile stuck or contradictory open-trade states
+        current_stage = "step 2c reconcile open trades"
+        try:
+            reconciliation = trade_monitor.reconcile_open_trades(auto_remediate=True)
+            flagged = reconciliation["counts"].get("resolved", 0)
+            flagged += reconciliation["counts"].get("unpriceable-but-identifiable", 0)
+            flagged += reconciliation["counts"].get("detached-from-watched-wallet", 0)
+            attention = sum(
+                1
+                for item in reconciliation.get("results", [])
+                if item.get("status") == "attention_required"
+            )
+            if reconciliation["auto_closed_trade_ids"] or flagged or attention:
+                log.info(
+                    "Step 2c: trade reconciliation auto_closed=%d flagged=%d attention=%d",
+                    len(reconciliation["auto_closed_trade_ids"]),
+                    flagged,
+                    attention,
+                )
+        except Exception as e:
+            log.warning("Trade reconciliation failed during %s: %s", current_stage, e)
+            record_attempt(
+                level,
+                "system",
+                "error",
+                "trade_reconciliation_failed",
+                f"Open-trade reconciliation failed: {e}",
+                event="Trade reconciliation",
                 phase=current_stage,
             )
 

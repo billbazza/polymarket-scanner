@@ -341,6 +341,26 @@
   .pill.confirmed { background: rgba(20,184,166,0.15); color: var(--teal); }
   .pill.partial   { background: rgba(245,158,11,0.15); color: var(--amber); }
   .pill.single    { background: rgba(107,114,128,0.15); color: #9ca3af; }
+  .pill.critical  { background: rgba(239,68,68,0.16); color: var(--red); }
+  .pill.warning   { background: rgba(245,158,11,0.16); color: var(--amber); }
+  .monitor-box {
+    margin: 0 0 12px;
+    padding: 12px 14px;
+    border-radius: 10px;
+    border: 1px solid rgba(245,158,11,0.3);
+    background: rgba(15,23,42,0.72);
+  }
+  .monitor-items {
+    display: grid;
+    gap: 8px;
+    margin-top: 10px;
+  }
+  .monitor-item {
+    padding: 10px 12px;
+    border-radius: 8px;
+    background: rgba(17,24,39,0.88);
+    border: 1px solid rgba(71,85,105,0.35);
+  }
 
   @media (max-width: 768px) {
     .stats-row { grid-template-columns: repeat(2, 1fr); }
@@ -588,6 +608,10 @@
 
   <!-- ── Open Trades ── -->
   <div id="panel-trades" class="table-wrap" style="display:none">
+    <div id="tradeMonitorBox" class="monitor-box" style="display:none">
+      <div id="tradeMonitorInfo" style="color:var(--text2);font-size:12px">Checking open-trade monitor state…</div>
+      <div id="tradeMonitorItems" class="monitor-items"></div>
+    </div>
     <table>
       <thead>
         <tr>
@@ -1202,14 +1226,57 @@ async function loadWeather() {
 
 async function loadTrades() {
   try {
-    const r = await fetch(API + '/api/trades?status=open&limit=500');
+    const [r, monResp] = await Promise.all([
+      fetch(API + '/api/trades?status=open&limit=500'),
+      fetch(API + '/api/trades/monitor'),
+    ]);
     const trades = await r.json();
+    const monitor = monResp.ok ? await monResp.json() : {summary:{available:false}, trades:[]};
     const body = document.getElementById('tradesBody');
+    const monBox = document.getElementById('tradeMonitorBox');
+    const monInfo = document.getElementById('tradeMonitorInfo');
+    const monItems = document.getElementById('tradeMonitorItems');
+    const flagged = monitor.trades || [];
+    if (monitor.summary?.available !== false && flagged.length) {
+      monBox.style.display = '';
+      monInfo.textContent = `${flagged.length} open trade${flagged.length===1?'':'s'} need attention. These are flagged from the latest reconciliation pass, not guessed from notes alone.`;
+      monItems.innerHTML = flagged.slice(0, 8).map(t => {
+        const sev = t.classification === 'unpriceable-but-identifiable' ? 'critical' : 'warning';
+        const label = t.classification === 'detached-from-watched-wallet'
+          ? 'detached'
+          : t.classification === 'unpriceable-but-identifiable'
+            ? 'unpriceable'
+            : t.classification === 'resolved'
+              ? 'resolved'
+              : 'stale-open';
+        return `<div class="monitor-item">
+          <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+            <span class="pill ${sev}">${esc(label)}</span>
+            <strong>trade #${t.trade_id}</strong>
+            <span style="color:var(--text2)">${esc(t.trade_type || '')}</span>
+          </div>
+          <div style="margin-top:4px">${esc(t.event || t.market_a || '')}</div>
+          <div style="margin-top:4px;color:var(--text2);font-size:12px">${esc(t.reason || '')}</div>
+        </div>`;
+      }).join('');
+    } else {
+      monBox.style.display = '';
+      const tracked = monitor.summary?.tracked_trades || trades.length || 0;
+      monInfo.textContent = monitor.summary?.available === false
+        ? 'Open-trade monitor feed is unavailable.'
+        : `No flagged stuck trades in the latest reconciliation pass. ${tracked} open trade${tracked===1?'':'s'} currently look consistent with source-of-truth market state.`;
+      monItems.innerHTML = '';
+    }
     if (!trades.length) {
       body.innerHTML = '<tr><td colspan="8" class="empty"><div class="icon">◻</div>No open trades.</td></tr>';
       return;
     }
+    const flaggedById = Object.fromEntries(flagged.map(t => [t.trade_id, t]));
     body.innerHTML = trades.map(t => {
+      const mon = flaggedById[t.id];
+      const monPill = mon
+        ? `<span class="pill ${mon.classification === 'unpriceable-but-identifiable' ? 'critical' : 'warning'}" style="margin-left:6px">${esc((mon.classification || '').replaceAll('-', ' '))}</span>`
+        : '';
       if (t.trade_type === 'copy') {
         const actionBadge = `<span class="badge ${t.side_a==='BUY_YES'?'yes':'no'}">${t.copy_outcome||t.side_a}</span>`;
         const sourceStatus = t.copy_wallet_active !== 1
@@ -1221,7 +1288,7 @@ async function loadTrades() {
           <td class="event-name" title="${esc(t.copy_label)}">${esc(t.copy_label||'')}</td>
           <td>${actionBadge}</td>
           <td>${fmtPct(t.entry_price_a)}</td>
-          <td style="color:var(--text2);font-size:12px">${esc(t.event||'')}${sourceStatus}</td>
+          <td style="color:var(--text2);font-size:12px">${esc(t.event||'')}${sourceStatus}${monPill}</td>
           <td>${fmtUsd(t.size_usd)}</td>
           <td><button class="btn sm" onclick="closeTrade(${t.id})">Close</button></td>
         </tr>`;
@@ -1233,7 +1300,7 @@ async function loadTrades() {
           <td class="event-name" title="${esc(t.event)}">${esc(t.event)}</td>
           <td>${actionBadge}</td>
           <td>${fmtPct(t.entry_price_a)}</td>
-          <td style="color:var(--text2);font-size:12px">${esc(t.market_a||'')}</td>
+          <td style="color:var(--text2);font-size:12px">${esc(t.market_a||'')}${monPill}</td>
           <td>${fmtUsd(t.size_usd)}</td>
           <td><button class="btn sm" onclick="closeTrade(${t.id})">Close</button></td>
         </tr>`;
@@ -1247,7 +1314,7 @@ async function loadTrades() {
           <td class="event-name" title="${esc(t.event)}">${esc(t.event)}</td>
           <td>${actionBadge}</td>
           <td>${fmtPct(t.entry_price_a)}</td>
-          <td style="color:var(--text2);font-size:12px">${esc(detail)}</td>
+          <td style="color:var(--text2);font-size:12px">${esc(detail)}${monPill}</td>
           <td>${fmtUsd(t.size_usd)}</td>
           <td><button class="btn sm" onclick="closeTrade(${t.id})">Close</button></td>
         </tr>`;
@@ -1258,7 +1325,7 @@ async function loadTrades() {
         <td class="event-name" title="${esc(t.event)}">${esc(t.event)}</td>
         <td><span class="badge ${t.side_a==='BUY'?'yes':'no'}">${t.side_a} / <span class="${t.side_b==='BUY'?'yes':'no'}">${t.side_b}</span></span></td>
         <td>${fmtPct(t.entry_price_a)}</td>
-        <td>${fmtPct(t.entry_price_b)}</td>
+        <td>${fmtPct(t.entry_price_b)}${monPill}</td>
         <td>${fmtUsd(t.size_usd)}</td>
         <td><button class="btn sm" onclick="closeTrade(${t.id})">Close</button></td>
       </tr>`;

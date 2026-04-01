@@ -20,6 +20,7 @@ import db
 import scanner
 import brain
 import cointegration_trial
+import trade_monitor
 from log_setup import init_logging
 
 init_logging()
@@ -487,6 +488,16 @@ async def paper_account():
 @app.get("/api/paper-trade-attempts")
 async def paper_trade_attempts(limit: int = 50):
     return _paper_trade_attempt_feed(limit=limit)
+
+
+@app.get("/api/trades/monitor")
+async def trade_monitor_status():
+    return trade_monitor.get_flagged_open_trades()
+
+
+@app.post("/api/trades/reconcile")
+async def reconcile_trades(auto_remediate: bool = True):
+    return trade_monitor.reconcile_open_trades(auto_remediate=auto_remediate)
 
 
 @app.get("/api/cointegration/trial")

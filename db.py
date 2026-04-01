@@ -593,6 +593,32 @@ def _migration_010_wallet_monitor_events(conn):
     """)
 
 
+def _migration_011_trade_monitor_events(conn):
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS trade_monitor_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp REAL NOT NULL,
+            source TEXT NOT NULL,
+            trade_id INTEGER NOT NULL REFERENCES trades(id),
+            trade_status TEXT,
+            event_type TEXT NOT NULL,
+            status TEXT NOT NULL,
+            classification TEXT,
+            reason_code TEXT,
+            reason TEXT,
+            remediation_action TEXT,
+            details_json TEXT
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_trade_monitor_events_ts
+            ON trade_monitor_events(timestamp DESC);
+        CREATE INDEX IF NOT EXISTS idx_trade_monitor_events_trade_ts
+            ON trade_monitor_events(trade_id, timestamp DESC);
+        CREATE INDEX IF NOT EXISTS idx_trade_monitor_events_classification
+            ON trade_monitor_events(classification, timestamp DESC);
+    """)
+
+
 _MIGRATIONS = [
     ("001_base_schema", _migration_001_base_schema),
     ("002_backfill_columns", _migration_002_backfill_columns),
@@ -604,6 +630,7 @@ _MIGRATIONS = [
     ("008_cointegration_trial_fields", _migration_008_cointegration_trial_fields),
     ("009_paper_trade_attempts", _migration_009_paper_trade_attempts),
     ("010_wallet_monitor_events", _migration_010_wallet_monitor_events),
+    ("011_trade_monitor_events", _migration_011_trade_monitor_events),
 ]
 
 
@@ -1272,6 +1299,163 @@ def get_paper_trade_attempts(limit: int = 50) -> list[dict]:
         return []
     finally:
         conn.close()
+
+
+def record_trade_monitor_event(
+    *,
+    source: str,
+    trade_id: int,
+    trade_status: str | None,
+    event_type: str,
+    status: str,
+    classification: str | None = None,
+    reason_code: str | None = None,
+    reason: str | None = None,
+    remediation_action: str | None = None,
+    details: dict | None = None,
+    timestamp: float | None = None,
+) -> int:
+    conn = get_conn()
+    try:
+        if not _table_exists(conn, "trade_monitor_events"):
+            log.warning("trade_monitor_events table unavailable; skipping trade monitor event")
+            return 0
+        conn.execute(
+            """
+            INSERT INTO trade_monitor_events (
+                timestamp, source, trade_id, trade_status, event_type, status,
+                classification, reason_code, reason, remediation_action, details_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                timestamp or time.time(),
+                source,
+                trade_id,
+                trade_status,
+                event_type,
+                status,
+                classification,
+                reason_code,
+                _sanitize_operator_reason(reason, fallback="Trade monitor event recorded."),
+                remediation_action,
+                json.dumps(details) if details else None,
+            ),
+        )
+        row_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+        conn.commit()
+        return int(row_id)
+    except sqlite3.Error as exc:
+        log.warning("Failed to record trade monitor event: %s", exc)
+        return 0
+    finally:
+        conn.close()
+
+
+def get_trade_monitor_events(
+    limit: int = 50,
+    trade_id: int | None = None,
+    open_only: bool = False,
+) -> list[dict]:
+    limit = _normalize_query_limit(limit, "get_trade_monitor_events")
+    conn = get_conn()
+    try:
+        if not _table_exists(conn, "trade_monitor_events"):
+            return []
+        params: list = []
+        query = """
+            SELECT tme.*
+            FROM trade_monitor_events tme
+        """
+        clauses = []
+        if open_only:
+            query += " JOIN trades t ON t.id = tme.trade_id"
+            clauses.append("t.status='open'")
+        if trade_id is not None:
+            clauses.append("tme.trade_id = ?")
+            params.append(int(trade_id))
+        if clauses:
+            query += " WHERE " + " AND ".join(clauses)
+        query += " ORDER BY tme.timestamp DESC, tme.id DESC"
+        if limit is not None:
+            query += " LIMIT ?"
+            params.append(limit)
+        rows = conn.execute(query, params).fetchall()
+        out = []
+        for row in rows:
+            item = dict(row)
+            if item.get("details_json"):
+                try:
+                    item["details"] = json.loads(item["details_json"])
+                except Exception:
+                    item["details"] = None
+            else:
+                item["details"] = None
+            out.append(item)
+        return out
+    except sqlite3.Error as exc:
+        log.warning("Failed to query trade monitor events: %s", exc)
+        return []
+    finally:
+        conn.close()
+
+
+def get_latest_trade_monitor_states(open_only: bool = True) -> list[dict]:
+    conn = get_conn()
+    try:
+        if not _table_exists(conn, "trade_monitor_events"):
+            return []
+        query = """
+            SELECT latest.*
+            FROM trade_monitor_events latest
+            JOIN (
+                SELECT trade_id, MAX(id) AS max_id
+                FROM trade_monitor_events
+                GROUP BY trade_id
+            ) picked ON picked.max_id = latest.id
+        """
+        if open_only:
+            query += " JOIN trades t ON t.id = latest.trade_id WHERE t.status='open'"
+        query += " ORDER BY latest.timestamp DESC, latest.id DESC"
+        rows = conn.execute(query).fetchall()
+        out = []
+        for row in rows:
+            item = dict(row)
+            if item.get("details_json"):
+                try:
+                    item["details"] = json.loads(item["details_json"])
+                except Exception:
+                    item["details"] = None
+            else:
+                item["details"] = None
+            out.append(item)
+        return out
+    except sqlite3.Error as exc:
+        log.warning("Failed to load latest trade monitor states: %s", exc)
+        return []
+    finally:
+        conn.close()
+
+
+def get_trade_monitor_summary(open_only: bool = True) -> dict:
+    events = get_latest_trade_monitor_states(open_only=open_only)
+    by_classification = {}
+    by_status = {}
+    flagged = 0
+    for item in events:
+        classification = item.get("classification") or "unknown"
+        status = item.get("status") or "unknown"
+        by_classification[classification] = by_classification.get(classification, 0) + 1
+        by_status[status] = by_status.get(status, 0) + 1
+        if status not in {"open_ok", "no_issue"}:
+            flagged += 1
+    return {
+        "available": True,
+        "open_only": open_only,
+        "tracked_trades": len(events),
+        "flagged_trades": flagged,
+        "by_classification": by_classification,
+        "by_status": by_status,
+    }
 
     attempts = []
     for row in rows:
