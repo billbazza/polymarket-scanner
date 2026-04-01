@@ -861,10 +861,11 @@ async function loadStats() {
     document.getElementById('statUtilization').textContent = (account.bankroll_used_pct || 0).toFixed(1) + '%';
     document.getElementById('statUtilizationMeta').textContent = `${fmtUsd(account.committed_capital || 0)} of ${fmtUsd(account.starting_bankroll || 0)} bankroll currently committed.`;
     document.getElementById('accountSummaryText').textContent =
-      `Equity ${fmtUsd(account.total_equity)} = cash ${fmtUsd(account.available_cash)} + committed capital ${fmtUsd(account.committed_capital)} + unrealized P&L ${fmtUsd(account.unrealized_pnl)}.`;
+      `Equity ${fmtUsd(account.total_equity)} = cash ${fmtUsd(account.available_cash)} + marked open positions ${fmtUsd(account.open_position_value)}.`;
     document.getElementById('accountExplainer').innerHTML =
       `<strong>Accounting rule:</strong> ${esc(account.cash_after_open_explanation || 'Opening a paper trade deducts its size from available cash immediately.')} ` +
-      `Available cash is computed as starting bankroll ${fmtUsd(account.starting_bankroll)} + realized P&amp;L ${fmtUsd(account.realized_pnl)} - committed capital ${fmtUsd(account.committed_capital)}.`;
+      `Available cash is computed as starting bankroll ${fmtUsd(account.starting_bankroll)} + realized P&amp;L ${fmtUsd(account.realized_pnl)} - committed capital ${fmtUsd(account.committed_capital)}. ` +
+      `Marked open-position value is committed capital ${fmtUsd(account.committed_capital)} + unrealized P&amp;L ${fmtUsd(account.unrealized_pnl)}.`;
 
     document.getElementById('statWinRate').textContent = s.win_rate + '%';
     document.getElementById('statOpen').textContent = s.open_trades;

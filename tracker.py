@@ -191,15 +191,30 @@ def _refresh_weather_trade(trade):
     price_state = _resolve_single_leg_price(trade, "refresh")
     if not price_state or price_state.get("price") is None:
         return []
-    current_a = price_state["price"]
+    current_a = db._normalize_probability_price(price_state["price"])
+    if current_a is None:
+        log.warning("Ignoring invalid single-leg price for trade %d: %r", trade_id, price_state["price"])
+        return []
 
-    entry = trade["entry_price_a"] or 0
-    pnl_usd = (current_a - entry) / entry * trade["size_usd"] if entry > 0 else 0
+    valuation = db.calculate_single_leg_mark_to_market(
+        trade["size_usd"],
+        trade["entry_price_a"],
+        current_a,
+    )
+    if not valuation["ok"]:
+        log.warning(
+            "Cannot mark single-leg trade %d: entry=%r current=%r size=%r",
+            trade_id,
+            trade.get("entry_price_a"),
+            current_a,
+            trade.get("size_usd"),
+        )
+        return []
 
     try:
         db.save_snapshot(trade_id, current_a, None, None, None)
         log.debug("Snapshot weather: trade=%d price=%.4f pnl=$%.2f",
-                  trade_id, current_a, pnl_usd)
+                  trade_id, current_a, valuation["pnl_usd"])
     except Exception as e:
         log.error("Failed to save snapshot for weather trade %d: %s", trade_id, e)
 
@@ -208,10 +223,10 @@ def _refresh_weather_trade(trade):
         "trade_type":      trade.get("trade_type") or "weather",
         "action":          trade.get("side_a", ""),
         "event":           trade.get("event", ""),
-        "entry_price_a":   entry,
+        "entry_price_a":   trade["entry_price_a"] or 0,
         "current_price_a": current_a,
         "price_source":    price_state.get("source"),
-        "unrealized_pnl":  {"pnl_usd": round(pnl_usd, 2)},
+        "unrealized_pnl":  valuation,
     }]
 
 
@@ -271,14 +286,32 @@ def _refresh_pairs_trade(trade):
         log.warning("Failed to fetch prices for trade %d: %s", trade_id, e)
         return []
 
-    if current_a <= 0 or current_b <= 0:
+    current_a = db._normalize_probability_price(current_a)
+    current_b = db._normalize_probability_price(current_b)
+    if current_a is None or current_b is None or current_a <= 0 or current_b <= 0:
         log.warning("Invalid prices for trade %d: a=%.4f b=%.4f",
-                    trade_id, current_a, current_b)
+                    trade_id, current_a or -1, current_b or -1)
         return []
 
-    pnl = _pairs_pnl(trade["entry_price_a"], current_a,
-                     trade["entry_price_b"], current_b,
-                     trade["side_a"], trade["size_usd"])
+    pnl = db.calculate_pairs_mark_to_market(
+        trade["size_usd"],
+        trade["entry_price_a"],
+        current_a,
+        trade["entry_price_b"],
+        current_b,
+        trade["side_a"],
+    )
+    if not pnl["ok"]:
+        log.warning(
+            "Cannot mark pairs trade %d: entry_a=%r entry_b=%r current_a=%r current_b=%r size=%r",
+            trade_id,
+            trade.get("entry_price_a"),
+            trade.get("entry_price_b"),
+            current_a,
+            current_b,
+            trade.get("size_usd"),
+        )
+        return []
 
     beta        = signal.get("beta", 1.0) or 1.0
     spread      = current_a - beta * current_b
@@ -478,8 +511,11 @@ def _auto_close_pairs(trade, z_threshold):
 
 def calculate_unrealized_pnl(trade, current_price_a, current_price_b):
     """Calculate unrealized P&L for an open pairs trade."""
-    return _pairs_pnl(
-        trade["entry_price_a"], current_price_a,
-        trade["entry_price_b"], current_price_b,
-        trade["side_a"], trade["size_usd"],
+    return db.calculate_pairs_mark_to_market(
+        trade["size_usd"],
+        trade["entry_price_a"],
+        current_price_a,
+        trade["entry_price_b"],
+        current_price_b,
+        trade["side_a"],
     )

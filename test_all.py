@@ -228,6 +228,96 @@ def test_paper_balance_lifecycle():
 run("paper_balance", test_paper_balance_lifecycle)
 
 
+# ── 2c. Open-trade valuation sanity ──────────────────────────────────────────
+
+section("2c. Open-trade valuation sanity")
+
+def test_single_leg_buy_no_mark_to_market():
+    import db
+    import tracker
+
+    before = db.get_paper_account_state(refresh_unrealized=False)
+    position = {
+        "conditionId": "cond-copy-buy-no-mtm",
+        "outcome": "No",
+        "curPrice": 0.98,
+        "asset": "tok_copy_no_mtm",
+    }
+    trade_id = db.open_copy_trade("0xcopy-mtm", "copy mtm", position, size_usd=20)
+    check("copy BUY_NO trade opened", trade_id is not None and trade_id > 0, f"got {trade_id}")
+
+    trade = db.get_trade(trade_id)
+    check("copy BUY_NO entry stores held token price", abs((trade or {}).get("entry_price_a", 0) - 0.98) < 1e-9,
+          f"got {trade.get('entry_price_a') if trade else None}")
+
+    with patch("api.get_midpoint", return_value=0.99):
+        updates = tracker.refresh_open_trades()
+
+    update = next((u for u in updates if u.get("trade_id") == trade_id), None)
+    expected = ((0.99 - 0.98) / 0.98) * 20
+    check("copy BUY_NO refresh produced update", update is not None)
+    if update:
+        check("copy BUY_NO unrealized pnl stays small and correct",
+              abs(update["unrealized_pnl"]["pnl_usd"] - round(expected, 2)) < 0.01,
+              f"got {update['unrealized_pnl']['pnl_usd']}, expected {expected:.2f}")
+
+    account = db.get_paper_account_state(refresh_unrealized=False)
+    check("paper account unrealized remains economically plausible for BUY_NO",
+          abs((account["unrealized_pnl"] - before["unrealized_pnl"]) - round(expected, 2)) < 0.01,
+          f"got delta {account['unrealized_pnl'] - before['unrealized_pnl']}, expected {expected:.2f}")
+    db.close_trade(trade_id, exit_price_a=0.99, notes="test cleanup")
+
+
+def test_pairs_open_trade_mark_to_market():
+    import db
+    import tracker
+
+    before = db.get_paper_account_state(refresh_unrealized=False)
+    signal = {
+        "event": "Pairs MTM Test",
+        "market_a": "Market A",
+        "market_b": "Market B",
+        "price_a": 0.25,
+        "price_b": 0.80,
+        "z_score": -2.0,
+        "coint_pvalue": 0.02,
+        "beta": 1.0,
+        "half_life": 4.0,
+        "spread_mean": 0.0,
+        "spread_std": 0.1,
+        "current_spread": -0.55,
+        "liquidity": 8000,
+        "volume_24h": 1200,
+        "action": "BUY A / SELL B",
+        "token_id_a": "tok-pairs-a",
+        "token_id_b": "tok-pairs-b",
+    }
+    signal_id = db.save_signal(signal)
+    trade_id = db.open_trade(signal_id, size_usd=100)
+    check("pairs trade opened", trade_id is not None and trade_id > 0, f"got {trade_id}")
+
+    with patch("api.get_midpoint", side_effect=[0.35, 0.70]):
+        updates = tracker.refresh_open_trades()
+
+    update = next((u for u in updates if u.get("trade_id") == trade_id), None)
+    expected = 50 / 0.25 * (0.35 - 0.25) + 50 / 0.80 * (0.80 - 0.70)
+    check("pairs refresh produced update", update is not None)
+    if update:
+        check("pairs unrealized pnl uses shares-based synthetic-short math",
+              abs(update["unrealized_pnl"]["pnl_usd"] - round(expected, 2)) < 0.01,
+              f"got {update['unrealized_pnl']['pnl_usd']}, expected {expected:.2f}")
+
+    account = db.get_paper_account_state(refresh_unrealized=False)
+    check("paper account unrealized includes pairs mark-to-market",
+          abs((account["unrealized_pnl"] - before["unrealized_pnl"]) - round(expected, 2)) < 0.01,
+          f"got delta {account['unrealized_pnl'] - before['unrealized_pnl']}, expected {expected:.2f}")
+    db.close_trade(trade_id, exit_price_a=0.35, exit_price_b=0.70, notes="test cleanup")
+
+
+run("single_leg_buy_no_mark_to_market", test_single_leg_buy_no_mark_to_market)
+run("pairs_open_trade_mark_to_market", test_pairs_open_trade_mark_to_market)
+
+
 # ── 3. Math Engine ──────────────────────────────────────────────────────────
 
 section("3. Math engine — EV, Kelly, slippage")

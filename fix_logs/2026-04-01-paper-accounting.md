@@ -2,17 +2,18 @@
 
 ## Source
 - Paper-trading bankroll/accounting/dashboard clarity task.
-- `AGENTS.md` was not present in this checkout, so repo contract guidance was taken from [CLAUDE.md](/Users/will/.cline/worktrees/ed369/polymarket-scanner/CLAUDE.md).
+- Followed repo contract from [AGENTS.md](/Users/will/.cline/worktrees/f4079/polymarket-scanner/AGENTS.md).
 
 ## Fixes Applied
-- Replaced the in-memory paper balance tracker in [execution.py](/Users/will/.cline/worktrees/ed369/polymarket-scanner/execution.py) with SQLite-backed paper account reporting.
-- Added a persistent `paper_accounts` table and paper-account helpers in [db.py](/Users/will/.cline/worktrees/ed369/polymarket-scanner/db.py) with a default starting bankroll of `$2000`.
-- Made paper-account reporting explicit for starting bankroll, available cash, committed capital, realized P&L, unrealized P&L, cumulative losses, and total equity.
-- Made paper trade opens consume available cash immediately by deriving cash from `starting bankroll + realized P&L - committed open trade size`.
-- Blocked new paper trade opens when available cash is insufficient for pairs, weather, whale, and copy-trading paths.
-- Extended [server.py](/Users/will/.cline/worktrees/ed369/polymarket-scanner/server.py) stats/trade responses with paper-account data and added a dedicated `/api/paper-account` endpoint.
-- Reworked the dashboard summary in [dashboard.html](/Users/will/.cline/worktrees/ed369/polymarket-scanner/dashboard.html) so the bankroll breakdown and equity formula are readable and unambiguous.
-- Updated [test_all.py](/Users/will/.cline/worktrees/ed369/polymarket-scanner/test_all.py) to validate the persisted paper-account lifecycle instead of process-local state.
+- Centralized paper mark-to-market math in [db.py](/Users/will/.cline/worktrees/f4079/polymarket-scanner/db.py) for both single-leg and pairs trades so snapshots, account summaries, and closes all use one valuation path.
+- Added probability-price validation to ignore malformed or out-of-range marks before they can pollute snapshots or unrealized P&L.
+- Fixed `BUY_NO` copy-trade entry handling in [db.py](/Users/will/.cline/worktrees/f4079/polymarket-scanner/db.py): Polymarket Data API `curPrice` already refers to the held token's price, so NO positions must not be inverted on insert.
+- Added migration `007_copy_no_entry_price_fix` in [db.py](/Users/will/.cline/worktrees/f4079/polymarket-scanner/db.py) to repair existing open copy `BUY_NO` trades created with inverted entry prices. This was the direct source of absurd unrealized P&L and total-equity numbers.
+- Updated [tracker.py](/Users/will/.cline/worktrees/f4079/polymarket-scanner/tracker.py) to reuse the centralized valuation helpers and skip invalid marks instead of recording bad snapshots.
+- Updated [dashboard.html](/Users/will/.cline/worktrees/f4079/polymarket-scanner/dashboard.html) to display equity as `cash + marked open positions`, while still showing committed capital and unrealized P&L explicitly.
+- Added targeted open-trade valuation coverage in [test_all.py](/Users/will/.cline/worktrees/f4079/polymarket-scanner/test_all.py) for single-leg `BUY_NO` paper marks and pairs share-based unrealized P&L.
 
 ## Verification
-- Pending local verification via `python3 -m py_compile`, `node --check dashboard.html`, and `python3 test_all.py`.
+- `python3 -m py_compile db.py tracker.py execution.py server.py test_all.py`
+- `python3 test_all.py`
+- `python3 - <<'PY' ... db.get_paper_account_state(refresh_unrealized=False) ... PY` against the local `scanner.db` after migration to confirm paper equity returned to plausible levels.

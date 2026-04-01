@@ -1,6 +1,7 @@
 """SQLite persistence layer for the scanner."""
 import json
 import logging
+import math
 import os
 import sqlite3
 import threading
@@ -409,6 +410,34 @@ def _migration_006_paper_account(conn):
     )
 
 
+def _migration_007_copy_no_entry_price_fix(conn):
+    """Repair open copy BUY_NO trades created with inverted entry prices.
+
+    Copy positions from Polymarket's data API already expose the held outcome's
+    token price in `curPrice`. Older code inverted that value for NO positions,
+    which turned cheap YES prices into nearly-free NO entries and blew up
+    unrealized P&L / total equity in paper accounting.
+    """
+    conn.execute(
+        """
+        UPDATE trades
+        SET entry_price_a = ROUND(1.0 - entry_price_a, 6),
+            notes = CASE
+                WHEN notes IS NULL OR notes = '' THEN
+                    'Migration 007: corrected copy BUY_NO entry price from inverted curPrice.'
+                ELSE
+                    notes || ' | Migration 007: corrected copy BUY_NO entry price from inverted curPrice.'
+            END
+        WHERE trade_type='copy'
+          AND status='open'
+          AND side_a='BUY_NO'
+          AND entry_price_a IS NOT NULL
+          AND entry_price_a > 0
+          AND entry_price_a < 1
+        """
+    )
+
+
 _MIGRATIONS = [
     ("001_base_schema", _migration_001_base_schema),
     ("002_backfill_columns", _migration_002_backfill_columns),
@@ -416,6 +445,7 @@ _MIGRATIONS = [
     ("004_report_items", _migration_004_report_items),
     ("005_settings", _migration_005_settings),
     ("006_paper_account", _migration_006_paper_account),
+    ("007_copy_no_entry_price_fix", _migration_007_copy_no_entry_price_fix),
 ]
 
 
@@ -578,6 +608,109 @@ def set_paper_starting_bankroll(starting_bankroll: float) -> dict:
     return dict(updated)
 
 
+def _normalize_probability_price(price):
+    try:
+        value = float(price)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(value):
+        return None
+    if 0.0 <= value <= 1.0:
+        return value
+    return None
+
+
+def calculate_single_leg_mark_to_market(size_usd, entry_price, current_price) -> dict:
+    """Return shares, current market value, and P&L for a single token position."""
+    cost_basis = max(0.0, float(size_usd or 0.0))
+    entry = _normalize_probability_price(entry_price)
+    current = _normalize_probability_price(current_price)
+    if cost_basis <= 0 or entry is None or current is None or entry <= 0:
+        return {
+            "ok": False,
+            "shares": 0.0,
+            "cost_basis": round(cost_basis, 2),
+            "current_price": current,
+            "current_value": 0.0,
+            "pnl_usd": 0.0,
+            "pnl_pct": 0.0,
+        }
+
+    shares = cost_basis / entry
+    current_value = shares * current
+    pnl_usd = current_value - cost_basis
+    pnl_pct = (pnl_usd / cost_basis * 100) if cost_basis > 0 else 0.0
+    return {
+        "ok": True,
+        "shares": shares,
+        "cost_basis": round(cost_basis, 2),
+        "current_price": current,
+        "current_value": round(current_value, 2),
+        "pnl_usd": round(pnl_usd, 2),
+        "pnl_pct": round(pnl_pct, 2),
+    }
+
+
+def calculate_pairs_mark_to_market(
+    size_usd,
+    entry_price_a,
+    current_price_a,
+    entry_price_b,
+    current_price_b,
+    side_a,
+) -> dict:
+    """Return shares, market value, and P&L for a two-leg paper pairs trade."""
+    total_cost = max(0.0, float(size_usd or 0.0))
+    half = total_cost / 2
+    entry_a = _normalize_probability_price(entry_price_a)
+    current_a = _normalize_probability_price(current_price_a)
+    entry_b = _normalize_probability_price(entry_price_b)
+    current_b = _normalize_probability_price(current_price_b)
+
+    if (
+        total_cost <= 0
+        or half <= 0
+        or entry_a is None
+        or current_a is None
+        or entry_b is None
+        or current_b is None
+        or entry_a <= 0
+        or entry_b <= 0
+    ):
+        return {
+            "ok": False,
+            "cost_basis": round(total_cost, 2),
+            "current_value": 0.0,
+            "pnl_usd": 0.0,
+            "pnl_pct": 0.0,
+            "shares_a": 0.0,
+            "shares_b": 0.0,
+        }
+
+    shares_a = half / entry_a
+    shares_b = half / entry_b
+
+    if side_a == "BUY":
+        pnl_a = shares_a * (current_a - entry_a)
+        pnl_b = shares_b * (entry_b - current_b)
+    else:
+        pnl_a = shares_a * (entry_a - current_a)
+        pnl_b = shares_b * (current_b - entry_b)
+
+    pnl_usd = pnl_a + pnl_b
+    current_value = total_cost + pnl_usd
+    pnl_pct = (pnl_usd / total_cost * 100) if total_cost > 0 else 0.0
+    return {
+        "ok": True,
+        "cost_basis": round(total_cost, 2),
+        "current_value": round(current_value, 2),
+        "pnl_usd": round(pnl_usd, 2),
+        "pnl_pct": round(pnl_pct, 2),
+        "shares_a": shares_a,
+        "shares_b": shares_b,
+    }
+
+
 def _paper_unrealized_from_updates(updates):
     unrealized = 0.0
     for item in updates or []:
@@ -603,27 +736,24 @@ def _paper_unrealized_from_snapshots(conn):
 
     unrealized = 0.0
     for row in rows:
-        price_a = row["price_a"]
-        entry_a = row["entry_price_a"] or 0
-        if price_a is None or entry_a <= 0:
-            continue
-
         trade_type = row["trade_type"] or "pairs"
         if trade_type in {"weather", "copy", "whale"}:
-            pnl = (price_a - entry_a) / entry_a * row["size_usd"]
+            valuation = calculate_single_leg_mark_to_market(
+                row["size_usd"],
+                row["entry_price_a"],
+                row["price_a"],
+            )
         else:
-            price_b = row["price_b"]
-            entry_b = row["entry_price_b"] or 0
-            if price_b is None or entry_b <= 0:
-                continue
-            half = row["size_usd"] / 2
-            shares_a = half / entry_a
-            shares_b = half / entry_b
-            if row["side_a"] == "BUY":
-                pnl = shares_a * (price_a - entry_a) + shares_b * (entry_b - price_b)
-            else:
-                pnl = shares_a * (entry_a - price_a) + shares_b * (price_b - entry_b)
-        unrealized += float(pnl)
+            valuation = calculate_pairs_mark_to_market(
+                row["size_usd"],
+                row["entry_price_a"],
+                row["price_a"],
+                row["entry_price_b"],
+                row["price_b"],
+                row["side_a"],
+            )
+        if valuation["ok"]:
+            unrealized += float(valuation["pnl_usd"])
     return unrealized
 
 
@@ -664,12 +794,14 @@ def get_paper_account_state(refresh_unrealized: bool = False) -> dict:
         conn.close()
 
     available_cash = starting_bankroll + realized_pnl - committed_capital
-    total_equity = starting_bankroll + realized_pnl + unrealized_pnl
+    open_position_value = committed_capital + unrealized_pnl
+    total_equity = available_cash + open_position_value
     bankroll_used_pct = (committed_capital / starting_bankroll * 100) if starting_bankroll > 0 else 0.0
     return {
         "starting_bankroll": round(starting_bankroll, 2),
         "available_cash": round(available_cash, 2),
         "committed_capital": round(committed_capital, 2),
+        "open_position_value": round(open_position_value, 2),
         "realized_pnl": round(realized_pnl, 2),
         "realized_gains": round(realized_gains, 2),
         "unrealized_pnl": round(unrealized_pnl, 2),
@@ -827,7 +959,15 @@ def open_copy_trade(
     outcome = position.get("outcome", "")
     price = position.get("curPrice") or position.get("avgPrice") or 0
     side = "BUY_YES" if outcome.lower() not in ("no",) else "BUY_NO"
-    entry_price = price if side == "BUY_YES" else round(1.0 - price, 4)
+    entry_price = _normalize_probability_price(price)
+    if entry_price is None or entry_price <= 0:
+        log.warning(
+            "Paper copy trade blocked for wallet %s: invalid entry price %r for %s",
+            wallet,
+            price,
+            condition_id,
+        )
+        return None
 
     conn = get_conn()
     conn.execute("""
@@ -916,27 +1056,25 @@ def close_trade(trade_id, exit_price_a, exit_price_b=None, notes=""):
     trade_type = trade["trade_type"] if trade["trade_type"] else "pairs"
 
     if trade_type in {"weather", "copy", "whale"}:
-        entry = trade["entry_price_a"] or 0
-        pnl_usd = (exit_price_a - entry) / entry * trade["size_usd"] if entry > 0 else 0
+        valuation = calculate_single_leg_mark_to_market(
+            trade["size_usd"],
+            trade["entry_price_a"],
+            exit_price_a,
+        )
+        pnl_usd = valuation["pnl_usd"]
         exit_b = exit_price_a  # store single price in both columns for consistency
     else:
         if exit_price_b is None:
             exit_price_b = trade["entry_price_b"]
-        entry_a = trade["entry_price_a"] or 0
-        entry_b = trade["entry_price_b"] or 0
-        if entry_a <= 0 or entry_b <= 0:
-            pnl_usd = 0.0
-        else:
-            half = trade["size_usd"] / 2
-            shares_a = half / entry_a
-            shares_b = half / entry_b
-            if trade["side_a"] == "BUY":
-                pnl_a = shares_a * (exit_price_a - entry_a)
-                pnl_b = shares_b * (entry_b - exit_price_b)
-            else:
-                pnl_a = shares_a * (entry_a - exit_price_a)
-                pnl_b = shares_b * (exit_price_b - entry_b)
-            pnl_usd = pnl_a + pnl_b
+        valuation = calculate_pairs_mark_to_market(
+            trade["size_usd"],
+            trade["entry_price_a"],
+            exit_price_a,
+            trade["entry_price_b"],
+            exit_price_b,
+            trade["side_a"],
+        )
+        pnl_usd = valuation["pnl_usd"]
         exit_b = exit_price_b
 
     conn.execute("""
@@ -1003,6 +1141,8 @@ def get_trade(trade_id):
 # --- Snapshots ---
 
 def save_snapshot(trade_id, price_a, price_b, spread, z_score):
+    price_a = _normalize_probability_price(price_a)
+    price_b = _normalize_probability_price(price_b) if price_b is not None else None
     conn = get_conn()
     conn.execute("""
         INSERT INTO snapshots (timestamp, trade_id, price_a, price_b, spread, z_score)
