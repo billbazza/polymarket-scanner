@@ -620,6 +620,7 @@
       <button class="btn sm sky" onclick="loadCopy()">Refresh</button>
     </div>
     <div id="copyLatest" style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:16px"></div>
+    <div id="copyDetached" style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:16px"></div>
 
     <!-- Discover / Score new wallet -->
     <div style="background:var(--card);border:1px solid var(--border);border-radius:8px;padding:14px;margin-bottom:16px">
@@ -1106,13 +1107,16 @@ async function loadTrades() {
     body.innerHTML = trades.map(t => {
       if (t.trade_type === 'copy') {
         const actionBadge = `<span class="badge ${t.side_a==='BUY_YES'?'yes':'no'}">${t.copy_outcome||t.side_a}</span>`;
+        const sourceStatus = t.copy_wallet_active !== 1
+          ? '<span class="pill" style="background:var(--amber);color:#000;margin-left:6px">unwatched</span>'
+          : '';
         return `<tr>
           <td>${fmt(t.opened_at)}</td>
           <td><span class="pill" style="background:var(--purple);color:#fff">copy</span></td>
           <td class="event-name" title="${esc(t.copy_label)}">${esc(t.copy_label||'')}</td>
           <td>${actionBadge}</td>
           <td>${fmtPct(t.entry_price_a)}</td>
-          <td style="color:var(--text2);font-size:12px">${esc(t.event||'')}</td>
+          <td style="color:var(--text2);font-size:12px">${esc(t.event||'')}${sourceStatus}</td>
           <td>${fmtUsd(t.size_usd)}</td>
           <td><button class="btn sm" onclick="closeTrade(${t.id})">Close</button></td>
         </tr>`;
@@ -1762,11 +1766,17 @@ function walletScoreCard(w, showRemove) {
   const b = w.score_breakdown || w.breakdown || {};
   const isDropped = w.active === 0;
   const willCopy = w.will_copy == 1 || w.will_copy === true;
+  const removeReason = w.auto_drop_reason || '';
+  const isManualUnwatch = removeReason.startsWith('manual_unwatch:');
   const removeBtn = showRemove
-    ? `<button class="btn sm" style="margin-top:6px;font-size:10px;padding:2px 7px;background:var(--red);color:#fff"
-         onclick="removeWallet('${esc(w.address)}', this)">Remove</button>` : '';
-  const droppedBadge = isDropped
-    ? `<div style="color:var(--red);font-size:10px;font-weight:700;margin-top:4px">AUTO-DROPPED: ${esc(w.auto_drop_reason||'')}</div>` : '';
+    ? (isDropped ? '' : `<button class="btn sm" style="margin-top:6px;font-size:10px;padding:2px 7px;background:var(--red);color:#fff"
+         onclick="removeWallet('${esc(w.address)}', this)">Unwatch</button>`) : '';
+  let droppedBadge = '';
+  if (isDropped && isManualUnwatch) {
+    droppedBadge = '<div style="color:var(--amber);font-size:10px;font-weight:700;margin-top:4px">UNWATCHED: future mirroring stopped</div>';
+  } else if (isDropped) {
+    droppedBadge = `<div style="color:var(--red);font-size:10px;font-weight:700;margin-top:4px">AUTO-DROPPED: ${esc(removeReason)}</div>`;
+  }
   const openTrades = w.open_copy_trades || 0;
   return `<div style="background:var(--surface);border:1px solid ${isDropped ? 'var(--red)' : 'var(--border)'};border-radius:8px;padding:10px 14px;min-width:200px;opacity:${isDropped ? '0.65' : '1'}">
     <div style="display:flex;justify-content:space-between;align-items:flex-start">
@@ -1894,12 +1904,13 @@ async function addToWatchlist(address, label, verdict, reasoning, btn) {
 }
 
 async function removeWallet(address, btn) {
-  if (!confirm('Remove this wallet and close its copy trades?')) return;
+  if (!confirm('Stop watching this wallet? Existing copy trades stay open and must be closed explicitly from Open Trades unless resolution or risk rules close them.')) return;
   btn.disabled = true;
   try {
     const r = await fetch(API + `/api/copy/watch/${encodeURIComponent(address)}`, {method:'DELETE'});
     const d = await r.json();
-    toast(`Removed wallet · ${d.trades_closed} trades closed`);
+    if (!r.ok || !d.ok) throw new Error(d.detail || d.error || 'Failed to stop watching wallet');
+    toast(`Stopped watching wallet · ${d.open_copy_trades_remaining || 0} copy trade${(d.open_copy_trades_remaining || 0) === 1 ? '' : 's'} still open`);
     loadCopyScores(); loadTrades(); loadStats();
   } catch(e) { toast('Error: ' + e, true); btn.disabled = false; }
 }
@@ -2041,6 +2052,42 @@ async function loadCopyLatest() {
   }
 }
 
+async function loadDetachedCopyTrades() {
+  const detachedEl = getEl('copyDetached');
+  if (!detachedEl) return 0;
+  try {
+    const r = await fetch(API + '/api/copy/detached');
+    if (!r.ok) throw new Error('Failed to load detached copy trades');
+    const payload = await r.json();
+    const trades = payload.trades || [];
+    if (!trades.length) {
+      detachedEl.innerHTML = '';
+      return 0;
+    }
+    detachedEl.innerHTML = `<div style="width:100%;color:var(--amber);font-size:12px;font-weight:600">
+      Mirrored trades from unwatched wallets remain open until you close them from Open Trades or they resolve.
+    </div>` + trades.map(t => {
+      const reason = t.status_label === 'unwatched'
+        ? 'source wallet manually unwatched'
+        : (t.reason || 'source wallet no longer active');
+      return `<div style="border:1px solid var(--border);border-radius:8px;padding:8px 10px;background:var(--surface2);font-size:12px;min-width:220px">
+        <div style="display:flex;justify-content:space-between;gap:8px">
+          <strong>${esc(t.label || 'Wallet')}</strong>
+          <span style="color:var(--amber);font-size:11px;text-transform:uppercase">${esc(t.status_label || 'detached')}</span>
+        </div>
+        <div style="color:var(--text2);font-size:11px">${esc(t.outcome || '')} · ${fmtUsd(t.size_usd || 0)} · trade #${t.trade_id}</div>
+        <div class="event-name" title="${esc(t.event || '')}" style="font-size:11px;margin-top:4px">${esc(t.event || '')}</div>
+        <div style="color:var(--text2);font-size:10px;margin-top:4px">${esc(reason)}</div>
+      </div>`;
+    }).join('');
+    return trades.length;
+  } catch(e) {
+    detachedEl.innerHTML = '<span style="color:var(--text2);font-size:12px">Detached copy trades unavailable.</span>';
+    console.error('loadDetachedCopyTrades error', e);
+    return 0;
+  }
+}
+
 async function loadCopy() {
   const latestEl = getEl('copyLatest');
   if (latestEl) {
@@ -2050,7 +2097,10 @@ async function loadCopy() {
   document.getElementById('copyInfo').textContent = 'Fetching wallet positions...';
   loadCopyScores();
   try {
-    const r = await fetch(API + '/api/copy/positions');
+    const [r, detachedCount] = await Promise.all([
+      fetch(API + '/api/copy/positions'),
+      loadDetachedCopyTrades(),
+    ]);
     const wallets = await r.json();
     const body = document.getElementById('copyBody');
     let totalPositions = 0;
@@ -2097,7 +2147,7 @@ async function loadCopy() {
     const existingText = document.getElementById('copyInfo').textContent;
     const monitorPart = existingText.split(' · ')[0] || 'Monitor: ○ stopped';
     document.getElementById('copyInfo').textContent =
-      `${monitorPart} · ${wallets.length} wallets · ${totalPositions} positions · updated ${new Date().toLocaleTimeString('en-GB')}`;
+      `${monitorPart} · ${wallets.length} active wallets · ${totalPositions} live positions · ${detachedCount || 0} detached copy trades · updated ${new Date().toLocaleTimeString('en-GB')}`;
   } catch(e) { console.error('loadCopy error:', e); document.getElementById('copyInfo').textContent = 'Error loading wallets'; }
 }
 

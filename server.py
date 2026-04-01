@@ -1215,6 +1215,36 @@ async def copy_positions():
     return out
 
 
+@app.get("/api/copy/detached")
+async def copy_detached_trades():
+    """Return open copy trades whose source wallet is no longer actively watched."""
+    detached = []
+    for trade in db.get_trades(status="open", limit=500):
+        if trade.get("trade_type") != "copy":
+            continue
+        if trade.get("copy_wallet_active") == 1:
+            continue
+        reason = trade.get("copy_wallet_reason") or ""
+        if reason.startswith("manual_unwatch:"):
+            status_label = "unwatched"
+        elif reason:
+            status_label = "inactive"
+        else:
+            status_label = "detached"
+        detached.append({
+            "trade_id": trade["id"],
+            "wallet": trade.get("copy_wallet"),
+            "label": trade.get("copy_label") or (trade.get("copy_wallet") or "")[:10] + "...",
+            "event": trade.get("event"),
+            "outcome": trade.get("copy_outcome") or trade.get("side_a"),
+            "opened_at": trade.get("opened_at"),
+            "size_usd": trade.get("size_usd"),
+            "status_label": status_label,
+            "reason": reason,
+        })
+    return {"trades": detached}
+
+
 @app.get("/api/copy/settings")
 async def get_copy_settings():
     return db.get_copy_trade_settings()
@@ -1428,20 +1458,28 @@ async def dismiss_candidate(candidate_id: int):
 
 @app.delete("/api/copy/watch/{address}")
 async def remove_from_watchlist(address: str):
-    """Remove a wallet and close its open copy trades."""
+    """Stop watching a wallet without force-closing its open copy trades."""
     address = address.lower()
-    # Close open copy trades
-    open_copy = [
-        t for t in db.get_trades(status="open", limit=500)
-        if t.get("trade_type") == "copy" and t.get("copy_wallet") == address
-    ]
-    closed = 0
-    for trade in open_copy:
-        db.close_trade(trade["id"], exit_price_a=trade.get("entry_price_a", 0.5),
-                       notes="removed from watchlist")
-        closed += 1
-    removed = db.remove_watched_wallet(address)
-    return {"ok": removed, "address": address, "trades_closed": closed}
+    open_copy_remaining = sum(
+        1
+        for trade in db.get_trades(status="open", limit=500)
+        if trade.get("trade_type") == "copy" and trade.get("copy_wallet") == address
+    )
+    removed = db.unwatch_wallet(address)
+    if removed:
+        log.info(
+            "Copy wallet unwatched: address=%s open_copy_trades_remaining=%d",
+            address,
+            open_copy_remaining,
+        )
+    return {
+        "ok": removed,
+        "address": address,
+        "action": "unwatched",
+        "future_mirroring_stopped": removed,
+        "open_copy_trades_remaining": open_copy_remaining,
+        "close_policy": "Existing copy trades stay open until manually closed or risk/resolution rules close them.",
+    }
 
 
 if __name__ == "__main__":

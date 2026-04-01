@@ -1181,7 +1181,8 @@ _TRADES_SELECT = """
         t.entry_price_a, t.entry_price_b, t.exit_price_a, t.exit_price_b,
         t.size_usd, t.pnl, t.status, t.notes, t.trade_type, t.weather_signal_id,
         t.token_id_a, t.token_id_b, t.copy_wallet, t.copy_label, t.copy_condition_id,
-        t.copy_outcome, t.whale_alert_id,
+        t.copy_outcome, t.whale_alert_id, ww.active AS copy_wallet_active,
+        ww.auto_drop_reason AS copy_wallet_reason,
         COALESCE(s.event, ws.event, t.copy_label, t.event) AS event,
         COALESCE(s.market_a, ws.market, t.copy_outcome, t.market_a) AS market_a,
         s.market_b,
@@ -1191,6 +1192,7 @@ _TRADES_SELECT = """
     FROM trades t
     LEFT JOIN signals s          ON t.signal_id          = s.id
     LEFT JOIN weather_signals ws ON t.weather_signal_id  = ws.id
+    LEFT JOIN watched_wallets ww ON t.copy_wallet        = ww.address
 """
 
 
@@ -1970,6 +1972,18 @@ def deactivate_watched_wallet(address: str, reason: str = "") -> None:
     )
     conn.commit()
     conn.close()
+
+
+def unwatch_wallet(address: str, reason: str = "manual_unwatch: operator stopped mirroring") -> bool:
+    """Stop watching a wallet without deleting its history or closing trades."""
+    conn = get_conn()
+    cursor = conn.execute(
+        "UPDATE watched_wallets SET active=0, auto_drop_reason=? WHERE address=?",
+        (reason, address.lower()),
+    )
+    conn.commit()
+    conn.close()
+    return cursor.rowcount > 0
 
 
 def remove_watched_wallet(address: str) -> bool:

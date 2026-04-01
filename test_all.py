@@ -318,6 +318,67 @@ run("single_leg_buy_no_mark_to_market", test_single_leg_buy_no_mark_to_market)
 run("pairs_open_trade_mark_to_market", test_pairs_open_trade_mark_to_market)
 
 
+# ── 2d. Copy trader unwatch semantics ───────────────────────────────────────
+
+section("2d. Copy trader unwatch semantics")
+
+def test_copy_trader_unwatch_semantics():
+    import asyncio
+    import db
+    import server
+
+    address = "0xcopy-unwatch"
+    db.add_watched_wallet(address, "Copy Wallet")
+    trade_id = db.open_copy_trade(
+        address,
+        "Copy Wallet",
+        {
+            "conditionId": "copy-unwatch-condition",
+            "outcome": "Yes",
+            "curPrice": 0.61,
+            "title": "Will copy unwatch semantics hold?",
+            "asset": "copy-unwatch-token",
+        },
+        size_usd=20,
+    )
+    check("copy trade opened before unwatch", trade_id is not None and trade_id > 0, f"got {trade_id}")
+
+    before = next(
+        (t for t in db.get_trades(status="open", limit=50) if t["id"] == trade_id),
+        None,
+    )
+    check("copy trade initially linked to active wallet", before is not None and before.get("copy_wallet_active") == 1)
+
+    result = asyncio.run(server.remove_from_watchlist(address))
+    check("unwatch endpoint succeeds", result.get("ok") is True, detail=str(result))
+    check("unwatch endpoint keeps trade count", result.get("open_copy_trades_remaining") == 1, detail=str(result))
+    check("unwatch endpoint exposes close policy", "stay open" in (result.get("close_policy") or "").lower())
+
+    active_wallets = db.get_watched_wallets(active_only=True)
+    all_wallets = db.get_watched_wallets(active_only=False)
+    check("wallet removed from active watch set", not any(w["address"] == address for w in active_wallets))
+    stored_wallet = next((w for w in all_wallets if w["address"] == address), None)
+    check("wallet history preserved as inactive", stored_wallet is not None and stored_wallet.get("active") == 0)
+    check("manual unwatch reason persisted",
+          (stored_wallet or {}).get("auto_drop_reason", "").startswith("manual_unwatch:"))
+
+    open_trade = next(
+        (t for t in db.get_trades(status="open", limit=50) if t["id"] == trade_id),
+        None,
+    )
+    check("open copy trade remains in global trade list", open_trade is not None)
+    check("open copy trade now marked unwatched", open_trade is not None and open_trade.get("copy_wallet_active") == 0)
+
+    detached = asyncio.run(server.copy_detached_trades())
+    detached_trade = next((t for t in detached.get("trades", []) if t.get("trade_id") == trade_id), None)
+    check("detached copy-trade API returns unwatched trade", detached_trade is not None)
+    check("detached copy-trade API labels unwatched state",
+          detached_trade is not None and detached_trade.get("status_label") == "unwatched",
+          detail=str(detached_trade))
+
+run("copy_trader_unwatch_semantics", test_copy_trader_unwatch_semantics)
+
+
 # ── 3. Math Engine ──────────────────────────────────────────────────────────
 
 section("3. Math engine — EV, Kelly, slippage")
