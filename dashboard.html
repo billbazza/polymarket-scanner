@@ -623,6 +623,11 @@
     </div>
     <div id="copyLatest" style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:16px"></div>
     <div id="copyDetached" style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:16px"></div>
+    <div style="display:flex;gap:10px;align-items:center;margin:0 0 10px">
+      <div style="font-weight:600;font-size:13px">Recent Wallet Activity</div>
+      <span id="copyEventsSummary" style="color:var(--text2);font-size:12px">Loading…</span>
+    </div>
+    <div id="copyEvents" style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:16px"></div>
 
     <!-- Discover / Score new wallet -->
     <div style="background:var(--card);border:1px solid var(--border);border-radius:8px;padding:14px;margin-bottom:16px">
@@ -1885,6 +1890,9 @@ function walletScoreCard(w, showRemove) {
     droppedBadge = `<div style="color:var(--red);font-size:10px;font-weight:700;margin-top:4px">AUTO-DROPPED: ${esc(removeReason)}</div>`;
   }
   const openTrades = w.open_copy_trades || 0;
+  const lastChecked = w.last_checked_at ? fmt(w.last_checked_at) : 'never';
+  const lastEvent = w.last_event_reason || 'No wallet-monitor events yet';
+  const lastStatus = w.last_event_status || 'idle';
   return `<div style="background:var(--surface);border:1px solid ${isDropped ? 'var(--red)' : 'var(--border)'};border-radius:8px;padding:10px 14px;min-width:200px;opacity:${isDropped ? '0.65' : '1'}">
     <div style="display:flex;justify-content:space-between;align-items:flex-start">
       <div style="font-weight:600;font-size:13px">${esc(w.label)}</div>
@@ -1894,9 +1902,37 @@ function walletScoreCard(w, showRemove) {
     <div style="color:var(--text2);font-size:11px">${willCopy ? '✓ auto-copy' : '✗ no auto-copy'} · ${openTrades} open trades</div>
     <div style="color:var(--text2);font-size:11px;margin-top:4px">${b.trade_count||'?'} trades · avg ${fmtM(b.avg_size_usd||0)}</div>
     <div style="color:var(--text2);font-size:11px">${b.top_category||'?'} (${b.top_cat_pct||0}%)</div>
+    <div style="color:var(--text2);font-size:10px;margin-top:5px">Last poll ${esc(lastChecked)} · ${esc(lastStatus)}</div>
+    <div style="color:var(--text2);font-size:10px;margin-top:3px">${esc(lastEvent)}</div>
     ${w.ai_reasoning ? `<div style="color:var(--text2);font-size:10px;margin-top:5px;font-style:italic">${esc(w.ai_reasoning)}</div>` : ''}
     ${droppedBadge}
     ${removeBtn}
+  </div>`;
+}
+
+function walletEventStyle(status) {
+  if (status === 'mirrored') return { bg: 'var(--green)', text: '#000' };
+  if (status === 'blocked') return { bg: 'var(--amber)', text: '#000' };
+  if (status === 'ignored') return { bg: 'var(--text2)', text: '#fff' };
+  if (status === 'closed') return { bg: 'var(--sky)', text: '#000' };
+  if (status === 'fetch_failed' || status === 'error') return { bg: 'var(--red)', text: '#fff' };
+  if (status === 'baseline_skipped') return { bg: 'var(--purple)', text: '#fff' };
+  return { bg: 'var(--surface2)', text: 'var(--text1)' };
+}
+
+function walletEventCard(ev) {
+  const style = walletEventStyle(ev.status);
+  const label = ev.label || (ev.wallet ? `${ev.wallet.slice(0,8)}...` : 'Wallet');
+  const outcome = ev.outcome_name ? ` · ${esc(ev.outcome_name)}` : '';
+  const market = ev.market_title ? `<div class="event-name" title="${esc(ev.market_title)}" style="font-size:11px;margin-top:4px">${esc(ev.market_title)}</div>` : '';
+  return `<div style="border:1px solid var(--border);border-radius:8px;padding:8px 10px;background:var(--surface2);font-size:12px;min-width:240px;max-width:320px">
+    <div style="display:flex;justify-content:space-between;gap:8px;align-items:flex-start">
+      <strong>${esc(label)}</strong>
+      <span style="background:${style.bg};color:${style.text};border-radius:999px;padding:2px 8px;font-size:10px;font-weight:700;text-transform:uppercase">${esc(ev.status || 'event')}</span>
+    </div>
+    <div style="color:var(--text2);font-size:11px;margin-top:4px">${fmt(ev.timestamp)} · ${esc(ev.event_type || 'wallet_event')}${outcome}</div>
+    ${market}
+    <div style="color:var(--text2);font-size:10px;margin-top:4px">${esc(ev.reason || '')}</div>
   </div>`;
 }
 
@@ -2198,12 +2234,43 @@ async function loadDetachedCopyTrades() {
   }
 }
 
+async function loadCopyEvents() {
+  const eventsEl = getEl('copyEvents');
+  const summaryEl = getEl('copyEventsSummary');
+  if (!eventsEl || !summaryEl) return;
+  try {
+    const r = await fetch(API + '/api/copy/events?limit=12');
+    const payload = await r.json();
+    if (!r.ok || payload.available === false) {
+      throw new Error(payload.degraded_reason || 'Failed to load wallet activity');
+    }
+    const events = payload.events || [];
+    const counts = (payload.summary || {}).status_counts || {};
+    const summaryBits = Object.entries(counts)
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 4)
+      .map(([k, v]) => `${v} ${k}`)
+      .join(' · ');
+    summaryEl.textContent = summaryBits || 'No recent watched-wallet events';
+    if (!events.length) {
+      eventsEl.innerHTML = '<span style="color:var(--text2);font-size:12px">No recent watched-wallet events yet. First polls will appear here.</span>';
+      return;
+    }
+    eventsEl.innerHTML = events.map(walletEventCard).join('');
+  } catch (e) {
+    console.error('loadCopyEvents error', e);
+    summaryEl.textContent = 'Wallet activity unavailable';
+    eventsEl.innerHTML = '<span style="color:var(--text2);font-size:12px">Recent wallet activity unavailable.</span>';
+  }
+}
+
 async function loadCopy() {
   const latestEl = getEl('copyLatest');
   if (latestEl) {
     latestEl.textContent = 'Checking latest mirrored trades…';
   }
   loadCopyLatest();
+  loadCopyEvents();
   document.getElementById('copyInfo').textContent = 'Fetching wallet positions...';
   loadCopyScores();
   try {

@@ -73,6 +73,53 @@ def _update_running_status():
     )
 
 
+def _record_event(
+    *,
+    source: str,
+    wallet: str,
+    label: str,
+    event_type: str,
+    status: str,
+    reason_code: str | None = None,
+    reason: str | None = None,
+    condition_id: str | None = None,
+    outcome_name: str | None = None,
+    market_title: str | None = None,
+    price: float | None = None,
+    position_value_usd: float | None = None,
+    details: dict | None = None,
+    checked_at: float | None = None,
+    positions_count: int | None = None,
+) -> None:
+    recorder = getattr(db, "record_wallet_monitor_event", None)
+    if not callable(recorder):
+        return
+    try:
+        recorder(
+            source=source,
+            wallet=wallet,
+            label=label,
+            event_type=event_type,
+            status=status,
+            reason_code=reason_code,
+            reason=reason,
+            condition_id=condition_id,
+            outcome_name=outcome_name,
+            market_title=market_title,
+            price=price,
+            position_value_usd=position_value_usd,
+            details=details,
+            checked_at=checked_at,
+            positions_count=positions_count,
+        )
+    except Exception as exc:
+        log.warning("Monitor: wallet event log failed for %s: %s", label, exc)
+
+
+def _position_key(address: str, condition_id: str) -> tuple[str, str]:
+    return ((address or "").lower(), condition_id or "")
+
+
 # ── Scoring ────────────────────────────────────────────────────────────────────
 
 def score_wallet(address: str, label: str, activity_limit: int = 500) -> dict:
@@ -206,15 +253,31 @@ def _score_result(address, label, score, classification, breakdown, trades, posi
 
 def _check_wallet(address: str, label: str, will_copy: bool) -> tuple[int, int]:
     """Check a wallet for new/exited positions. Returns (opened, closed)."""
+    checked_at = time.time()
     try:
         positions = get_positions(address)
     except Exception as e:
         log.warning("Monitor: positions fetch failed for %s: %s", label, e)
+        _record_event(
+            source="wallet_monitor",
+            wallet=address,
+            label=label,
+            event_type="wallet_polled",
+            status="fetch_failed",
+            reason_code="positions_fetch_failed",
+            reason=f"Positions fetch failed: {e}",
+            checked_at=checked_at,
+        )
         return 0, 0
 
     current_cids = {p["conditionId"] for p in positions if p.get("conditionId")}
     prev_cids = _known_positions.get(address, None)
     _known_positions[address] = current_cids
+    db.update_watched_wallet_poll_status(
+        address,
+        checked_at=checked_at,
+        positions_count=len(current_cids),
+    )
 
     if prev_cids is None:
         # First time seeing this wallet — record state, don't trade.
@@ -224,8 +287,29 @@ def _check_wallet(address: str, label: str, will_copy: bool) -> tuple[int, int]:
             db.set_wallet_baseline(address, list(current_cids))
             log.info("Monitor: %s — baseline set: %d existing positions (skipped)",
                      label, len(current_cids))
+            _record_event(
+                source="wallet_monitor",
+                wallet=address,
+                label=label,
+                event_type="baseline_set",
+                status="baseline_skipped",
+                reason=f"Baseline set from {len(current_cids)} existing positions; only future positions will mirror.",
+                checked_at=checked_at,
+                positions_count=len(current_cids),
+                details={"baseline_positions": sorted(current_cids)},
+            )
         else:
             log.info("Monitor: %s — initial snapshot: %d positions", label, len(current_cids))
+            _record_event(
+                source="wallet_monitor",
+                wallet=address,
+                label=label,
+                event_type="wallet_polled",
+                status="initial_snapshot",
+                reason=f"Initial snapshot loaded with {len(current_cids)} live positions.",
+                checked_at=checked_at,
+                positions_count=len(current_cids),
+            )
         return 0, 0
 
     opened = 0
@@ -239,9 +323,11 @@ def _check_wallet(address: str, label: str, will_copy: bool) -> tuple[int, int]:
         if not pos:
             continue
         size = pos.get("currentValue", 0)
+        title = pos.get("title", "")
+        price = pos.get("curPrice", 0)
+        outcome = pos.get("outcome")
         log.info("Monitor: %s NEW position — %s %s @%.3f size=%s",
-                 label, pos.get("outcome"), pos.get("title", "")[:45],
-                 pos.get("curPrice", 0), f"${size:,.0f}")
+                 label, outcome, title[:45], price, f"${size:,.0f}")
 
         if will_copy:
             copy_settings = db.get_copy_trade_settings()
@@ -256,6 +342,22 @@ def _check_wallet(address: str, label: str, will_copy: bool) -> tuple[int, int]:
             )
             if not decision["ok"]:
                 log.info("Monitor: skipped %s — %s", label, decision["reason"])
+                _record_event(
+                    source="wallet_monitor",
+                    wallet=address,
+                    label=label,
+                    event_type="new_position",
+                    status="blocked",
+                    reason_code=decision["reason_code"],
+                    reason=decision["reason"],
+                    condition_id=cid,
+                    outcome_name=outcome,
+                    market_title=title,
+                    price=price,
+                    position_value_usd=size,
+                    checked_at=checked_at,
+                    positions_count=len(current_cids),
+                )
                 continue
             t_id = db.open_copy_trade(
                 address,
@@ -270,27 +372,116 @@ def _check_wallet(address: str, label: str, will_copy: bool) -> tuple[int, int]:
                 log.info("Monitor: AUTO-MIRRORED %s → trade #%d ($%.0f paper)",
                          label, t_id, COPY_SIZE_USD)
                 _status["new_trades_found"] += 1
+                _record_event(
+                    source="wallet_monitor",
+                    wallet=address,
+                    label=label,
+                    event_type="new_position",
+                    status="mirrored",
+                    reason_code="opened",
+                    reason=f"Paper copy trade opened as trade #{t_id}.",
+                    condition_id=cid,
+                    outcome_name=outcome,
+                    market_title=title,
+                    price=price,
+                    position_value_usd=size,
+                    checked_at=checked_at,
+                    positions_count=len(current_cids),
+                    details={"trade_id": t_id, "size_usd": COPY_SIZE_USD},
+                )
             else:
                 log.debug("Monitor: copy trade open failed after ready check for %s", cid[:16])
+                _record_event(
+                    source="wallet_monitor",
+                    wallet=address,
+                    label=label,
+                    event_type="new_position",
+                    status="error",
+                    reason_code="open_failed",
+                    reason="Copy trade could not be opened after ready check passed.",
+                    condition_id=cid,
+                    outcome_name=outcome,
+                    market_title=title,
+                    price=price,
+                    position_value_usd=size,
+                    checked_at=checked_at,
+                    positions_count=len(current_cids),
+                )
         else:
             log.info("Monitor: %s scored below copy threshold — not mirroring", label)
+            _record_event(
+                source="wallet_monitor",
+                wallet=address,
+                label=label,
+                event_type="new_position",
+                status="ignored",
+                reason_code="wallet_not_copyable",
+                reason="New position seen, but wallet is not currently enabled for auto-copy.",
+                condition_id=cid,
+                outcome_name=outcome,
+                market_title=title,
+                price=price,
+                position_value_usd=size,
+                checked_at=checked_at,
+                positions_count=len(current_cids),
+            )
 
     # Exited positions — close our mirrors
     open_copy = {
-        t["copy_condition_id"]: t
+        _position_key(t.get("copy_wallet"), t.get("copy_condition_id")): t
         for t in db.get_trades(status="open", limit=500)
         if t.get("trade_type") == "copy"
         and t.get("copy_wallet") == address
         and t.get("copy_condition_id")
     }
     for cid in prev_cids - current_cids:
-        if cid in open_copy:
-            trade = open_copy[cid]
+        trade = open_copy.get(_position_key(address, cid))
+        if trade:
             pnl = db.close_trade(trade["id"], exit_price_a=trade["entry_price_a"],
                                  notes=f"auto-close: {label} exited position")
             closed += 1
             log.info("Monitor: AUTO-CLOSED copy trade #%d (%s exited) pnl=$%.2f",
                      trade["id"], label, pnl or 0)
+            _record_event(
+                source="wallet_monitor",
+                wallet=address,
+                label=label,
+                event_type="position_closed",
+                status="closed",
+                reason_code="wallet_exited_position",
+                reason=f"Mirrored trade #{trade['id']} closed because watched wallet exited the position.",
+                condition_id=cid,
+                outcome_name=trade.get("copy_outcome"),
+                market_title=trade.get("event"),
+                position_value_usd=trade.get("size_usd"),
+                checked_at=checked_at,
+                positions_count=len(current_cids),
+                details={"trade_id": trade["id"], "pnl": pnl},
+            )
+
+    if not opened and not closed:
+        _record_event(
+            source="wallet_monitor",
+            wallet=address,
+            label=label,
+            event_type="wallet_polled",
+            status="no_change",
+            reason=f"Polled successfully: {len(current_cids)} live positions, no new copy-trading actions.",
+            checked_at=checked_at,
+            positions_count=len(current_cids),
+        )
+    else:
+        _record_event(
+            source="wallet_monitor",
+            wallet=address,
+            label=label,
+            event_type="wallet_polled",
+            status="changes_seen",
+            reason=f"Poll processed: {opened} mirrored, {closed} closed, {len(current_cids)} live positions.",
+            checked_at=checked_at,
+            positions_count=len(current_cids),
+            details={"opened": opened, "closed": closed},
+        )
 
     return opened, closed
 

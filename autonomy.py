@@ -192,6 +192,18 @@ def record_attempt(level, strategy, outcome, reason_code, reason, **kwargs):
     )
 
 
+def _record_wallet_event(**kwargs):
+    recorder = getattr(db, "record_wallet_monitor_event", None)
+    if not callable(recorder):
+        return False
+    try:
+        recorder(**kwargs)
+        return True
+    except Exception as exc:
+        log.warning("Wallet monitor event logging failed during autonomy cycle: %s", exc)
+        return False
+
+
 # --- Performance Metrics ---
 
 def get_performance(state):
@@ -886,15 +898,16 @@ def run_cycle(state):
             max_copy_total_open = copy_trade_settings["total_open_cap"] if copy_trade_settings["cap_enabled"] else None
             copy_opened = 0
             copy_closed = 0
+            now_ts = time.time()
 
-            # Build index of currently open copy trades: condition_id → trade
+            # Build index of currently open copy trades: (wallet, condition_id) → trade
             open_copy = {
-                t["copy_condition_id"]: t
+                ((t.get("copy_wallet") or "").lower(), t.get("copy_condition_id")): t
                 for t in db.get_trades(status="open", limit=None)
-                if t.get("trade_type") == "copy" and t.get("copy_condition_id")
+                if t.get("trade_type") == "copy" and t.get("copy_condition_id") and t.get("copy_wallet")
             }
-            # Track which condition_ids are still held by watched wallets this cycle
-            live_condition_ids = set()
+            # Track which (wallet, condition_id) tuples are still held this cycle
+            live_position_keys = set()
 
             for address, label in {r["address"]: r["label"] for r in db.get_watched_wallets(active_only=True)}.items():
                 try:
@@ -911,7 +924,23 @@ def run_cycle(state):
                         wallet=address,
                         phase=current_stage,
                     )
+                    _record_wallet_event(
+                        source="autonomy",
+                        wallet=address,
+                        label=label,
+                        event_type="wallet_polled",
+                        status="fetch_failed",
+                        reason_code="positions_fetch_failed",
+                        reason=f"Positions fetch failed during autonomy cycle: {e}",
+                        checked_at=now_ts,
+                    )
                     continue
+
+                db.update_watched_wallet_poll_status(
+                    address,
+                    checked_at=now_ts,
+                    positions_count=len([p for p in positions if p.get("conditionId")]),
+                )
 
                 # Forward-only: on first scan after adding a wallet, snapshot all
                 # existing positions as baseline and skip them. Only mirror NEW
@@ -927,21 +956,34 @@ def run_cycle(state):
                     for pos in positions:
                         cid = pos.get("conditionId", "")
                         if cid:
-                            live_condition_ids.add(cid)
+                            live_position_keys.add((address.lower(), cid))
+                    _record_wallet_event(
+                        source="autonomy",
+                        wallet=address,
+                        label=label,
+                        event_type="baseline_set",
+                        status="baseline_skipped",
+                        reason=f"Baseline set from {len(baseline_ids)} existing positions during autonomy cycle.",
+                        checked_at=now_ts,
+                        positions_count=len(baseline_ids),
+                        details={"baseline_positions": baseline_ids},
+                    )
                     continue
 
+                wallet_opened = 0
                 for pos in positions:
                     cid = pos.get("conditionId", "")
                     if not cid:
                         continue
-                    live_condition_ids.add(cid)
+                    live_position_keys.add((address.lower(), cid))
 
                     # Skip positions that existed before we started watching
                     if cid in baseline:
                         continue
 
                     # New position — not yet mirrored
-                    if cid not in open_copy:
+                    position_key = (address.lower(), cid)
+                    if position_key not in open_copy:
                         decision = db.inspect_copy_trade_open(
                             address,
                             pos,
@@ -962,6 +1004,22 @@ def run_cycle(state):
                                 condition_id=cid,
                                 size_usd=20,
                                 phase=current_stage,
+                            )
+                            _record_wallet_event(
+                                source="autonomy",
+                                wallet=address,
+                                label=label,
+                                event_type="new_position",
+                                status="blocked",
+                                reason_code=decision["reason_code"],
+                                reason=decision["reason"],
+                                condition_id=cid,
+                                outcome_name=pos.get("outcome"),
+                                market_title=pos.get("title"),
+                                price=pos.get("curPrice"),
+                                position_value_usd=pos.get("currentValue"),
+                                checked_at=now_ts,
+                                positions_count=len([p for p in positions if p.get("conditionId")]),
                             )
                             journal({
                                 "action": "skip_trade",
@@ -996,6 +1054,17 @@ def run_cycle(state):
                                 phase=current_stage,
                             )
                             copy_opened += 1
+                            wallet_opened += 1
+                            open_copy[position_key] = {
+                                "id": t_id,
+                                "copy_wallet": address,
+                                "copy_condition_id": cid,
+                                "copy_label": label,
+                                "copy_outcome": pos.get("outcome"),
+                                "entry_price_a": decision.get("entry_price"),
+                                "size_usd": 20,
+                                "event": pos.get("title"),
+                            }
                             journal({
                                 "action": "trade_opened",
                                 "level": level,
@@ -1006,12 +1075,53 @@ def run_cycle(state):
                                 "size_usd": 20,
                                 "reason": f"Copy {label} — {pos.get('outcome','')} @{pos.get('curPrice',0):.3f}",
                             })
+                            _record_wallet_event(
+                                source="autonomy",
+                                wallet=address,
+                                label=label,
+                                event_type="new_position",
+                                status="mirrored",
+                                reason_code="opened",
+                                reason=f"Paper copy trade opened as trade #{t_id} during autonomy cycle.",
+                                condition_id=cid,
+                                outcome_name=pos.get("outcome"),
+                                market_title=pos.get("title"),
+                                price=pos.get("curPrice"),
+                                position_value_usd=pos.get("currentValue"),
+                                checked_at=now_ts,
+                                positions_count=len([p for p in positions if p.get("conditionId")]),
+                                details={"trade_id": t_id, "size_usd": 20},
+                            )
                             log.info("Step 4e: Mirrored %s — %s %s @%.3f",
                                      label, pos.get("outcome"), pos.get("title","")[:40], pos.get("curPrice", 0))
 
+                if wallet_opened == 0:
+                    _record_wallet_event(
+                        source="autonomy",
+                        wallet=address,
+                        label=label,
+                        event_type="wallet_polled",
+                        status="no_change",
+                        reason=f"Autonomy poll saw {len([p for p in positions if p.get('conditionId')])} live positions and no new copy actions.",
+                        checked_at=now_ts,
+                        positions_count=len([p for p in positions if p.get("conditionId")]),
+                    )
+                else:
+                    _record_wallet_event(
+                        source="autonomy",
+                        wallet=address,
+                        label=label,
+                        event_type="wallet_polled",
+                        status="changes_seen",
+                        reason=f"Autonomy poll mirrored {wallet_opened} new position(s) from {len([p for p in positions if p.get('conditionId')])} live positions.",
+                        checked_at=now_ts,
+                        positions_count=len([p for p in positions if p.get("conditionId")]),
+                        details={"opened": wallet_opened},
+                    )
+
             # Watched wallet has exited a position — close our mirror
-            for cid, trade in open_copy.items():
-                if cid not in live_condition_ids:
+            for position_key, trade in open_copy.items():
+                if position_key not in live_position_keys:
                     # Use entry price as exit (neutral P&L) — market may have resolved
                     pnl = db.close_trade(trade["id"], exit_price_a=trade["entry_price_a"],
                                          notes="auto-close: watched wallet exited position")
@@ -1023,6 +1133,21 @@ def run_cycle(state):
                         "pnl": pnl,
                         "reason": f"Watched wallet {trade.get('copy_label','')} exited position",
                     })
+                    _record_wallet_event(
+                        source="autonomy",
+                        wallet=trade.get("copy_wallet"),
+                        label=trade.get("copy_label"),
+                        event_type="position_closed",
+                        status="closed",
+                        reason_code="wallet_exited_position",
+                        reason=f"Mirrored trade #{trade['id']} closed because watched wallet exited the position.",
+                        condition_id=trade.get("copy_condition_id"),
+                        outcome_name=trade.get("copy_outcome"),
+                        market_title=trade.get("event"),
+                        position_value_usd=trade.get("size_usd"),
+                        checked_at=now_ts,
+                        details={"trade_id": trade["id"], "pnl": pnl},
+                    )
                     log.info("Step 4e: Auto-closed copy trade %d (wallet exited) pnl=$%.2f",
                              trade["id"], pnl or 0)
 

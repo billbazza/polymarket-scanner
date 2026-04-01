@@ -414,7 +414,15 @@ def _migration_002_backfill_columns(conn):
     ]:
         _add_column_if_missing(conn, "trades", col, coltype)
 
-    for col, coltype in [("baseline_positions", "TEXT")]:
+    for col, coltype in [
+        ("baseline_positions", "TEXT"),
+        ("last_checked_at", "REAL"),
+        ("last_positions_count", "INTEGER"),
+        ("last_event_at", "REAL"),
+        ("last_event_type", "TEXT"),
+        ("last_event_status", "TEXT"),
+        ("last_event_reason", "TEXT"),
+    ]:
         _add_column_if_missing(conn, "watched_wallets", col, coltype)
 
     for col, coltype in [("analysis", "TEXT")]:
@@ -558,6 +566,33 @@ def _migration_009_paper_trade_attempts(conn):
     """)
 
 
+def _migration_010_wallet_monitor_events(conn):
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS wallet_monitor_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp REAL NOT NULL,
+            source TEXT NOT NULL,
+            wallet TEXT NOT NULL,
+            label TEXT,
+            event_type TEXT NOT NULL,
+            status TEXT NOT NULL,
+            reason_code TEXT,
+            reason TEXT,
+            condition_id TEXT,
+            outcome_name TEXT,
+            market_title TEXT,
+            price REAL,
+            position_value_usd REAL,
+            details_json TEXT
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_wallet_monitor_events_ts
+            ON wallet_monitor_events(timestamp DESC);
+        CREATE INDEX IF NOT EXISTS idx_wallet_monitor_events_wallet_ts
+            ON wallet_monitor_events(wallet, timestamp DESC);
+    """)
+
+
 _MIGRATIONS = [
     ("001_base_schema", _migration_001_base_schema),
     ("002_backfill_columns", _migration_002_backfill_columns),
@@ -568,6 +603,7 @@ _MIGRATIONS = [
     ("007_copy_no_entry_price_fix", _migration_007_copy_no_entry_price_fix),
     ("008_cointegration_trial_fields", _migration_008_cointegration_trial_fields),
     ("009_paper_trade_attempts", _migration_009_paper_trade_attempts),
+    ("010_wallet_monitor_events", _migration_010_wallet_monitor_events),
 ]
 
 
@@ -1053,6 +1089,166 @@ def record_paper_trade_attempt(
         return 0
     finally:
         conn.close()
+
+
+def update_watched_wallet_poll_status(
+    address: str,
+    *,
+    checked_at: float | None = None,
+    positions_count: int | None = None,
+) -> None:
+    conn = get_conn()
+    try:
+        conn.execute(
+            """
+            UPDATE watched_wallets
+            SET last_checked_at = COALESCE(?, last_checked_at),
+                last_positions_count = COALESCE(?, last_positions_count)
+            WHERE address = ?
+            """,
+            (
+                checked_at,
+                positions_count,
+                (address or "").lower(),
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def record_wallet_monitor_event(
+    *,
+    source: str,
+    wallet: str,
+    label: str | None,
+    event_type: str,
+    status: str,
+    reason_code: str | None = None,
+    reason: str | None = None,
+    condition_id: str | None = None,
+    outcome_name: str | None = None,
+    market_title: str | None = None,
+    price: float | None = None,
+    position_value_usd: float | None = None,
+    details: dict | None = None,
+    timestamp: float | None = None,
+    checked_at: float | None = None,
+    positions_count: int | None = None,
+) -> int:
+    wallet = (wallet or "").lower()
+    event_ts = timestamp or time.time()
+    conn = get_conn()
+    try:
+        if not _table_exists(conn, "wallet_monitor_events"):
+            log.warning("wallet_monitor_events table unavailable; skipping event log write")
+            return 0
+
+        conn.execute(
+            """
+            INSERT INTO wallet_monitor_events (
+                timestamp, source, wallet, label, event_type, status,
+                reason_code, reason, condition_id, outcome_name, market_title,
+                price, position_value_usd, details_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                event_ts,
+                source,
+                wallet,
+                label,
+                event_type,
+                status,
+                reason_code,
+                _sanitize_operator_reason(reason, fallback="Wallet monitor event recorded."),
+                condition_id,
+                outcome_name,
+                market_title,
+                price,
+                position_value_usd,
+                json.dumps(details) if details else None,
+            ),
+        )
+        row_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+        conn.execute(
+            """
+            UPDATE watched_wallets
+            SET last_event_at = ?,
+                last_event_type = ?,
+                last_event_status = ?,
+                last_event_reason = ?,
+                last_checked_at = COALESCE(?, last_checked_at),
+                last_positions_count = COALESCE(?, last_positions_count)
+            WHERE address = ?
+            """,
+            (
+                event_ts,
+                event_type,
+                status,
+                _sanitize_operator_reason(reason, fallback="Wallet monitor event recorded."),
+                checked_at,
+                positions_count,
+                wallet,
+            ),
+        )
+        conn.commit()
+        return int(row_id)
+    except sqlite3.Error as exc:
+        log.warning("Failed to record wallet monitor event: %s", exc)
+        return 0
+    finally:
+        conn.close()
+
+
+def get_wallet_monitor_events(limit: int = 50, wallet: str | None = None) -> list[dict]:
+    limit = _normalize_query_limit(limit, "get_wallet_monitor_events")
+    conn = get_conn()
+    try:
+        if not _table_exists(conn, "wallet_monitor_events"):
+            return []
+        params: list = []
+        query = """
+            SELECT *
+            FROM wallet_monitor_events
+        """
+        if wallet:
+            query += " WHERE wallet = ?"
+            params.append(wallet.lower())
+        query += " ORDER BY timestamp DESC, id DESC"
+        if limit is not None:
+            query += " LIMIT ?"
+            params.append(limit)
+        rows = conn.execute(query, params).fetchall()
+        out = []
+        for row in rows:
+            item = dict(row)
+            if item.get("details_json"):
+                try:
+                    item["details"] = json.loads(item["details_json"])
+                except Exception:
+                    item["details"] = None
+            else:
+                item["details"] = None
+            out.append(item)
+        return out
+    except sqlite3.Error as exc:
+        log.warning("Failed to query wallet monitor events: %s", exc)
+        return []
+    finally:
+        conn.close()
+
+
+def get_wallet_monitor_event_summary(limit: int = 50, wallet: str | None = None) -> dict:
+    events = get_wallet_monitor_events(limit=limit, wallet=wallet)
+    counts = {}
+    for item in events:
+        key = item.get("status") or "unknown"
+        counts[key] = counts.get(key, 0) + 1
+    return {
+        "available": True,
+        "recent_count": len(events),
+        "status_counts": counts,
+    }
 
 
 def get_paper_trade_attempts(limit: int = 50) -> list[dict]:

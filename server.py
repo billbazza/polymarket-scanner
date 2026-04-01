@@ -1073,6 +1073,25 @@ async def copy_latest_trades(limit: int = 5):
     return {"trades": db.get_latest_copy_trades(limit)}
 
 
+@app.get("/api/copy/events")
+async def copy_wallet_events(limit: int = 40, wallet: str | None = None):
+    getter = getattr(db, "get_wallet_monitor_events", None)
+    summary_getter = getattr(db, "get_wallet_monitor_event_summary", None)
+    if not callable(getter) or not callable(summary_getter):
+        return {
+            "available": False,
+            "degraded_reason": "wallet_monitor_event_api_missing",
+            "events": [],
+            "summary": {"available": False, "recent_count": 0, "status_counts": {}},
+        }
+    return {
+        "available": True,
+        "degraded_reason": None,
+        "events": getter(limit=limit, wallet=wallet),
+        "summary": summary_getter(limit=limit, wallet=wallet),
+    }
+
+
 # --- Trades ---
 
 @app.get("/api/trades")
@@ -1411,22 +1430,28 @@ async def copy_positions():
     """Return current open positions for all active watched wallets, annotated with mirror status."""
     import copy_scanner
     mirrored = {
-        t["copy_condition_id"]
+        ((t.get("copy_wallet") or "").lower(), t.get("copy_condition_id"))
         for t in db.get_trades(status="open", limit=500)
-        if t.get("trade_type") == "copy" and t.get("copy_condition_id")
+        if t.get("trade_type") == "copy" and t.get("copy_condition_id") and t.get("copy_wallet")
     }
     out = []
     for row in db.get_watched_wallets(active_only=True):
         address, label = row["address"], row["label"]
         positions = copy_scanner.get_positions(address)
         for p in positions:
-            p["mirrored"] = p.get("conditionId", "") in mirrored
+            p["mirrored"] = ((address or "").lower(), p.get("conditionId", "")) in mirrored
         value = copy_scanner.get_portfolio_value(address)
         out.append({
             "address": address,
             "label": label,
             "portfolio_usd": value,
             "positions": positions,
+            "last_checked_at": row.get("last_checked_at"),
+            "last_positions_count": row.get("last_positions_count"),
+            "last_event_at": row.get("last_event_at"),
+            "last_event_type": row.get("last_event_type"),
+            "last_event_status": row.get("last_event_status"),
+            "last_event_reason": row.get("last_event_reason"),
         })
     return out
 
@@ -1661,6 +1686,19 @@ async def add_to_watchlist(
     row_id = db.add_watched_wallet(address, label)
     if ai_verdict:
         db.update_wallet_ai(address, ai_verdict, ai_reasoning or "", [])
+    record_wallet_event = getattr(db, "record_wallet_monitor_event", None)
+    if callable(record_wallet_event):
+        try:
+            record_wallet_event(
+                source="server",
+                wallet=address,
+                label=label,
+                event_type="watch_added",
+                status="watching",
+                reason="Wallet added to watch list. First poll will set a baseline from current positions; only later positions can auto-mirror.",
+            )
+        except Exception as exc:
+            log.warning("Watch-add event logging failed for %s: %s", address, exc)
     # Kick off a background score if not yet scored
     import threading, wallet_monitor
     def _bg_score():
