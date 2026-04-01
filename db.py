@@ -924,6 +924,106 @@ def count_open_trades() -> int:
     return int(row[0] if row else 0)
 
 
+def inspect_weather_trade_open(weather_signal_id, size_usd=100, max_total_open=None, conn=None):
+    """Return a structured weather-trade open decision.
+
+    This centralizes duplicate suppression, paper cash checks, and optional
+    total-open gating so autonomy, API endpoints, and the dashboard can all
+    surface the same blocking reason.
+    """
+    owns_conn = conn is None
+    conn = conn or get_conn()
+    try:
+        sig = conn.execute(
+            "SELECT * FROM weather_signals WHERE id=?", (weather_signal_id,)
+        ).fetchone()
+        if not sig:
+            return {
+                "ok": False,
+                "reason_code": "signal_not_found",
+                "reason": f"Weather signal {weather_signal_id} not found.",
+            }
+
+        action = sig["action"]
+        entry_token = sig["yes_token"] if action == "BUY_YES" else sig["no_token"]
+        existing_signal_trade = conn.execute(
+            "SELECT id FROM trades WHERE weather_signal_id=? AND status='open'",
+            (weather_signal_id,),
+        ).fetchone()
+        if existing_signal_trade:
+            trade_id = int(existing_signal_trade["id"])
+            return {
+                "ok": False,
+                "reason_code": "signal_already_open",
+                "reason": f"Weather signal {weather_signal_id} is already open as trade #{trade_id}.",
+                "existing_trade_id": trade_id,
+                "entry_token": entry_token,
+            }
+
+        existing_token_trade = None
+        if entry_token:
+            existing_token_trade = conn.execute(
+                """
+                SELECT id, weather_signal_id
+                FROM trades
+                WHERE trade_type='weather' AND token_id_a=? AND status='open'
+                ORDER BY opened_at DESC, id DESC
+                LIMIT 1
+                """,
+                (entry_token,),
+            ).fetchone()
+        if existing_token_trade:
+            trade_id = int(existing_token_trade["id"])
+            other_signal_id = existing_token_trade["weather_signal_id"]
+            detail = f" via signal {other_signal_id}" if other_signal_id else ""
+            return {
+                "ok": False,
+                "reason_code": "token_already_open",
+                "reason": f"Already have an open weather trade on this token as trade #{trade_id}{detail}.",
+                "existing_trade_id": trade_id,
+                "existing_signal_id": other_signal_id,
+                "entry_token": entry_token,
+            }
+
+        if max_total_open is not None and count_open_trades() >= max_total_open:
+            return {
+                "ok": False,
+                "reason_code": "max_open_reached",
+                "reason": f"At max open trades ({count_open_trades()}/{max_total_open}).",
+                "entry_token": entry_token,
+            }
+
+        account_check = can_open_paper_trade(size_usd)
+        if not account_check["ok"]:
+            return {
+                "ok": False,
+                "reason_code": "insufficient_cash",
+                "reason": (
+                    f"Insufficient paper cash: ${account_check['available_cash']:.2f} available, "
+                    f"${account_check['requested_size_usd']:.2f} requested."
+                ),
+                "entry_token": entry_token,
+                "account": account_check["account"],
+                "available_cash": account_check["available_cash"],
+                "requested_size_usd": account_check["requested_size_usd"],
+            }
+
+        entry_price = sig["market_price"] if action == "BUY_YES" else round(1.0 - (sig["market_price"] or 0), 4)
+        return {
+            "ok": True,
+            "reason_code": "ready",
+            "reason": "Ready to open weather trade.",
+            "signal": dict(sig),
+            "entry_token": entry_token,
+            "entry_price": entry_price,
+            "action": action,
+            "requested_size_usd": round(float(size_usd), 2),
+        }
+    finally:
+        if owns_conn:
+            conn.close()
+
+
 def open_copy_trade(
     wallet: str,
     label: str,
@@ -992,39 +1092,19 @@ def open_weather_trade(weather_signal_id, size_usd=100):
     DB-level guard: returns None if an open trade already exists for this signal.
     """
     conn = get_conn()
-    sig = conn.execute(
-        "SELECT * FROM weather_signals WHERE id=?", (weather_signal_id,)
-    ).fetchone()
-    if not sig:
-        conn.close()
-        return None
-
-    existing = conn.execute(
-        "SELECT id FROM trades WHERE weather_signal_id=? AND status='open'",
-        (weather_signal_id,)
-    ).fetchone()
-    if existing:
-        conn.close()
-        return None
-
-    account_check = can_open_paper_trade(size_usd)
-    if not account_check["ok"]:
-        log.warning(
-            "Paper weather trade blocked for signal %s: need $%.2f cash, have $%.2f",
+    decision = inspect_weather_trade_open(weather_signal_id, size_usd=size_usd, conn=conn)
+    if not decision["ok"]:
+        log.info(
+            "Paper weather trade blocked for signal %s: %s",
             weather_signal_id,
-            float(size_usd),
-            account_check["available_cash"],
+            decision["reason"],
         )
         conn.close()
         return None
 
-    action = sig["action"]  # BUY_YES or BUY_NO
-    if action == "BUY_YES":
-        token = sig["yes_token"]
-        entry_price = sig["market_price"]
-    else:
-        token = sig["no_token"]
-        entry_price = round(1.0 - (sig["market_price"] or 0), 4)
+    action = decision["action"]
+    token = decision["entry_token"]
+    entry_price = decision["entry_price"]
 
     conn.execute("""
         INSERT INTO trades (signal_id, weather_signal_id, trade_type, opened_at,
@@ -1116,10 +1196,19 @@ _TRADES_SELECT = """
 
 def get_trades(status=None, limit=50):
     conn = get_conn()
-    if status:
+    if status and limit is None:
+        rows = conn.execute(
+            _TRADES_SELECT + " WHERE t.status=? ORDER BY t.opened_at DESC",
+            (status,),
+        ).fetchall()
+    elif status:
         rows = conn.execute(
             _TRADES_SELECT + " WHERE t.status=? ORDER BY t.opened_at DESC LIMIT ?",
             (status, limit),
+        ).fetchall()
+    elif limit is None:
+        rows = conn.execute(
+            _TRADES_SELECT + " ORDER BY t.opened_at DESC"
         ).fetchall()
     else:
         rows = conn.execute(
@@ -1202,7 +1291,7 @@ def save_weather_signal(opp):
 def get_weather_signals(limit=50, tradeable_only=False):
     """Fetch recent weather-edge opportunities, annotated with open trade id if one exists."""
     base = """
-        SELECT ws.*, t.id AS open_trade_id
+        SELECT ws.*, t.id AS exact_open_trade_id
         FROM weather_signals ws
         LEFT JOIN trades t ON t.weather_signal_id = ws.id AND t.status = 'open'
     """
@@ -1215,8 +1304,21 @@ def get_weather_signals(limit=50, tradeable_only=False):
         rows = conn.execute(
             base + " ORDER BY ws.timestamp DESC LIMIT ?", (limit,)
         ).fetchall()
-    conn.close()
-    return [dict(r) for r in rows]
+    results = []
+    try:
+        for row in rows:
+            item = dict(row)
+            decision = inspect_weather_trade_open(item["id"], size_usd=20, conn=conn)
+            item["open_trade_id"] = decision.get("existing_trade_id") or item.get("exact_open_trade_id")
+            item["can_open_trade"] = bool(item.get("tradeable")) and decision["ok"]
+            item["blocking_reason"] = None if decision["ok"] else decision.get("reason")
+            item["blocking_reason_code"] = None if decision["ok"] else decision.get("reason_code")
+            item["entry_token"] = decision.get("entry_token")
+            item.pop("exact_open_trade_id", None)
+            results.append(item)
+    finally:
+        conn.close()
+    return results
 
 
 def get_weather_signal_by_id(signal_id):

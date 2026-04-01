@@ -1067,8 +1067,10 @@ async function loadWeather() {
         tradeBtn = '<span style="color:var(--green);font-size:11px;font-weight:600">● open</span>';
       } else if (row.status === 'traded') {
         tradeBtn = '<span style="color:var(--text2);font-size:11px">closed</span>';
-      } else if (row.tradeable) {
+      } else if (row.can_open_trade) {
         tradeBtn = `<button class="btn sm sky" onclick="openWeatherTrade(${row.id}, this)" style="margin-left:6px">Trade</button>`;
+      } else if (row.tradeable && row.blocking_reason) {
+        tradeBtn = `<span style="color:var(--amber);font-size:11px" title="${esc(row.blocking_reason)}">${esc(row.blocking_reason)}</span>`;
       } else {
         tradeBtn = '';
       }
@@ -1094,7 +1096,7 @@ async function loadWeather() {
 
 async function loadTrades() {
   try {
-    const r = await fetch(API + '/api/trades?status=open');
+    const r = await fetch(API + '/api/trades?status=open&limit=500');
     const trades = await r.json();
     const body = document.getElementById('tradesBody');
     if (!trades.length) {

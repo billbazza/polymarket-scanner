@@ -22,7 +22,7 @@ def refresh_open_trades():
     Returns:
         list of dicts with trade_id, current prices, and unrealized P&L.
     """
-    trades = db.get_trades(status="open")
+    trades = db.get_trades(status="open", limit=None)
     if not trades:
         log.debug("No open trades to refresh")
         return []
@@ -350,7 +350,7 @@ def auto_close_trades(z_threshold=0.5):
     Returns:
         list of dicts with closed trade info and realized P&L.
     """
-    trades = db.get_trades(status="open")
+    trades = db.get_trades(status="open", limit=None)
     if not trades:
         log.debug("No open trades to check for auto-close")
         return []

@@ -725,7 +725,7 @@ def test_autonomy():
 
     levels = autonomy.LEVELS
     check("paper level exists", "paper" in levels)
-    check("paper max_open = 100", levels["paper"]["max_open"] == 100,
+    check("paper max_open disabled", levels["paper"]["max_open"] is None,
           f"got {levels['paper']['max_open']}")
     check("scout cannot trade", not levels["scout"]["can_trade"])
     check("paper can trade", levels["paper"]["can_trade"])
@@ -1065,6 +1065,96 @@ def test_weather_trade_awaits_resolution_when_unpriceable():
 
 run("copy_trade_resolves_via_gamma_fallback", test_copy_trade_resolves_via_gamma_fallback)
 run("weather_trade_awaits_resolution_when_unpriceable", test_weather_trade_awaits_resolution_when_unpriceable)
+
+
+section("13. Weather duplicates and open-trade counting")
+
+def test_weather_signal_block_reason_for_duplicate_token():
+    import db
+
+    opp = {
+        "market": "Will Dallas reach 84°F on April 2?",
+        "market_id": "mkt_weather_duplicate",
+        "event": "Highest temperature in Dallas on April 2?",
+        "city": "dallas",
+        "lat": 32.77,
+        "lon": -96.79,
+        "target_date": "2026-04-02",
+        "threshold_f": 84,
+        "direction": "above",
+        "yes_token": "tok_weather_dup_yes",
+        "no_token": "tok_weather_dup_no",
+        "market_price": 0.34,
+        "noaa_prob": 0.21,
+        "noaa_forecast_f": 80.0,
+        "noaa_sigma_f": 3.5,
+        "om_prob": 0.12,
+        "om_forecast_f": 79.0,
+        "combined_prob": 0.165,
+        "combined_edge": -0.175,
+        "combined_edge_pct": -17.5,
+        "sources_agree": True,
+        "sources_available": 2,
+        "hours_ahead": 24,
+        "ev_pct": 11.0,
+        "kelly_fraction": 0.07,
+        "action": "BUY_NO",
+        "tradeable": True,
+        "liquidity": 1500,
+    }
+
+    first_id = db.save_weather_signal(opp)
+    trade_id = db.open_weather_trade(first_id, size_usd=20)
+    check("first duplicate weather trade opened", trade_id is not None and trade_id > 0, f"got {trade_id}")
+
+    second_id = db.save_weather_signal({**opp, "market_id": "mkt_weather_duplicate_2"})
+    decision = db.inspect_weather_trade_open(second_id, size_usd=20)
+    check("duplicate weather signal blocked", decision["ok"] is False)
+    check("duplicate block reason code", decision.get("reason_code") == "token_already_open",
+          f"got {decision.get('reason_code')}")
+    check("duplicate block references open trade", decision.get("existing_trade_id") == trade_id,
+          f"got {decision.get('existing_trade_id')}")
+
+    rows = db.get_weather_signals(limit=10, tradeable_only=True)
+    duplicate_row = next((row for row in rows if row["id"] == second_id), None)
+    check("duplicate weather row returned", duplicate_row is not None)
+    if duplicate_row:
+        check("duplicate weather row shows open trade", duplicate_row.get("open_trade_id") == trade_id,
+              f"got {duplicate_row.get('open_trade_id')}")
+        check("duplicate weather row cannot open", duplicate_row.get("can_open_trade") is False,
+              f"got {duplicate_row.get('can_open_trade')}")
+        check("duplicate weather row exposes blocking reason",
+              "Already have an open weather trade" in (duplicate_row.get("blocking_reason") or ""),
+              f"got {duplicate_row.get('blocking_reason')}")
+
+
+def test_get_trades_without_limit_returns_all_open_rows():
+    import db
+
+    conn = db.get_conn()
+    now = time.time()
+    try:
+        for i in range(55):
+            conn.execute(
+                """
+                INSERT INTO trades (trade_type, opened_at, side_a, side_b,
+                    entry_price_a, entry_price_b, token_id_a, size_usd, status, notes)
+                VALUES ('copy', ?, 'BUY_YES', '', 0.5, 0, ?, 1, 'open', 'limit test')
+                """,
+                (now + i, f"tok-limit-{i}"),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+    total_open = db.count_open_trades()
+    open_rows = db.get_trades(status="open", limit=None)
+    check("get_trades(limit=None) returns every open trade", len(open_rows) == total_open,
+          f"got {len(open_rows)} rows vs count {total_open}")
+
+
+run("weather_signal_block_reason_for_duplicate_token", test_weather_signal_block_reason_for_duplicate_token)
+run("get_trades_without_limit_returns_all_open_rows", test_get_trades_without_limit_returns_all_open_rows)
 
 
 # ── Summary ─────────────────────────────────────────────────────────────────

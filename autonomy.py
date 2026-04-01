@@ -64,7 +64,7 @@ LEVELS = {
         "description": "Auto paper-trade A+ signals",
         "can_trade": True,
         "size_usd": 20,
-        "max_open": 25,
+        "max_open": None,
         "graduation": {
             "min_trades": 50,
             "min_win_rate": 55.0,
@@ -324,11 +324,11 @@ def run_cycle(state):
         save_state(state)
         return state
 
-    open_trades = db.get_trades(status="open")
+    open_trades = db.get_trades(status="open", limit=None)
     open_count = len(open_trades)
     max_open = config["max_open"]
 
-    if open_count >= max_open:
+    if max_open is not None and open_count >= max_open:
         log.info("Step 4: At max positions (%d/%d), skipping new trades",
                  open_count, max_open)
         journal({"action": "skip_trade", "level": level,
@@ -343,7 +343,7 @@ def run_cycle(state):
     else:
         size_usd = config["size_usd"]
 
-    slots = max_open - open_count
+    slots = (max_open - open_count) if max_open is not None else len(tradeable)
     traded = 0
 
     # Build dedup sets from currently open trades — keyed by signal_id and event name
@@ -457,24 +457,36 @@ def run_cycle(state):
     log.info("Step 4: Opened %d new trades", traded)
 
     # Step 4b: Open weather trades (if slots remain)
-    open_trades = db.get_trades(status="open")
+    open_trades = db.get_trades(status="open", limit=None)
     open_count = len(open_trades)
-    slots_remaining = max_open - open_count
+    slots_remaining = (max_open - open_count) if max_open is not None else None
 
-    if slots_remaining > 0:
+    if slots_remaining is None or slots_remaining > 0:
         try:
             import weather_scanner
             weather_opps, _ = weather_scanner.scan(min_edge=0.06, verbose=False)
             tradeable_weather = [o for o in weather_opps if o.get("tradeable")]
             weather_traded = 0
-            for w_opp in tradeable_weather[:slots_remaining]:
+            candidates = tradeable_weather if slots_remaining is None else tradeable_weather[:slots_remaining]
+            for w_opp in candidates:
                 try:
-                    # Dedup: skip if we already have an open trade on this token
-                    entry_token = w_opp.get("yes_token") if w_opp.get("action") == "BUY_YES" else w_opp.get("no_token")
-                    if entry_token and db.has_open_weather_trade(entry_token):
-                        continue
                     w_id = db.save_weather_signal(w_opp)
-                    t_id = db.open_weather_trade(w_id, size_usd=size_usd if level != "book" else 20)
+                    trade_size = size_usd if level != "book" else 20
+                    decision = db.inspect_weather_trade_open(
+                        w_id,
+                        size_usd=trade_size,
+                        max_total_open=max_open,
+                    )
+                    if not decision["ok"]:
+                        journal({
+                            "action": "skip_trade",
+                            "level": level,
+                            "trade_type": "weather",
+                            "event": w_opp.get("event", w_opp.get("market", ""))[:60],
+                            "reason": decision["reason"],
+                        })
+                        continue
+                    t_id = db.open_weather_trade(w_id, size_usd=trade_size)
                     if t_id:
                         weather_traded += 1
                         journal({
@@ -485,7 +497,7 @@ def run_cycle(state):
                             "signal_id": w_id,
                             "trade_type": "weather",
                             "event": w_opp.get("event", w_opp.get("market", ""))[:60],
-                            "size_usd": size_usd if level != "book" else 20,
+                            "size_usd": trade_size,
                             "reason": f"Weather edge {w_opp.get('combined_edge_pct', 0):+.1f}%",
                         })
                 except Exception as e:
@@ -560,7 +572,7 @@ def run_cycle(state):
         # Build index of currently open copy trades: condition_id → trade
         open_copy = {
             t["copy_condition_id"]: t
-            for t in db.get_trades(status="open", limit=500)
+            for t in db.get_trades(status="open", limit=None)
             if t.get("trade_type") == "copy" and t.get("copy_condition_id")
         }
         # Track which condition_ids are still held by watched wallets this cycle
@@ -730,7 +742,7 @@ def print_status(state):
   Level:        {config['name']} ({level})
   Description:  {config['description']}
   Trade Size:   {'$' + str(config['size_usd']) if config.get('size_usd') else 'Kelly-sized'}
-  Max Open:     {config.get('max_open', 'N/A')}
+  Max Open:     {config.get('max_open') if config.get('max_open') is not None else 'No hard cap (cash-limited)'}
 
   PERFORMANCE AT THIS LEVEL
   ─────────────────────────
@@ -829,7 +841,8 @@ def promote(state):
 
     print(f"\nPromoted to {next_config['name']}!")
     print(f"Trade size: ${next_config.get('size_usd', 'Kelly-sized')}")
-    print(f"Max open positions: {next_config['max_open']}")
+    next_max_open = next_config['max_open'] if next_config.get('max_open') is not None else 'No hard cap (cash-limited)'
+    print(f"Max open positions: {next_max_open}")
     return state
 
 

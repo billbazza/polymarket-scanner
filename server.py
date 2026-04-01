@@ -1024,16 +1024,15 @@ async def close_trade(trade_id: int, exit_price_a: float, exit_price_b: float = 
 @app.post("/api/weather/{signal_id}/trade")
 async def open_weather_trade(signal_id: int, size_usd: float = 20):
     """Open a paper trade from a weather signal."""
-    balance_check = db.can_open_paper_trade(size_usd)
-    if not balance_check["ok"]:
-        raise HTTPException(
-            400,
-            f"Insufficient paper cash: ${balance_check['available_cash']:.2f} available, "
-            f"${balance_check['requested_size_usd']:.2f} requested",
-        )
+    decision = db.inspect_weather_trade_open(signal_id, size_usd=size_usd)
+    if not decision["ok"]:
+        status_code = 404 if decision["reason_code"] == "signal_not_found" else 409
+        if decision["reason_code"] == "insufficient_cash":
+            status_code = 400
+        raise HTTPException(status_code, decision["reason"])
     trade_id = db.open_weather_trade(signal_id, size_usd=size_usd)
     if not trade_id:
-        raise HTTPException(404, "Weather signal not found or already traded")
+        raise HTTPException(409, "Weather trade could not be opened.")
     return {
         "trade_id": trade_id,
         "signal_id": signal_id,
