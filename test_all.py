@@ -833,6 +833,140 @@ def test_weather_trade_lifecycle():
 run("weather_trade_lifecycle", test_weather_trade_lifecycle)
 
 
+section("12. Single-leg tracker fallback on midpoint 404")
+
+def _http_404(*_args, **_kwargs):
+    import requests
+
+    resp = requests.Response()
+    resp.status_code = 404
+    resp.url = "https://clob.polymarket.com/midpoint"
+    raise requests.HTTPError("404 Client Error", response=resp)
+
+
+def test_copy_trade_resolves_via_gamma_fallback():
+    import db
+    import tracker
+
+    position = {
+        "conditionId": "cond-copy-404",
+        "outcome": "No",
+        "curPrice": 0.80,
+        "asset": "tok_copy_no_404",
+    }
+    trade_id = db.open_copy_trade("0xcopy", "copy wallet", position, size_usd=20)
+    check("copy trade opened", trade_id is not None and trade_id > 0, f"got {trade_id}")
+
+    gamma_market = {
+        "conditionId": "cond-copy-404",
+        "closed": True,
+        "acceptingOrders": False,
+        "umaResolutionStatus": "resolved",
+        "clobTokenIds": '["tok_copy_yes_404", "tok_copy_no_404"]',
+        "outcomePrices": '["0", "1"]',
+    }
+
+    with patch("api.get_midpoint", side_effect=_http_404), \
+         patch("api.get_market", return_value=gamma_market):
+        updates = tracker.refresh_open_trades()
+        closed = tracker.auto_close_trades()
+
+    copy_updates = [u for u in updates if u.get("trade_id") == trade_id]
+    check("copy trade refresh uses Gamma fallback", len(copy_updates) == 1,
+          f"got {len(copy_updates)} updates")
+    if copy_updates:
+        check("copy trade refresh source=gamma", copy_updates[0].get("price_source") == "gamma",
+              f"got {copy_updates[0].get('price_source')}")
+        check("copy trade refresh price=1.0", abs(copy_updates[0].get("current_price_a", 0) - 1.0) < 0.001,
+              f"got {copy_updates[0].get('current_price_a')}")
+
+    copy_closed = [c for c in closed if c.get("trade_id") == trade_id]
+    check("copy trade auto-closed from Gamma resolved price", len(copy_closed) == 1,
+          f"got {len(copy_closed)} closed")
+    if copy_closed:
+        check("copy trade closed at 1.0", abs(copy_closed[0].get("exit_price_a", 0) - 1.0) < 0.001,
+              f"got {copy_closed[0].get('exit_price_a')}")
+
+    trade = db.get_trade(trade_id)
+    check("copy trade status closed after Gamma fallback",
+          trade and trade["status"] == "closed",
+          f"got {trade.get('status') if trade else None}")
+
+
+def test_weather_trade_awaits_resolution_when_unpriceable():
+    import db
+    import tracker
+
+    target = (date.today() - timedelta(days=1)).isoformat()
+    opp = {
+        "market": "Will NYC exceed 75°F yesterday?",
+        "market_id": "mkt_weather_404_pending",
+        "event": "NYC temperature pending settlement",
+        "city": "new york city",
+        "lat": 40.71,
+        "lon": -74.01,
+        "target_date": target,
+        "threshold_f": 75,
+        "direction": "above",
+        "yes_token": "tok_weather_yes_pending",
+        "no_token": "tok_weather_no_pending",
+        "market_price": 0.40,
+        "noaa_prob": 0.55,
+        "noaa_forecast_f": 77.0,
+        "noaa_sigma_f": 5.0,
+        "om_prob": 0.57,
+        "om_forecast_f": 78.0,
+        "combined_prob": 0.56,
+        "combined_edge": 0.16,
+        "combined_edge_pct": 16.0,
+        "sources_agree": True,
+        "sources_available": 2,
+        "hours_ahead": 24,
+        "ev_pct": 14.0,
+        "kelly_fraction": 0.08,
+        "action": "BUY_NO",
+        "tradeable": True,
+        "liquidity": 1500,
+    }
+
+    sig_id = db.save_weather_signal(opp)
+    trade_id = db.open_weather_trade(sig_id, size_usd=20)
+    check("pending weather trade opened", trade_id is not None and trade_id > 0, f"got {trade_id}")
+
+    gamma_market = {
+        "id": "mkt_weather_404_pending",
+        "closed": False,
+        "acceptingOrders": False,
+        "umaResolutionStatus": None,
+        "clobTokenIds": '["tok_weather_yes_pending", "tok_weather_no_pending"]',
+        "outcomePrices": '["0", "0"]',
+    }
+
+    with patch("api.get_midpoint", side_effect=_http_404), \
+         patch("api.get_market", return_value=gamma_market):
+        updates = tracker.refresh_open_trades()
+        closed = tracker.auto_close_trades()
+
+    pending_updates = [u for u in updates if u.get("trade_id") == trade_id]
+    check("pending weather trade omitted from refresh when unpriceable", len(pending_updates) == 0,
+          f"got {len(pending_updates)} updates")
+    pending_closed = [c for c in closed if c.get("trade_id") == trade_id]
+    check("pending weather trade stays open", len(pending_closed) == 0,
+          f"got {len(pending_closed)} closed")
+
+    trade = db.get_trade(trade_id)
+    check("pending weather trade still open in DB",
+          trade and trade["status"] == "open",
+          f"got {trade.get('status') if trade else None}")
+    check("pending weather trade note recorded",
+          trade and "awaiting final resolution" in (trade.get("notes") or ""),
+          f"got {trade.get('notes') if trade else None}")
+
+
+run("copy_trade_resolves_via_gamma_fallback", test_copy_trade_resolves_via_gamma_fallback)
+run("weather_trade_awaits_resolution_when_unpriceable", test_weather_trade_awaits_resolution_when_unpriceable)
+
+
 # ── Summary ─────────────────────────────────────────────────────────────────
 
 section("Summary")

@@ -691,7 +691,7 @@ def open_weather_trade(weather_signal_id, size_usd=100):
 def close_trade(trade_id, exit_price_a, exit_price_b=None, notes=""):
     """Close a paper trade and calculate P&L.
 
-    For weather trades (single-leg), exit_price_b is not needed.
+    For single-leg trades (weather/copy/whale), exit_price_b is not needed.
     P&L = (exit - entry) / entry * size_usd.
 
     For pairs trades, both exit prices are required.
@@ -704,7 +704,7 @@ def close_trade(trade_id, exit_price_a, exit_price_b=None, notes=""):
 
     trade_type = trade["trade_type"] if trade["trade_type"] else "pairs"
 
-    if trade_type == "weather":
+    if trade_type in {"weather", "copy", "whale"}:
         entry = trade["entry_price_a"] or 0
         pnl_usd = (exit_price_a - entry) / entry * trade["size_usd"] if entry > 0 else 0
         exit_b = exit_price_a  # store single price in both columns for consistency
@@ -743,6 +743,14 @@ def close_trade(trade_id, exit_price_a, exit_price_b=None, notes=""):
         pass
 
     return pnl_usd
+
+
+def update_trade_notes(trade_id, notes):
+    """Persist tracker or operator notes on a trade."""
+    conn = get_conn()
+    conn.execute("UPDATE trades SET notes=? WHERE id=?", (notes, trade_id))
+    conn.commit()
+    conn.close()
 
 
 _TRADES_SELECT = """
@@ -864,6 +872,14 @@ def get_weather_signals(limit=50, tradeable_only=False):
         ).fetchall()
     conn.close()
     return [dict(r) for r in rows]
+
+
+def get_weather_signal_by_id(signal_id):
+    """Fetch a single weather signal by id."""
+    conn = get_conn()
+    row = conn.execute("SELECT * FROM weather_signals WHERE id=?", (signal_id,)).fetchone()
+    conn.close()
+    return dict(row) if row else None
 
 
 # --- Locked Arb ---
