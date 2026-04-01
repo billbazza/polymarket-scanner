@@ -15,6 +15,16 @@ _session.headers.update({"Accept": "application/json"})
 
 _last_request = 0
 _min_interval = 0.2
+_INVALID_LOOKUP_VALUES = {
+    "n/a",
+    "na",
+    "none",
+    "null",
+    "placeholder",
+    "token_id",
+    "unknown",
+}
+_INVALID_TOKEN_PREFIXES = ("dummy", "example", "fake", "mock", "placeholder", "sample", "test")
 
 
 def _get(base, path, params=None, retries=2):
@@ -92,9 +102,57 @@ def get_spread(token_id):
     return _get(CLOB_BASE, "/spread", {"token_id": token_id})
 
 
+def normalize_token_id(token_id):
+    """Return a cleaned token id or None when the input is clearly malformed."""
+    if token_id is None:
+        return None
+    if isinstance(token_id, (int, float)):
+        token_id = str(token_id)
+    if not isinstance(token_id, str):
+        return None
+
+    token_id = token_id.strip()
+    if not token_id:
+        return None
+
+    lowered = token_id.lower()
+    if lowered in _INVALID_LOOKUP_VALUES:
+        return None
+    if any(lowered == f"{prefix}_token_id" for prefix in _INVALID_TOKEN_PREFIXES):
+        return None
+    if any(lowered.startswith(f"{prefix}_") for prefix in _INVALID_TOKEN_PREFIXES):
+        return None
+    if any(ch.isspace() for ch in token_id):
+        return None
+    if any(ch in token_id for ch in '[]{}",'):
+        return None
+    return token_id
+
+
+def _normalize_lookup_value(value):
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        value = str(value)
+    if not isinstance(value, str):
+        return None
+
+    value = value.strip()
+    if not value:
+        return None
+    if value.lower() in _INVALID_LOOKUP_VALUES:
+        return None
+    if any(ch.isspace() for ch in value):
+        return None
+    return value
+
+
 def get_market(condition_id=None, token_id=None, market_id=None):
     """Fetch a single Gamma market by condition id, token id, or market id."""
     params = {}
+    condition_id = _normalize_lookup_value(condition_id)
+    token_id = normalize_token_id(token_id)
+    market_id = _normalize_lookup_value(market_id)
     if condition_id:
         params["condition_ids"] = [condition_id]
     elif token_id:

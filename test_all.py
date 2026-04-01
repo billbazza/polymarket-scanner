@@ -1152,6 +1152,84 @@ run("copy_trade_resolves_via_gamma_fallback", test_copy_trade_resolves_via_gamma
 run("weather_trade_awaits_resolution_when_unpriceable", test_weather_trade_awaits_resolution_when_unpriceable)
 
 
+def test_whale_trade_invalid_token_is_sanitized_on_open():
+    import db
+    import whale_detector
+
+    alert = {
+        "id": 9991,
+        "event": "Whale invalid token event",
+        "market": "Will invalid token be sanitized?",
+        "token_id": "test_token_id",
+        "current_price": 0.61,
+        "dominant_side": "BID",
+        "analysis": "placeholder whale alert",
+        "suspicion_score": 77,
+    }
+
+    trade_id = whale_detector.create_whale_trade(alert, size_usd=20)
+    check("whale trade created with invalid token input", trade_id is not None and trade_id > 0, f"got {trade_id}")
+
+    trade = db.get_trade(trade_id)
+    check("whale trade strips invalid token before storage", trade and not trade.get("token_id_a"),
+          f"got token_id_a={trade.get('token_id_a') if trade else None}")
+    check("whale trade stores invalid-token note",
+          trade and "invalid" in (trade.get("notes") or "").lower(),
+          f"got notes={trade.get('notes') if trade else None}")
+
+
+def test_single_leg_invalid_token_skips_gamma_lookup():
+    import db
+    import tracker
+
+    conn = db.get_conn()
+    try:
+        conn.execute(
+            """
+            INSERT INTO trades (trade_type, opened_at, side_a, side_b,
+                entry_price_a, entry_price_b, token_id_a, size_usd, status, event, market_a, notes)
+            VALUES ('whale', ?, 'BUY_YES', '', 0.55, 0, ?, 20, 'open', ?, ?, '')
+            """,
+            (time.time(), "test_token_id", "Existing malformed whale trade", "Will malformed token stay open?"),
+        )
+        trade_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+        conn.commit()
+    finally:
+        conn.close()
+
+    with patch("api.get_midpoint", return_value=0.5) as midpoint_mock, \
+         patch("api.get_market", return_value=None) as market_mock:
+        updates = tracker.refresh_open_trades()
+        closed = tracker.auto_close_trades()
+
+    malformed_updates = [u for u in updates if u.get("trade_id") == trade_id]
+    malformed_closed = [c for c in closed if c.get("trade_id") == trade_id]
+    trade = db.get_trade(trade_id)
+
+    check("invalid-token whale trade omitted from refresh updates", len(malformed_updates) == 0,
+          f"got {len(malformed_updates)} updates")
+    check("invalid-token whale trade stays open", len(malformed_closed) == 0,
+          f"got {len(malformed_closed)} closes")
+    midpoint_tokens = [call.args[0] for call in midpoint_mock.call_args_list if call.args]
+    gamma_tokens = [call.kwargs.get("token_id") for call in market_mock.call_args_list if call.kwargs.get("token_id")]
+    check("invalid-token path skips midpoint lookup",
+          "test_token_id" not in midpoint_tokens,
+          f"got midpoint tokens={midpoint_tokens}")
+    check("invalid-token path skips Gamma lookup",
+          "test_token_id" not in gamma_tokens,
+          f"got Gamma token lookups={gamma_tokens}")
+    check("invalid-token whale trade remains open in DB",
+          trade and trade["status"] == "open",
+          f"got {trade.get('status') if trade else None}")
+    check("invalid-token whale trade note recorded",
+          trade and "invalid token_id_a placeholder" in (trade.get("notes") or ""),
+          f"got {trade.get('notes') if trade else None}")
+
+
+run("whale_trade_invalid_token_is_sanitized_on_open", test_whale_trade_invalid_token_is_sanitized_on_open)
+run("single_leg_invalid_token_skips_gamma_lookup", test_single_leg_invalid_token_skips_gamma_lookup)
+
+
 section("13. Weather duplicates and open-trade counting")
 
 def test_weather_signal_block_reason_for_duplicate_token():

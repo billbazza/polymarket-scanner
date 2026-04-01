@@ -2656,7 +2656,7 @@ def open_whale_trade(trade_data):
             trade_data.get('whale_alert_id'),
             trade_data['event'],
             trade_data['market_a'],
-            f"Suspicion: {trade_data.get('suspicion_score', 0)}/100"
+            trade_data.get('notes') or f"Suspicion: {trade_data.get('suspicion_score', 0)}/100"
         ))
         trade_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
         conn.commit()

@@ -202,7 +202,7 @@ def scan_market(market, event_name):
             if isinstance(tokens, str):
                 import json
                 tokens = json.loads(tokens)
-            token_id = tokens[0] if tokens else None
+            token_id = api.normalize_token_id(tokens[0] if tokens else None)
         except Exception:
             pass
 
@@ -338,6 +338,7 @@ def create_whale_trade(alert, size_usd=20):
         current_price = alert.get("current_price")
         if current_price is None:
             current_price = 0.5
+        token_id = api.normalize_token_id(alert.get("token_id"))
 
         # Determine trade direction based on analysis
         # If there's a large buy order (dominant_side='BID'), price may go up -> BUY_YES
@@ -356,7 +357,11 @@ def create_whale_trade(alert, size_usd=20):
         # Validate entry_price is reasonable
         if entry_price is None or not (0 <= entry_price <= 1):
             entry_price = 0.5  # fallback
-        
+
+        notes = [f"Suspicion: {alert.get('suspicion_score', 0)}/100"]
+        if alert.get("token_id") and not token_id:
+            notes.append("Tracker: whale alert token_id was invalid; trade cannot be auto-priced until corrected.")
+
         # Create trade record
         trade_data = {
             'trade_type': 'whale',
@@ -365,14 +370,15 @@ def create_whale_trade(alert, size_usd=20):
             'side_b': '',  # Single leg trade
             'entry_price_a': entry_price,
             'entry_price_b': 0,
-            'token_id_a': alert.get('token_id'),
+            'token_id_a': token_id,
             'size_usd': size_usd,
             'status': 'open',
             'whale_alert_id': alert['id'],
             'event': alert['event'],
             'market_a': alert['market'],
             'analysis': alert['analysis'],
-            'suspicion_score': alert['suspicion_score']
+            'suspicion_score': alert['suspicion_score'],
+            'notes': " ".join(notes),
         }
         
         # Save to database

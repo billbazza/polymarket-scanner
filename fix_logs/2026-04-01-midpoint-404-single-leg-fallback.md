@@ -44,3 +44,13 @@ Server logs on 2026-04-01 showed repeated `/midpoint` 404 warnings for open sing
 
 - As of 2026-04-01, the live `scanner.db` had `18` open single-leg trades whose stored token returned midpoint `404`.
 - The sampled problem trades (`339`, `342`, `343`, `344`, `350`, `351`, `352`, `353`) all mapped to Gamma markets already marked `resolved` with `outcomePrices=["0","1"]`.
+
+## 2026-04-01 follow-up: invalid whale token fallback
+
+- Server logs on 2026-04-01 also showed whale trade `282` repeatedly hitting midpoint `404`, then Gamma lookup `422`, because the stored `token_id_a` was an invalid placeholder (`test_token_id`) rather than a real CLOB token id.
+- Added shared token-id sanitizing in `api.py` and reused it in `whale_detector.py` so new whale alerts and whale trades do not persist placeholder token ids into `trades.token_id_a`.
+- Hardened `tracker.py` single-leg pricing so malformed token ids are classified as `invalid-token`, skip both midpoint and Gamma lookups, write a persistent tracker note, and leave the trade open without repeated warning spam.
+- Tightened the no-fallback path so missing Gamma matches and missing Gamma outcome prices are recorded as explicit unpriceable states instead of recurring warnings.
+- Added targeted regression tests for:
+  - whale trade creation with invalid token input
+  - existing malformed whale trades staying open without midpoint or Gamma calls

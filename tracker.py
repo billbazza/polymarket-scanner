@@ -72,6 +72,7 @@ def _load_weather_signal(trade):
 
 def _get_single_leg_market(trade):
     trade_type = _trade_kind(trade)
+    token_id = api.normalize_token_id(trade.get("token_id_a"))
 
     if trade_type == "weather":
         signal = _load_weather_signal(trade)
@@ -80,14 +81,18 @@ def _get_single_leg_market(trade):
                 market = api.get_market(market_id=signal["market_id"])
                 if market:
                     return market
-            return api.get_market(token_id=trade.get("token_id_a"))
+            if token_id:
+                return api.get_market(token_id=token_id)
+            return None
 
     if trade_type == "copy" and trade.get("copy_condition_id"):
         market = api.get_market(condition_id=trade["copy_condition_id"])
         if market:
             return market
 
-    return api.get_market(token_id=trade.get("token_id_a"))
+    if token_id:
+        return api.get_market(token_id=token_id)
+    return None
 
 
 def _market_is_resolved(market):
@@ -112,13 +117,29 @@ def _weather_target_passed(trade):
 
 def _resolve_single_leg_price(trade, phase):
     trade_id = trade["id"]
-    token_a = trade.get("token_id_a")
+    raw_token_a = trade.get("token_id_a")
+    token_a = api.normalize_token_id(raw_token_a)
     label = _trade_label(trade)
-    if not token_a:
+    if not raw_token_a:
         _log_once("warning", (trade_id, phase, "missing-token"),
                   "%s missing token_id_a; cannot %s", label, phase)
         _set_tracker_note(trade_id, f"Tracker: missing token_id_a; cannot {phase}.")
-        return None
+        return {"price": None, "source": "missing-token", "resolved": False, "unpriceable": True}
+    if not token_a:
+        _log_once("info", (trade_id, phase, "invalid-token"),
+                  "%s has invalid token_id_a; skipping pricing during %s",
+                  label, phase)
+        _set_tracker_note(
+            trade_id,
+            "Tracker: invalid token_id_a placeholder; skipping midpoint/Gamma pricing and leaving trade open.",
+        )
+        return {
+            "price": None,
+            "source": "invalid-token",
+            "resolved": False,
+            "unpriceable": True,
+            "unpriceable_reason": "invalid_token_id",
+        }
 
     try:
         current_a = api.get_midpoint(token_a)
@@ -144,11 +165,20 @@ def _resolve_single_leg_price(trade, phase):
         return None
 
     if not market:
-        _log_once("warning", (trade_id, phase, "gamma-missing"),
+        _log_once("info", (trade_id, phase, "gamma-missing"),
                   "%s midpoint 404 and no Gamma market match found during %s",
                   label, phase)
-        _set_tracker_note(trade_id, "Tracker: midpoint 404 and no Gamma market match found.")
-        return None
+        _set_tracker_note(
+            trade_id,
+            "Tracker: midpoint 404 and no Gamma market match found; trade remains open and unpriceable.",
+        )
+        return {
+            "price": None,
+            "source": "gamma",
+            "resolved": False,
+            "unpriceable": True,
+            "unpriceable_reason": "gamma_market_missing",
+        }
 
     gamma_price = api.extract_market_price(market, token_a)
     resolved = _market_is_resolved(market)
@@ -179,10 +209,16 @@ def _resolve_single_leg_price(trade, phase):
         return {"price": None, "source": "gamma", "resolved": False, "awaiting_resolution": True}
 
     _set_tracker_note(trade_id, "Tracker: midpoint 404 and no usable fallback price; leaving trade open.")
-    _log_once("warning", (trade_id, phase, "unpriceable"),
+    _log_once("info", (trade_id, phase, "unpriceable"),
               "%s midpoint 404 and no usable fallback price during %s; leaving trade open",
               label, phase)
-    return {"price": None, "source": "gamma", "resolved": resolved, "unpriceable": True}
+    return {
+        "price": None,
+        "source": "gamma",
+        "resolved": resolved,
+        "unpriceable": True,
+        "unpriceable_reason": "gamma_price_missing",
+    }
 
 
 def _refresh_weather_trade(trade):
