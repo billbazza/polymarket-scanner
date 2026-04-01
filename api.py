@@ -1,6 +1,8 @@
 """Polymarket API client — read-only, no auth required."""
+import json
 import logging
 import time
+
 import requests
 
 log = logging.getLogger("scanner.api")
@@ -88,3 +90,38 @@ def get_book(token_id):
 def get_spread(token_id):
     """Get bid-ask spread."""
     return _get(CLOB_BASE, "/spread", {"token_id": token_id})
+
+
+def get_market(condition_id=None, token_id=None, market_id=None):
+    """Fetch a single Gamma market by condition id, token id, or market id."""
+    params = {}
+    if condition_id:
+        params["condition_ids"] = [condition_id]
+    elif token_id:
+        params["clob_token_ids"] = [token_id]
+    elif market_id:
+        params["id"] = str(market_id)
+    else:
+        raise ValueError("condition_id, token_id, or market_id is required")
+
+    markets = _get(GAMMA_BASE, "/markets", params)
+    return markets[0] if isinstance(markets, list) and markets else None
+
+
+def extract_market_price(market, token_id):
+    """Return the outcome price for a token from a Gamma market payload."""
+    if not market or not token_id:
+        return None
+    try:
+        token_ids = json.loads(market.get("clobTokenIds") or "[]")
+        prices = json.loads(market.get("outcomePrices") or "[]")
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None
+
+    for idx, candidate in enumerate(token_ids):
+        if str(candidate) == str(token_id) and idx < len(prices):
+            try:
+                return float(prices[idx])
+            except (TypeError, ValueError):
+                return None
+    return None
