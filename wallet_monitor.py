@@ -374,13 +374,17 @@ def _check_wallet(address: str, label: str, will_copy: bool) -> tuple[int, int]:
                 max_total_open=max_total_open,
             )
             if not decision["ok"]:
-                log.info("Monitor: skipped %s — %s", label, decision["reason"])
+                event_status = "already_mirrored" if decision["reason_code"] == "position_already_open" else "blocked"
+                if event_status == "already_mirrored":
+                    log.info("Monitor: %s already mirrored — %s", label, decision["reason"])
+                else:
+                    log.info("Monitor: skipped %s — %s", label, decision["reason"])
                 _record_event(
                     source="wallet_monitor",
                     wallet=address,
                     label=label,
                     event_type="new_position",
-                    status="blocked",
+                    status=event_status,
                     reason_code=decision["reason_code"],
                     reason=decision["reason"],
                     condition_id=cid,
@@ -423,6 +427,33 @@ def _check_wallet(address: str, label: str, will_copy: bool) -> tuple[int, int]:
                     details={"trade_id": t_id, "size_usd": COPY_SIZE_USD},
                 )
             else:
+                retry_decision = db.inspect_copy_trade_open(
+                    address,
+                    pos,
+                    size_usd=COPY_SIZE_USD,
+                    max_wallet_open=max_wallet_open,
+                    max_total_open=max_total_open,
+                )
+                if retry_decision["reason_code"] == "position_already_open":
+                    log.info("Monitor: %s already mirrored after open race — %s", label, retry_decision["reason"])
+                    _record_event(
+                        source="wallet_monitor",
+                        wallet=address,
+                        label=label,
+                        event_type="new_position",
+                        status="already_mirrored",
+                        reason_code=retry_decision["reason_code"],
+                        reason=retry_decision["reason"],
+                        condition_id=cid,
+                        outcome_name=outcome,
+                        market_title=title,
+                        price=price,
+                        position_value_usd=size,
+                        checked_at=checked_at,
+                        positions_count=len(current_keys),
+                        details={"existing_trade_id": retry_decision.get("existing_trade_id")},
+                    )
+                    continue
                 log.debug("Monitor: copy trade open failed after ready check for %s", cid[:16])
                 _record_event(
                     source="wallet_monitor",

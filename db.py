@@ -1083,6 +1083,59 @@ def get_trade_reconciliation_key(trade: dict) -> str | None:
     return f"paper:{trade.get('id')}" if trade.get("id") else None
 
 
+def find_open_copy_trade(
+    wallet: str,
+    *,
+    canonical_ref: str | None = None,
+    external_position_id: str | None = None,
+    condition_id: str | None = None,
+    outcome: str | None = None,
+    conn=None,
+) -> dict | None:
+    """Return the current open copy trade matching a watched-wallet position."""
+    wallet_norm = (wallet or "").lower().strip()
+    canonical_ref = (canonical_ref or "").strip() or None
+    external_position_id = (external_position_id or "").strip() or None
+    condition_id = (condition_id or "").strip() or None
+    outcome_norm = str(outcome or "").strip().lower() or None
+    owns_conn = conn is None
+    conn = conn or get_conn()
+    try:
+        matchers = []
+        params = [wallet_norm]
+        if canonical_ref:
+            matchers.append("canonical_ref = ?")
+            params.append(canonical_ref)
+        if condition_id and outcome_norm:
+            matchers.append("(copy_condition_id = ? AND LOWER(COALESCE(copy_outcome, '')) = ?)")
+            params.extend([condition_id, outcome_norm])
+        if external_position_id:
+            matchers.append("external_position_id = ?")
+            params.append(external_position_id)
+        if condition_id:
+            matchers.append("copy_condition_id = ?")
+            params.append(condition_id)
+        if not matchers:
+            return None
+        row = conn.execute(
+            f"""
+            SELECT id, copy_wallet, copy_condition_id, copy_outcome, canonical_ref, external_position_id
+            FROM trades
+            WHERE trade_type='copy'
+              AND status='open'
+              AND copy_wallet=?
+              AND ({' OR '.join(matchers)})
+            ORDER BY opened_at DESC, id DESC
+            LIMIT 1
+            """,
+            params,
+        ).fetchone()
+        return dict(row) if row else None
+    finally:
+        if owns_conn:
+            conn.close()
+
+
 def calculate_single_leg_mark_to_market(size_usd, entry_price, current_price) -> dict:
     """Return shares, current market value, and P&L for a single token position."""
     cost_basis = max(0.0, float(size_usd or 0.0))
@@ -1841,6 +1894,8 @@ def inspect_copy_trade_open(
     identifiers = get_position_identity(position, wallet=wallet)
     condition_id = identifiers["condition_id"] or ""
     external_position_id = identifiers["external_position_id"]
+    canonical_ref = identifiers["canonical_ref"]
+    outcome = identifiers["outcome"]
     max_wallet_open = _normalize_optional_cap(max_wallet_open)
     max_total_open = _normalize_optional_cap(max_total_open)
 
@@ -1853,14 +1908,23 @@ def inspect_copy_trade_open(
             **_paper_position_policy_dict(),
         }
 
-    if has_open_copy_trade(wallet, condition_id, external_position_id=external_position_id):
+    existing_trade = find_open_copy_trade(
+        wallet,
+        canonical_ref=canonical_ref,
+        external_position_id=external_position_id,
+        condition_id=condition_id,
+        outcome=outcome,
+    )
+    if existing_trade:
         return {
             "ok": False,
             "reason_code": "position_already_open",
-            "reason": "Already have an open copy trade for this position.",
+            "reason": f"Already mirrored by open copy trade #{existing_trade['id']}.",
             "wallet": wallet,
             "condition_id": condition_id,
             "external_position_id": external_position_id,
+            "canonical_ref": canonical_ref,
+            "existing_trade_id": existing_trade["id"],
             **_paper_position_policy_dict(),
         }
 
@@ -1929,7 +1993,7 @@ def inspect_copy_trade_open(
         "wallet": wallet,
         "condition_id": condition_id,
         "external_position_id": external_position_id,
-        "canonical_ref": identifiers["canonical_ref"],
+        "canonical_ref": canonical_ref,
         "entry_price": entry_price,
         "requested_size_usd": round(float(size_usd), 2),
         "max_wallet_open": max_wallet_open,
@@ -2029,26 +2093,11 @@ def has_open_weather_trade(token_id):
 
 def has_open_copy_trade(wallet: str, condition_id: str, external_position_id: str | None = None) -> bool:
     """Return True if we already have an open copy trade for this wallet+market."""
-    conn = get_conn()
-    wallet = (wallet or "").lower()
-    if external_position_id:
-        row = conn.execute(
-            """
-            SELECT id
-            FROM trades
-            WHERE copy_wallet=?
-              AND external_position_id=?
-              AND status='open'
-            """,
-            (wallet, external_position_id),
-        ).fetchone()
-    else:
-        row = conn.execute(
-            "SELECT id FROM trades WHERE copy_wallet=? AND copy_condition_id=? AND status='open'",
-            (wallet, condition_id)
-        ).fetchone()
-    conn.close()
-    return row is not None
+    return find_open_copy_trade(
+        wallet,
+        condition_id=condition_id,
+        external_position_id=external_position_id,
+    ) is not None
 
 
 def count_open_copy_trades(wallet: str | None = None) -> int:
@@ -2210,27 +2259,55 @@ def open_copy_trade(
     outcome = position.get("outcome", "")
     side = "BUY_YES" if outcome.lower() not in ("no",) else "BUY_NO"
     entry_price = decision["entry_price"]
+    outcome_norm = str(outcome or "").strip().lower()
 
     conn = get_conn()
-    conn.execute("""
-        INSERT INTO trades (trade_type, opened_at, side_a, side_b,
+    cursor = conn.execute(
+        """
+        INSERT INTO trades (
+            trade_type, opened_at, side_a, side_b,
             entry_price_a, entry_price_b, token_id_a, size_usd, status,
             copy_wallet, copy_label, copy_condition_id, copy_outcome,
             event, market_a, trade_state_mode, reconciliation_mode,
-            canonical_ref, external_position_id, external_source)
-        VALUES ('copy', ?, ?, '', ?, 0, ?, ?, 'open', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    """, (
-        time.time(), side, entry_price,
-        position.get("asset", ""), size_usd,
-        wallet, label, condition_id, outcome,
-        position.get("title"),
-        outcome,
-        TRADE_STATE_WALLET,
-        RECONCILIATION_WALLET,
-        decision.get("canonical_ref") or identifiers["canonical_ref"],
-        decision.get("external_position_id") or identifiers["external_position_id"],
-        "watched_wallet",
-    ))
+            canonical_ref, external_position_id, external_source
+        )
+        SELECT 'copy', ?, ?, '', ?, 0, ?, ?, 'open', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+        WHERE NOT EXISTS (
+            SELECT 1
+            FROM trades
+            WHERE trade_type='copy'
+              AND status='open'
+              AND copy_wallet=?
+              AND (
+                    canonical_ref=?
+                 OR (copy_condition_id=? AND LOWER(COALESCE(copy_outcome, ''))=?)
+                 OR external_position_id=?
+                 OR copy_condition_id=?
+              )
+        )
+        """,
+        (
+            time.time(), side, entry_price,
+            position.get("asset", ""), size_usd,
+            wallet, label, condition_id, outcome,
+            position.get("title"),
+            outcome,
+            TRADE_STATE_WALLET,
+            RECONCILIATION_WALLET,
+            decision.get("canonical_ref") or identifiers["canonical_ref"],
+            decision.get("external_position_id") or identifiers["external_position_id"],
+            "watched_wallet",
+            wallet,
+            decision.get("canonical_ref") or identifiers["canonical_ref"],
+            condition_id,
+            outcome_norm,
+            decision.get("external_position_id") or identifiers["external_position_id"],
+            condition_id,
+        ),
+    )
+    if cursor.rowcount <= 0:
+        conn.close()
+        return None
     trade_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
     conn.commit()
     conn.close()

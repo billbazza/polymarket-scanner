@@ -148,6 +148,59 @@ class WatchedWalletMonitoringTests(unittest.TestCase):
         self.assertEqual(payload["events"][0]["status"], "blocked")
         self.assertEqual(payload["summary"]["status_counts"]["blocked"], 1)
 
+    def test_wallet_monitor_dedupes_existing_open_copy_trade_when_asset_id_changes(self):
+        address = "0xddd0000000000000000000000000000000000003"
+        self.db.add_watched_wallet(address, "Validator")
+        self.db.set_wallet_baseline(address, [])
+        self.wallet_monitor._known_positions[address] = set()
+
+        original_position = {
+            "conditionId": "cond-stable",
+            "outcome": "YES",
+            "title": "Will Validator keep this position?",
+            "curPrice": 0.61,
+            "avgPrice": 0.61,
+            "currentValue": 120.0,
+            "asset": "asset-v1",
+        }
+        trade_id = self.db.open_copy_trade(address, "Validator", original_position, size_usd=20)
+        self.assertIsNotNone(trade_id)
+
+        polled_position = dict(original_position)
+        polled_position["asset"] = "asset-v2"
+
+        with patch.object(self.wallet_monitor, "get_positions", return_value=[polled_position]):
+            opened, closed = self.wallet_monitor._check_wallet(address, "Validator", True)
+
+        self.assertEqual(opened, 0)
+        self.assertEqual(closed, 0)
+        self.assertEqual(self.db.count_open_copy_trades(address), 1)
+
+        events = self.db.get_wallet_monitor_events(limit=5, wallet=address)
+        already = next((event for event in events if event["status"] == "already_mirrored"), None)
+        self.assertIsNotNone(already)
+        self.assertEqual(already["reason_code"], "position_already_open")
+        self.assertIn("trade #", already["reason"])
+
+    def test_open_copy_trade_rejects_duplicate_wallet_condition_outcome_despite_asset_change(self):
+        address = "0xeee0000000000000000000000000000000000004"
+        first_position = {
+            "conditionId": "cond-dup",
+            "outcome": "NO",
+            "title": "Duplicate guard market",
+            "curPrice": 0.42,
+            "asset": "asset-old",
+        }
+        second_position = dict(first_position)
+        second_position["asset"] = "asset-new"
+
+        first_trade = self.db.open_copy_trade(address, "Guard", first_position, size_usd=20)
+        second_trade = self.db.open_copy_trade(address, "Guard", second_position, size_usd=20)
+
+        self.assertIsNotNone(first_trade)
+        self.assertIsNone(second_trade)
+        self.assertEqual(self.db.count_open_copy_trades(address), 1)
+
     def test_init_db_repairs_missing_watched_wallet_monitor_columns_when_backfill_marked_applied(self):
         current_db_path = os.environ["SCANNER_DB_PATH"]
         legacy_db_path = os.path.join(self.tmpdir.name, "legacy-scanner.db")
