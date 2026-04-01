@@ -603,20 +603,21 @@
     <div style="display:flex;gap:12px;align-items:center;padding:8px 0 12px;flex-wrap:wrap">
       <span id="copyInfo" style="color:var(--text2);font-size:13px">Loading watched wallets...</span>
       <label style="color:var(--text2);font-size:12px;display:flex;align-items:center;gap:4px;">
-        <input type="checkbox" id="copyCapEnabled" onchange="persistUiPrefs(); saveCopySettings()"> Cap trades
+        <input type="checkbox" id="copyCapEnabled" onchange="persistUiPrefs(); saveCopySettings()"> Enable copy caps
       </label>
       <label style="color:var(--text2);font-size:12px;display:flex;align-items:center;gap:6px;">
         Wallet
-        <input id="copyPerWalletCap" type="number" min="1" step="1" value="3"
+        <input id="copyPerWalletCap" type="number" min="0" step="1" value="0"
           onchange="persistUiPrefs(); saveCopySettings()"
           style="width:62px;background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:5px 8px;color:var(--text1);font-size:12px">
       </label>
       <label style="color:var(--text2);font-size:12px;display:flex;align-items:center;gap:6px;">
         Total
-        <input id="copyTotalCap" type="number" min="1" step="1" value="25"
+        <input id="copyTotalCap" type="number" min="0" step="1" value="0"
           onchange="persistUiPrefs(); saveCopySettings()"
           style="width:62px;background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:5px 8px;color:var(--text1);font-size:12px">
       </label>
+      <span style="color:var(--text2);font-size:11px">Use `0` for uncapped. Paper mode is cash-limited by default.</span>
       <button class="btn sm sky" onclick="loadCopy()">Refresh</button>
     </div>
     <div id="copyLatest" style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:16px"></div>
@@ -772,8 +773,8 @@ function persistUiPrefs() {
     whaleMinScore: getEl('whaleMinScore')?.value || '60',
     whaleOrderValue: getEl('whaleOrderValue')?.value || '20',
     copyCapEnabled: !!getEl('copyCapEnabled')?.checked,
-    copyPerWalletCap: getEl('copyPerWalletCap')?.value || '3',
-    copyTotalCap: getEl('copyTotalCap')?.value || '25',
+    copyPerWalletCap: getEl('copyPerWalletCap')?.value || '0',
+    copyTotalCap: getEl('copyTotalCap')?.value || '0',
   };
   localStorage.setItem(UI_PREFS_KEY, JSON.stringify(prefs));
 }
@@ -851,7 +852,7 @@ async function loadStats() {
     document.getElementById('statEquity').textContent = fmtUsd(account.total_equity);
     document.getElementById('statStartingBankroll').textContent = `Starting bankroll ${fmtUsd(account.starting_bankroll)}`;
     document.getElementById('statAvailableCash').textContent = fmtUsd(account.available_cash);
-    document.getElementById('statCashMeta').textContent = `${fmtUsd(account.available_cash)} free to deploy now.`;
+    document.getElementById('statCashMeta').textContent = `${fmtUsd(account.available_cash)} free to deploy now. Paper entries are cash-limited, not count-capped.`;
     document.getElementById('statCommitted').textContent = fmtUsd(account.committed_capital);
     document.getElementById('statCommittedMeta').textContent = `${fmtUsd(account.committed_capital)} tied up across ${account.open_trades || 0} open trade${(account.open_trades || 0) === 1 ? '' : 's'}.`;
     setSignedValue('statRealized', account.realized_pnl || 0);
@@ -865,6 +866,7 @@ async function loadStats() {
       `Equity ${fmtUsd(account.total_equity)} = cash ${fmtUsd(account.available_cash)} + marked open positions ${fmtUsd(account.open_position_value)}.`;
     document.getElementById('accountExplainer').innerHTML =
       `<strong>Accounting rule:</strong> ${esc(account.cash_after_open_explanation || 'Opening a paper trade deducts its size from available cash immediately.')} ` +
+      `${esc(account.position_policy_detail || 'Paper trading is uncapped by position count and limited by available cash.')} ` +
       `Available cash is computed as starting bankroll ${fmtUsd(account.starting_bankroll)} + realized P&amp;L ${fmtUsd(account.realized_pnl)} - committed capital ${fmtUsd(account.committed_capital)}. ` +
       `Marked open-position value is committed capital ${fmtUsd(account.committed_capital)} + unrealized P&amp;L ${fmtUsd(account.unrealized_pnl)}.`;
 
@@ -1328,13 +1330,13 @@ async function openWeatherTrade(signalId, btn) {
   try {
     const r = await fetch(API + `/api/weather/${signalId}/trade`, {method: 'POST'});
     const data = await r.json();
-    if (r.ok) {
+    if (r.ok && data.ok !== false) {
       toast(`Weather trade #${data.trade_id} opened`);
       btn.textContent = 'traded';
       btn.disabled = true;
       btn.style.opacity = '0.5';
     } else {
-      toast(`Error: ${data.detail || JSON.stringify(data)}`, true);
+      toast(`Error: ${data.reason || data.detail || data.error || JSON.stringify(data)}`, true);
       btn.disabled = false;
       btn.textContent = 'Trade';
     }
@@ -1409,6 +1411,10 @@ async function paperTrade(signalId) {
   try {
     const r = await fetch(API + `/api/trades?signal_id=${signalId}&size_usd=${size}`, { method: 'POST' });
     const data = await r.json();
+    if (!r.ok || data.ok === false) {
+      toast(`Failed: ${data.reason || data.detail || data.error || 'Request failed'}`, true);
+      return;
+    }
     toast(`Paper trade opened (ID: ${data.trade_id})`);
     loadSignals(); loadTrades(); loadStats();
   } catch(e) { toast('Failed: ' + e.message); }
@@ -1806,11 +1812,14 @@ async function loadCopyScores() {
 
     const lastPoll = mon.last_poll ? fmt(mon.last_poll) : 'never';
     if (getEl('copyCapEnabled')) getEl('copyCapEnabled').checked = !!settings.cap_enabled;
-    if (getEl('copyPerWalletCap')) getEl('copyPerWalletCap').value = settings.per_wallet_cap ?? 3;
-    if (getEl('copyTotalCap')) getEl('copyTotalCap').value = settings.total_open_cap ?? 25;
+    if (getEl('copyPerWalletCap')) getEl('copyPerWalletCap').value = settings.per_wallet_cap ?? 0;
+    if (getEl('copyTotalCap')) getEl('copyTotalCap').value = settings.total_open_cap ?? 0;
     persistUiPrefs();
+    const capsSummary = settings.caps_active
+      ? `on (${settings.effective_per_wallet_cap ?? 'uncapped'}/wallet, ${settings.effective_total_open_cap ?? 'uncapped'} total)`
+      : 'off (paper uncapped; cash-limited)';
     document.getElementById('copyInfo').textContent =
-      `Monitor: ${mon.running ? '● live' : '○ stopped'} · last poll ${lastPoll} · ${mon.polls_run||0} polls · ${mon.new_trades_found||0} auto-opened · caps ${settings.cap_enabled ? `on (${settings.per_wallet_cap}/wallet, ${settings.total_open_cap} total)` : 'off'}`;
+      `Monitor: ${mon.running ? '● live' : '○ stopped'} · last poll ${lastPoll} · ${mon.polls_run||0} polls · ${mon.new_trades_found||0} auto-opened · caps ${capsSummary}`;
 
     const scoresEl = document.getElementById('copyScores');
     scoresEl.innerHTML = watchlist.map(w => walletScoreCard(w, true)).join('');
@@ -1820,8 +1829,8 @@ async function loadCopyScores() {
 async function saveCopySettings() {
   try {
     const enabled = !!getEl('copyCapEnabled')?.checked;
-    const perWallet = Math.max(1, Number(getEl('copyPerWalletCap')?.value || 3));
-    const totalCap = Math.max(1, Number(getEl('copyTotalCap')?.value || 25));
+    const perWallet = Math.max(0, Number(getEl('copyPerWalletCap')?.value || 0));
+    const totalCap = Math.max(0, Number(getEl('copyTotalCap')?.value || 0));
     const params = new URLSearchParams({
       cap_enabled: String(enabled),
       per_wallet_cap: String(perWallet),
@@ -1832,7 +1841,7 @@ async function saveCopySettings() {
     if (!r.ok || !data.ok) {
       throw new Error(data.detail || data.error || 'Failed to save settings');
     }
-    toast(`Copy trade caps ${enabled ? 'enabled' : 'disabled'}`, 5000);
+    toast(`Copy settings saved: ${enabled ? 'caps enabled' : 'uncapped paper default'}`, 5000);
     loadCopyScores();
   } catch(e) {
     toast('Copy settings error: ' + e.message, true);
@@ -2163,12 +2172,12 @@ async function mirrorTrade(wallet, conditionId, btn) {
       loadTrades(); loadStats();
     } else {
       // Handle specific error cases
-      if (data.error && data.error.includes('Already have an open copy trade')) {
+      if (data.reason_code === 'position_already_open' || (data.error && data.error.includes('Already have an open copy trade'))) {
         btn.textContent = '✓ Already Mirrored';
         btn.style.background = 'var(--teal)'; btn.style.color = '#000';
         toast('Position already mirrored', true);
       } else {
-        toast(data.error || 'Mirror failed', true);
+        toast(data.reason || data.error || 'Mirror failed', true);
         btn.disabled = false; btn.textContent = 'Mirror $20';
       }
     }

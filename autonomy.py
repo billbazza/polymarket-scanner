@@ -647,6 +647,23 @@ def run_cycle(state):
 
                 # New position — not yet mirrored
                 if cid not in open_copy:
+                    decision = db.inspect_copy_trade_open(
+                        address,
+                        pos,
+                        size_usd=20,
+                        max_wallet_open=max_copy_wallet_open,
+                        max_total_open=max_copy_total_open,
+                    )
+                    if not decision["ok"]:
+                        journal({
+                            "action": "skip_trade",
+                            "level": level,
+                            "trade_type": "copy",
+                            "event": f"{label}: {pos.get('title','')[:50]}",
+                            "reason": decision["reason"],
+                        })
+                        log.info("Step 4e: Copy skip for %s — %s", label, decision["reason"])
+                        continue
                     t_id = db.open_copy_trade(
                         address,
                         label,

@@ -810,6 +810,7 @@ def get_paper_account_state(refresh_unrealized: bool = False) -> dict:
         "open_trades": open_trades,
         "bankroll_used_pct": round(bankroll_used_pct, 1),
         "cash_after_open_explanation": "Opening a paper trade deducts its full size from available cash immediately and moves that amount into committed capital until the trade closes.",
+        **_paper_position_policy_dict(),
     }
 
 
@@ -826,6 +827,187 @@ def can_open_paper_trade(size_usd: float) -> dict:
     }
 
 
+def _normalize_optional_cap(value) -> int | None:
+    try:
+        if value is None:
+            return None
+        parsed = int(value)
+        return parsed if parsed > 0 else None
+    except Exception:
+        return None
+
+
+def _paper_position_policy_dict() -> dict:
+    return {
+        "position_policy": "uncapped_cash_limited",
+        "position_policy_label": "No hard paper position cap",
+        "position_policy_detail": (
+            "Paper trading is uncapped by position count. Available cash and any "
+            "explicit operator-enabled caps are the only open-position constraints."
+        ),
+    }
+
+
+def inspect_pairs_trade_open(signal_id, size_usd=100, conn=None):
+    """Return a structured pairs-trade open decision."""
+    owns_conn = conn is None
+    conn = conn or get_conn()
+    try:
+        sig = conn.execute("SELECT * FROM signals WHERE id=?", (signal_id,)).fetchone()
+        if not sig:
+            return {
+                "ok": False,
+                "reason_code": "signal_not_found",
+                "reason": f"Signal {signal_id} not found.",
+                **_paper_position_policy_dict(),
+            }
+
+        existing = conn.execute(
+            "SELECT id FROM trades WHERE signal_id=? AND status='open'",
+            (signal_id,),
+        ).fetchone()
+        if existing:
+            trade_id = int(existing["id"])
+            return {
+                "ok": False,
+                "reason_code": "signal_already_open",
+                "reason": f"Signal {signal_id} is already open as trade #{trade_id}.",
+                "existing_trade_id": trade_id,
+                **_paper_position_policy_dict(),
+            }
+
+        account_check = can_open_paper_trade(size_usd)
+        if not account_check["ok"]:
+            return {
+                "ok": False,
+                "reason_code": "insufficient_cash",
+                "reason": (
+                    f"Insufficient paper cash: ${account_check['available_cash']:.2f} available, "
+                    f"${account_check['requested_size_usd']:.2f} requested."
+                ),
+                "available_cash": account_check["available_cash"],
+                "requested_size_usd": account_check["requested_size_usd"],
+                "shortfall_usd": account_check["shortfall_usd"],
+                "account": account_check["account"],
+                **_paper_position_policy_dict(),
+            }
+
+        return {
+            "ok": True,
+            "reason_code": "ready",
+            "reason": "Ready to open paper pairs trade.",
+            "signal": dict(sig),
+            "requested_size_usd": round(float(size_usd), 2),
+            **_paper_position_policy_dict(),
+        }
+    finally:
+        if owns_conn:
+            conn.close()
+
+
+def inspect_copy_trade_open(
+    wallet: str,
+    position: dict,
+    size_usd: float = 20.0,
+    *,
+    max_wallet_open: int | None = None,
+    max_total_open: int | None = None,
+) -> dict:
+    """Return a structured copy-trade open decision."""
+    wallet = (wallet or "").lower()
+    condition_id = position.get("conditionId", "")
+    max_wallet_open = _normalize_optional_cap(max_wallet_open)
+    max_total_open = _normalize_optional_cap(max_total_open)
+
+    if not condition_id:
+        return {
+            "ok": False,
+            "reason_code": "position_not_found",
+            "reason": "Copy position is missing a conditionId.",
+            "wallet": wallet,
+            **_paper_position_policy_dict(),
+        }
+
+    if has_open_copy_trade(wallet, condition_id):
+        return {
+            "ok": False,
+            "reason_code": "position_already_open",
+            "reason": "Already have an open copy trade for this position.",
+            "wallet": wallet,
+            "condition_id": condition_id,
+            **_paper_position_policy_dict(),
+        }
+
+    wallet_open = count_open_copy_trades(wallet) if max_wallet_open is not None else None
+    if max_wallet_open is not None and wallet_open >= max_wallet_open:
+        return {
+            "ok": False,
+            "reason_code": "wallet_cap_reached",
+            "reason": f"Copy wallet cap reached ({wallet_open}/{max_wallet_open}).",
+            "wallet": wallet,
+            "condition_id": condition_id,
+            "wallet_open": wallet_open,
+            "max_wallet_open": max_wallet_open,
+            **_paper_position_policy_dict(),
+        }
+
+    total_open = count_open_trades() if max_total_open is not None else None
+    if max_total_open is not None and total_open >= max_total_open:
+        return {
+            "ok": False,
+            "reason_code": "total_cap_reached",
+            "reason": f"Copy total open cap reached ({total_open}/{max_total_open}).",
+            "wallet": wallet,
+            "condition_id": condition_id,
+            "total_open": total_open,
+            "max_total_open": max_total_open,
+            **_paper_position_policy_dict(),
+        }
+
+    account_check = can_open_paper_trade(size_usd)
+    if not account_check["ok"]:
+        return {
+            "ok": False,
+            "reason_code": "insufficient_cash",
+            "reason": (
+                f"Insufficient paper cash: ${account_check['available_cash']:.2f} available, "
+                f"${account_check['requested_size_usd']:.2f} requested."
+            ),
+            "wallet": wallet,
+            "condition_id": condition_id,
+            "available_cash": account_check["available_cash"],
+            "requested_size_usd": account_check["requested_size_usd"],
+            "shortfall_usd": account_check["shortfall_usd"],
+            "account": account_check["account"],
+            **_paper_position_policy_dict(),
+        }
+
+    price = position.get("curPrice") or position.get("avgPrice") or 0
+    entry_price = _normalize_probability_price(price)
+    if entry_price is None or entry_price <= 0:
+        return {
+            "ok": False,
+            "reason_code": "invalid_entry_price",
+            "reason": f"Invalid copy-trade entry price: {price!r}.",
+            "wallet": wallet,
+            "condition_id": condition_id,
+            **_paper_position_policy_dict(),
+        }
+
+    return {
+        "ok": True,
+        "reason_code": "ready",
+        "reason": "Ready to open copy trade.",
+        "wallet": wallet,
+        "condition_id": condition_id,
+        "entry_price": entry_price,
+        "requested_size_usd": round(float(size_usd), 2),
+        "max_wallet_open": max_wallet_open,
+        "max_total_open": max_total_open,
+        **_paper_position_policy_dict(),
+    }
+
+
 # --- Trades ---
 
 def open_trade(signal_id, size_usd=100):
@@ -835,29 +1017,12 @@ def open_trade(signal_id, size_usd=100):
     for this signal_id, preventing duplicates from concurrent autonomy runs.
     """
     conn = get_conn()
-    sig = conn.execute("SELECT * FROM signals WHERE id=?", (signal_id,)).fetchone()
-    if not sig:
+    decision = inspect_pairs_trade_open(signal_id, size_usd=size_usd, conn=conn)
+    if not decision["ok"]:
+        log.info("Paper pairs trade blocked for signal %s: %s", signal_id, decision["reason"])
         conn.close()
         return None
-
-    # DB-level dedup: abort if open trade already exists for this signal
-    existing = conn.execute(
-        "SELECT id FROM trades WHERE signal_id=? AND status='open'", (signal_id,)
-    ).fetchone()
-    if existing:
-        conn.close()
-        return None
-
-    account_check = can_open_paper_trade(size_usd)
-    if not account_check["ok"]:
-        log.warning(
-            "Paper trade blocked for signal %s: need $%.2f cash, have $%.2f",
-            signal_id,
-            float(size_usd),
-            account_check["available_cash"],
-        )
-        conn.close()
-        return None
+    sig = decision["signal"]
 
     # Determine sides from z-score direction
     if sig["z_score"] < 0:
@@ -934,6 +1099,7 @@ def inspect_weather_trade_open(weather_signal_id, size_usd=100, max_total_open=N
     owns_conn = conn is None
     conn = conn or get_conn()
     try:
+        max_total_open = _normalize_optional_cap(max_total_open)
         sig = conn.execute(
             "SELECT * FROM weather_signals WHERE id=?", (weather_signal_id,)
         ).fetchone()
@@ -942,6 +1108,7 @@ def inspect_weather_trade_open(weather_signal_id, size_usd=100, max_total_open=N
                 "ok": False,
                 "reason_code": "signal_not_found",
                 "reason": f"Weather signal {weather_signal_id} not found.",
+                **_paper_position_policy_dict(),
             }
 
         action = sig["action"]
@@ -958,6 +1125,7 @@ def inspect_weather_trade_open(weather_signal_id, size_usd=100, max_total_open=N
                 "reason": f"Weather signal {weather_signal_id} is already open as trade #{trade_id}.",
                 "existing_trade_id": trade_id,
                 "entry_token": entry_token,
+                **_paper_position_policy_dict(),
             }
 
         existing_token_trade = None
@@ -983,6 +1151,7 @@ def inspect_weather_trade_open(weather_signal_id, size_usd=100, max_total_open=N
                 "existing_trade_id": trade_id,
                 "existing_signal_id": other_signal_id,
                 "entry_token": entry_token,
+                **_paper_position_policy_dict(),
             }
 
         if max_total_open is not None and count_open_trades() >= max_total_open:
@@ -991,6 +1160,7 @@ def inspect_weather_trade_open(weather_signal_id, size_usd=100, max_total_open=N
                 "reason_code": "max_open_reached",
                 "reason": f"At max open trades ({count_open_trades()}/{max_total_open}).",
                 "entry_token": entry_token,
+                **_paper_position_policy_dict(),
             }
 
         account_check = can_open_paper_trade(size_usd)
@@ -1006,6 +1176,7 @@ def inspect_weather_trade_open(weather_signal_id, size_usd=100, max_total_open=N
                 "account": account_check["account"],
                 "available_cash": account_check["available_cash"],
                 "requested_size_usd": account_check["requested_size_usd"],
+                **_paper_position_policy_dict(),
             }
 
         entry_price = sig["market_price"] if action == "BUY_YES" else round(1.0 - (sig["market_price"] or 0), 4)
@@ -1018,6 +1189,7 @@ def inspect_weather_trade_open(weather_signal_id, size_usd=100, max_total_open=N
             "entry_price": entry_price,
             "action": action,
             "requested_size_usd": round(float(size_usd), 2),
+            **_paper_position_policy_dict(),
         }
     finally:
         if owns_conn:
@@ -1040,34 +1212,19 @@ def open_copy_trade(
     """
     wallet = wallet.lower()
     condition_id = position.get("conditionId", "")
-    if has_open_copy_trade(wallet, condition_id):
+    decision = inspect_copy_trade_open(
+        wallet,
+        position,
+        size_usd=size_usd,
+        max_wallet_open=max_wallet_open,
+        max_total_open=max_total_open,
+    )
+    if not decision["ok"]:
+        log.info("Paper copy trade blocked for wallet %s: %s", wallet, decision["reason"])
         return None
-    if max_wallet_open is not None and count_open_copy_trades(wallet) >= max_wallet_open:
-        return None
-    if max_total_open is not None and count_open_trades() >= max_total_open:
-        return None
-    account_check = can_open_paper_trade(size_usd)
-    if not account_check["ok"]:
-        log.warning(
-            "Paper copy trade blocked for wallet %s: need $%.2f cash, have $%.2f",
-            wallet,
-            float(size_usd),
-            account_check["available_cash"],
-        )
-        return None
-
     outcome = position.get("outcome", "")
-    price = position.get("curPrice") or position.get("avgPrice") or 0
     side = "BUY_YES" if outcome.lower() not in ("no",) else "BUY_NO"
-    entry_price = _normalize_probability_price(price)
-    if entry_price is None or entry_price <= 0:
-        log.warning(
-            "Paper copy trade blocked for wallet %s: invalid entry price %r for %s",
-            wallet,
-            price,
-            condition_id,
-        )
-        return None
+    entry_price = decision["entry_price"]
 
     conn = get_conn()
     conn.execute("""
@@ -1582,10 +1739,17 @@ def set_setting(key: str, value) -> None:
 
 def get_copy_trade_settings() -> dict:
     settings = get_setting("copy_trade_limits", default=None) or {}
+    cap_enabled = bool(settings.get("cap_enabled", False))
+    per_wallet_cap = _normalize_optional_cap(settings.get("per_wallet_cap"))
+    total_open_cap = _normalize_optional_cap(settings.get("total_open_cap"))
     return {
-        "cap_enabled": bool(settings.get("cap_enabled", False)),
-        "per_wallet_cap": int(settings.get("per_wallet_cap", 3) or 3),
-        "total_open_cap": int(settings.get("total_open_cap", 25) or 25),
+        "cap_enabled": cap_enabled,
+        "per_wallet_cap": per_wallet_cap,
+        "total_open_cap": total_open_cap,
+        "effective_per_wallet_cap": per_wallet_cap if cap_enabled else None,
+        "effective_total_open_cap": total_open_cap if cap_enabled else None,
+        "caps_active": bool(cap_enabled and (per_wallet_cap is not None or total_open_cap is not None)),
+        **_paper_position_policy_dict(),
     }
 
 # --- Longshot Signals ---

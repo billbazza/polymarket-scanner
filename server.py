@@ -994,17 +994,38 @@ async def get_trade(trade_id: int):
 @app.post("/api/trades")
 async def create_trade(signal_id: int, size_usd: float = 100):
     """Open a paper trade from a signal."""
-    balance_check = db.can_open_paper_trade(size_usd)
-    if not balance_check["ok"]:
-        raise HTTPException(
-            400,
-            f"Insufficient paper cash: ${balance_check['available_cash']:.2f} available, "
-            f"${balance_check['requested_size_usd']:.2f} requested",
+    decision = db.inspect_pairs_trade_open(signal_id, size_usd=size_usd)
+    if not decision["ok"]:
+        status_code = 404 if decision["reason_code"] == "signal_not_found" else 409
+        if decision["reason_code"] == "insufficient_cash":
+            status_code = 400
+        return JSONResponse(
+            status_code=status_code,
+            content={
+                "ok": False,
+                "error": decision["reason"],
+                "reason": decision["reason"],
+                "reason_code": decision["reason_code"],
+                "paper_account": decision.get("account"),
+                "policy": {
+                    "position_policy": decision.get("position_policy"),
+                    "label": decision.get("position_policy_label"),
+                    "detail": decision.get("position_policy_detail"),
+                },
+            },
         )
     trade_id = db.open_trade(signal_id, size_usd=size_usd)
     if not trade_id:
-        raise HTTPException(404, "Signal not found")
-    return {"trade_id": trade_id, "status": "open", "paper_account": db.get_paper_account_state(refresh_unrealized=True)}
+        return JSONResponse(
+            status_code=409,
+            content={"ok": False, "error": "Pairs trade could not be opened.", "reason_code": "open_failed"},
+        )
+    return {
+        "ok": True,
+        "trade_id": trade_id,
+        "status": "open",
+        "paper_account": db.get_paper_account_state(refresh_unrealized=True),
+    }
 
 
 @app.post("/api/trades/{trade_id}/close")
@@ -1029,11 +1050,29 @@ async def open_weather_trade(signal_id: int, size_usd: float = 20):
         status_code = 404 if decision["reason_code"] == "signal_not_found" else 409
         if decision["reason_code"] == "insufficient_cash":
             status_code = 400
-        raise HTTPException(status_code, decision["reason"])
+        return JSONResponse(
+            status_code=status_code,
+            content={
+                "ok": False,
+                "error": decision["reason"],
+                "reason": decision["reason"],
+                "reason_code": decision["reason_code"],
+                "paper_account": decision.get("account"),
+                "policy": {
+                    "position_policy": decision.get("position_policy"),
+                    "label": decision.get("position_policy_label"),
+                    "detail": decision.get("position_policy_detail"),
+                },
+            },
+        )
     trade_id = db.open_weather_trade(signal_id, size_usd=size_usd)
     if not trade_id:
-        raise HTTPException(409, "Weather trade could not be opened.")
+        return JSONResponse(
+            status_code=409,
+            content={"ok": False, "error": "Weather trade could not be opened.", "reason_code": "open_failed"},
+        )
     return {
+        "ok": True,
         "trade_id": trade_id,
         "signal_id": signal_id,
         "status": "open",
@@ -1253,29 +1292,28 @@ async def get_copy_settings():
 @app.post("/api/copy/settings")
 async def update_copy_settings(
     cap_enabled: bool = False,
-    per_wallet_cap: int = 3,
-    total_open_cap: int = 25,
+    per_wallet_cap: int | None = None,
+    total_open_cap: int | None = None,
 ):
+    def _normalize_cap(value):
+        if value is None:
+            return None
+        value = int(value)
+        return value if value > 0 else None
+
     settings = {
         "cap_enabled": bool(cap_enabled),
-        "per_wallet_cap": max(1, int(per_wallet_cap)),
-        "total_open_cap": max(1, int(total_open_cap)),
+        "per_wallet_cap": _normalize_cap(per_wallet_cap),
+        "total_open_cap": _normalize_cap(total_open_cap),
     }
     db.set_setting("copy_trade_limits", settings)
-    return {"ok": True, "settings": settings}
+    return {"ok": True, "settings": db.get_copy_trade_settings()}
 
 
 @app.post("/api/copy/mirror")
 async def mirror_position(wallet: str, condition_id: str, size_usd: float = 20.0):
     """Open a paper copy trade mirroring a watched wallet's position."""
     import copy_scanner
-    balance_check = db.can_open_paper_trade(size_usd)
-    if not balance_check["ok"]:
-        raise HTTPException(
-            400,
-            f"Insufficient paper cash: ${balance_check['available_cash']:.2f} available, "
-            f"${balance_check['requested_size_usd']:.2f} requested",
-        )
     wallets = {r["address"]: r["label"] for r in db.get_watched_wallets(active_only=True)}
     label = wallets.get(wallet, wallet[:10] + "...")
     positions = copy_scanner.get_positions(wallet)
@@ -1283,6 +1321,31 @@ async def mirror_position(wallet: str, condition_id: str, size_usd: float = 20.0
     if not pos:
         raise HTTPException(404, f"Position {condition_id} not found for wallet {wallet}")
     copy_settings = db.get_copy_trade_settings()
+    decision = db.inspect_copy_trade_open(
+        wallet,
+        pos,
+        size_usd=size_usd,
+        max_wallet_open=(copy_settings["per_wallet_cap"] if copy_settings["cap_enabled"] else None),
+        max_total_open=(copy_settings["total_open_cap"] if copy_settings["cap_enabled"] else None),
+    )
+    if not decision["ok"]:
+        status_code = 400 if decision["reason_code"] == "insufficient_cash" else 409
+        return JSONResponse(
+            status_code=status_code,
+            content={
+                "ok": False,
+                "error": decision["reason"],
+                "reason": decision["reason"],
+                "reason_code": decision["reason_code"],
+                "paper_account": decision.get("account"),
+                "copy_settings": copy_settings,
+                "policy": {
+                    "position_policy": decision.get("position_policy"),
+                    "label": decision.get("position_policy_label"),
+                    "detail": decision.get("position_policy_detail"),
+                },
+            },
+        )
     trade_id = db.open_copy_trade(
         wallet,
         label,
@@ -1292,13 +1355,10 @@ async def mirror_position(wallet: str, condition_id: str, size_usd: float = 20.0
         max_total_open=(copy_settings["total_open_cap"] if copy_settings["cap_enabled"] else None),
     )
     if trade_id is None:
-        wallet_open = db.count_open_copy_trades(wallet)
-        total_open = db.count_open_trades()
-        if copy_settings["cap_enabled"] and wallet_open >= copy_settings["per_wallet_cap"]:
-            return {"ok": False, "error": f"Wallet cap reached ({wallet_open}/{copy_settings['per_wallet_cap']})"}
-        if copy_settings["cap_enabled"] and total_open >= copy_settings["total_open_cap"]:
-            return {"ok": False, "error": f"Global open trade cap reached ({total_open}/{copy_settings['total_open_cap']})"}
-        return {"ok": False, "error": "Already have an open copy trade for this position"}
+        return JSONResponse(
+            status_code=409,
+            content={"ok": False, "error": "Copy trade could not be opened.", "reason_code": "open_failed"},
+        )
     return {"ok": True, "trade_id": trade_id, "label": label,
             "market": pos.get("title"), "outcome": pos.get("outcome"),
             "price": pos.get("curPrice"), "size_usd": size_usd,

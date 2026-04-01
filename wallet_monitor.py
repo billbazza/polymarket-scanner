@@ -247,6 +247,16 @@ def _check_wallet(address: str, label: str, will_copy: bool) -> tuple[int, int]:
             copy_settings = db.get_copy_trade_settings()
             max_wallet_open = copy_settings["per_wallet_cap"] if copy_settings["cap_enabled"] else None
             max_total_open = copy_settings["total_open_cap"] if copy_settings["cap_enabled"] else None
+            decision = db.inspect_copy_trade_open(
+                address,
+                pos,
+                size_usd=COPY_SIZE_USD,
+                max_wallet_open=max_wallet_open,
+                max_total_open=max_total_open,
+            )
+            if not decision["ok"]:
+                log.info("Monitor: skipped %s — %s", label, decision["reason"])
+                continue
             t_id = db.open_copy_trade(
                 address,
                 label,
@@ -261,16 +271,7 @@ def _check_wallet(address: str, label: str, will_copy: bool) -> tuple[int, int]:
                          label, t_id, COPY_SIZE_USD)
                 _status["new_trades_found"] += 1
             else:
-                wallet_open = db.count_open_copy_trades(address)
-                total_open = db.count_open_trades()
-                if copy_settings["cap_enabled"] and max_wallet_open is not None and wallet_open >= max_wallet_open:
-                    log.info("Monitor: skipped %s — copy wallet cap reached (%d/%d)",
-                             label, wallet_open, max_wallet_open)
-                elif copy_settings["cap_enabled"] and max_total_open is not None and total_open >= max_total_open:
-                    log.info("Monitor: skipped %s — max open trade cap reached (%d/%d)",
-                             label, total_open, max_total_open)
-                else:
-                    log.debug("Monitor: dedup — copy trade already open for %s", cid[:16])
+                log.debug("Monitor: copy trade open failed after ready check for %s", cid[:16])
         else:
             log.info("Monitor: %s scored below copy threshold — not mirroring", label)
 

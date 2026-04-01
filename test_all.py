@@ -1242,6 +1242,80 @@ run("weather_signal_block_reason_for_duplicate_token", test_weather_signal_block
 run("get_trades_without_limit_returns_all_open_rows", test_get_trades_without_limit_returns_all_open_rows)
 
 
+def test_copy_trade_settings_default_to_uncapped_policy():
+    import asyncio
+    import db
+    import server
+
+    settings = db.get_copy_trade_settings()
+    check("copy settings default caps disabled", settings["cap_enabled"] is False, detail=str(settings))
+    check("copy settings default wallet cap uncapped", settings["per_wallet_cap"] is None, detail=str(settings))
+    check("copy settings default total cap uncapped", settings["total_open_cap"] is None, detail=str(settings))
+    check("copy settings default policy is uncapped cash-limited",
+          settings.get("position_policy") == "uncapped_cash_limited", detail=str(settings))
+
+    updated = asyncio.run(server.update_copy_settings(cap_enabled=True, per_wallet_cap=2, total_open_cap=0))
+    saved = updated["settings"]
+    check("copy settings preserve explicit wallet cap", saved["per_wallet_cap"] == 2, detail=str(saved))
+    check("copy settings normalize zero total cap to uncapped", saved["total_open_cap"] is None, detail=str(saved))
+    check("copy settings report active overrides when enabled", saved["caps_active"] is True, detail=str(saved))
+    check("copy settings effective total cap stays uncapped", saved["effective_total_open_cap"] is None, detail=str(saved))
+
+
+def test_paper_open_api_surfaces_block_reasons():
+    import asyncio
+    import db
+    import server
+
+    signal = {
+        "event": "Pairs API Block Reason",
+        "market_a": "Will API pair A happen?",
+        "market_b": "Will API pair B happen?",
+        "price_a": 0.44,
+        "price_b": 0.56,
+        "z_score": 1.7,
+        "coint_pvalue": 0.03,
+        "beta": 1.0,
+        "half_life": 4.0,
+        "spread_mean": 0.0,
+        "spread_std": 0.1,
+        "current_spread": 0.17,
+        "liquidity": 8000,
+        "volume_24h": 1000,
+        "action": "SELL A / BUY B",
+        "token_id_a": "tok-api-pair-a",
+        "token_id_b": "tok-api-pair-b",
+    }
+    signal_id = db.save_signal(signal)
+    first_trade = db.open_trade(signal_id, size_usd=100)
+    check("pairs API test setup trade opened", first_trade is not None and first_trade > 0, f"got {first_trade}")
+
+    response = asyncio.run(server.create_trade(signal_id=signal_id, size_usd=100))
+    payload = json.loads(response.body.decode())
+    check("pairs API duplicate open returns structured block", payload.get("ok") is False, detail=str(payload))
+    check("pairs API duplicate reason code exposed", payload.get("reason_code") == "signal_already_open", detail=str(payload))
+    check("pairs API policy detail exposed", "cash" in (payload.get("policy", {}).get("detail") or "").lower(), detail=str(payload))
+
+    wallet = "0xcopy-api-block"
+    position = {
+        "conditionId": "copy-api-block-condition",
+        "outcome": "Yes",
+        "curPrice": 0.63,
+        "title": "Will copy API blocking reason show?",
+        "asset": "copy-api-block-token",
+    }
+    with patch("copy_scanner.get_positions", return_value=[position]):
+        response = asyncio.run(server.mirror_position(wallet=wallet, condition_id=position["conditionId"], size_usd=1_000_000))
+    payload = json.loads(response.body.decode())
+    check("copy mirror API insufficient cash returns structured block", payload.get("ok") is False, detail=str(payload))
+    check("copy mirror API reason code exposed", payload.get("reason_code") == "insufficient_cash", detail=str(payload))
+    check("copy mirror API includes paper account", isinstance(payload.get("paper_account"), dict), detail=str(payload))
+
+
+run("copy_trade_settings_default_to_uncapped_policy", test_copy_trade_settings_default_to_uncapped_policy)
+run("paper_open_api_surfaces_block_reasons", test_paper_open_api_surfaces_block_reasons)
+
+
 # ── Summary ─────────────────────────────────────────────────────────────────
 
 section("Summary")
