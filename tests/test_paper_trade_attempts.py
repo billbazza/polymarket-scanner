@@ -136,6 +136,60 @@ class PaperTradeAttemptTests(unittest.TestCase):
         self.assertEqual(body["summary"]["blocked"], 1)
         self.assertEqual(body["attempts"][0]["reason_code"], "insufficient_cash")
 
+    def test_blocked_pairs_endpoint_degrades_gracefully_when_attempt_logger_missing(self):
+        signal_id = self.db.save_signal(_base_signal())
+        self.db.set_paper_starting_bankroll(10)
+
+        original = getattr(self.server.db, "record_paper_trade_attempt")
+        delattr(self.server.db, "record_paper_trade_attempt")
+        try:
+            response = self.client.post(
+                f"/api/trades?signal_id={signal_id}&size_usd=25",
+                headers={"X-API-Key": "test-admin-key"},
+            )
+        finally:
+            setattr(self.server.db, "record_paper_trade_attempt", original)
+
+        self.assertEqual(response.status_code, 400)
+        payload = response.json()
+        self.assertEqual(payload["reason_code"], "insufficient_cash")
+
+    def test_attempt_feed_degrades_gracefully_when_attempt_helpers_missing(self):
+        original_attempts = getattr(self.server.db, "get_paper_trade_attempts")
+        original_summary = getattr(self.server.db, "get_paper_trade_attempt_summary")
+        delattr(self.server.db, "get_paper_trade_attempts")
+        delattr(self.server.db, "get_paper_trade_attempt_summary")
+        try:
+            response = self.client.get("/api/paper-trade-attempts?limit=5")
+        finally:
+            setattr(self.server.db, "get_paper_trade_attempts", original_attempts)
+            setattr(self.server.db, "get_paper_trade_attempt_summary", original_summary)
+
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertFalse(body["available"])
+        self.assertEqual(body["degraded_reason"], "paper_trade_attempt_api_missing")
+        self.assertEqual(body["attempts"], [])
+        self.assertFalse(body["summary"]["available"])
+
+    def test_autonomy_record_attempt_skips_missing_db_helper(self):
+        import autonomy
+
+        autonomy = importlib.reload(autonomy)
+        original = getattr(autonomy.db, "record_paper_trade_attempt")
+        delattr(autonomy.db, "record_paper_trade_attempt")
+        try:
+            autonomy.record_attempt(
+                "paper",
+                "pairs",
+                "blocked",
+                "insufficient_cash",
+                "Insufficient paper cash.",
+                event="Autonomy preflight",
+            )
+        finally:
+            setattr(autonomy.db, "record_paper_trade_attempt", original)
+
 
 if __name__ == "__main__":
     unittest.main()

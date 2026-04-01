@@ -98,6 +98,66 @@ TESTING_IDEAS_PATH = Path(__file__).parent / "testing-ideas.md"
 FIX_LOGS_DIR = Path(__file__).parent / "fix_logs"
 
 
+def _safe_record_paper_trade_attempt(**kwargs) -> bool:
+    recorder = getattr(db, "record_paper_trade_attempt", None)
+    if not callable(recorder):
+        log.warning("Paper-trade attempt logging unavailable in db module; skipping event")
+        return False
+    try:
+        recorder(**kwargs)
+        return True
+    except Exception as exc:
+        log.warning("Paper-trade attempt logging failed: %s", exc)
+        return False
+
+
+def _paper_trade_attempt_feed(limit: int) -> dict:
+    attempts_getter = getattr(db, "get_paper_trade_attempts", None)
+    summary_getter = getattr(db, "get_paper_trade_attempt_summary", None)
+    if not callable(attempts_getter) or not callable(summary_getter):
+        return {
+            "available": False,
+            "degraded_reason": "paper_trade_attempt_api_missing",
+            "attempts": [],
+            "summary": {
+                "available": False,
+                "recent_count": 0,
+                "allowed": 0,
+                "blocked": 0,
+                "errors": 0,
+                "top_blockers": [],
+            },
+        }
+
+    try:
+        attempts = attempts_getter(limit=limit)
+        summary = summary_getter(limit=limit)
+        if not isinstance(summary, dict):
+            summary = {}
+        summary.setdefault("available", True)
+        return {
+            "available": bool(summary.get("available", True)),
+            "degraded_reason": None,
+            "attempts": attempts or [],
+            "summary": summary,
+        }
+    except Exception as exc:
+        log.warning("Paper-trade attempt feed unavailable: %s", exc)
+        return {
+            "available": False,
+            "degraded_reason": str(exc),
+            "attempts": [],
+            "summary": {
+                "available": False,
+                "recent_count": 0,
+                "allowed": 0,
+                "blocked": 0,
+                "errors": 0,
+                "top_blockers": [],
+            },
+        }
+
+
 def _tail_lines(path: Path, limit: int = 80) -> list[str]:
     if not path.exists():
         return []
@@ -426,10 +486,7 @@ async def paper_account():
 
 @app.get("/api/paper-trade-attempts")
 async def paper_trade_attempts(limit: int = 50):
-    return {
-        "attempts": db.get_paper_trade_attempts(limit=limit),
-        "summary": db.get_paper_trade_attempt_summary(limit=limit),
-    }
+    return _paper_trade_attempt_feed(limit=limit)
 
 
 @app.get("/api/cointegration/trial")
@@ -1036,7 +1093,7 @@ async def create_trade(signal_id: int, size_usd: float = 100):
     """Open a paper trade from a signal."""
     decision = db.inspect_pairs_trade_open(signal_id, size_usd=size_usd)
     if not decision["ok"]:
-        db.record_paper_trade_attempt(
+        _safe_record_paper_trade_attempt(
             source="manual_api",
             strategy="pairs",
             outcome="blocked",
@@ -1067,7 +1124,7 @@ async def create_trade(signal_id: int, size_usd: float = 100):
         )
     trade_id = db.open_trade(signal_id, size_usd=size_usd)
     if not trade_id:
-        db.record_paper_trade_attempt(
+        _safe_record_paper_trade_attempt(
             source="manual_api",
             strategy="pairs",
             outcome="error",
@@ -1082,7 +1139,7 @@ async def create_trade(signal_id: int, size_usd: float = 100):
             status_code=409,
             content={"ok": False, "error": "Pairs trade could not be opened.", "reason_code": "open_failed"},
         )
-    db.record_paper_trade_attempt(
+    _safe_record_paper_trade_attempt(
         source="manual_api",
         strategy="pairs",
         outcome="allowed",
@@ -1121,7 +1178,7 @@ async def open_weather_trade(signal_id: int, size_usd: float = 20):
     """Open a paper trade from a weather signal."""
     decision = db.inspect_weather_trade_open(signal_id, size_usd=size_usd)
     if not decision["ok"]:
-        db.record_paper_trade_attempt(
+        _safe_record_paper_trade_attempt(
             source="manual_api",
             strategy="weather",
             outcome="blocked",
@@ -1153,7 +1210,7 @@ async def open_weather_trade(signal_id: int, size_usd: float = 20):
         )
     trade_id = db.open_weather_trade(signal_id, size_usd=size_usd)
     if not trade_id:
-        db.record_paper_trade_attempt(
+        _safe_record_paper_trade_attempt(
             source="manual_api",
             strategy="weather",
             outcome="error",
@@ -1169,7 +1226,7 @@ async def open_weather_trade(signal_id: int, size_usd: float = 20):
             status_code=409,
             content={"ok": False, "error": "Weather trade could not be opened.", "reason_code": "open_failed"},
         )
-    db.record_paper_trade_attempt(
+    _safe_record_paper_trade_attempt(
         source="manual_api",
         strategy="weather",
         outcome="allowed",
@@ -1294,7 +1351,7 @@ def _run_autonomy_background():
         log.info("Autonomy cycle complete in %.1fs", duration)
     except Exception as e:
         log.exception("Autonomy cycle failed in background thread: %s", e)
-        db.record_paper_trade_attempt(
+        _safe_record_paper_trade_attempt(
             source="autonomy_runner",
             strategy="system",
             outcome="error",
@@ -1449,7 +1506,7 @@ async def mirror_position(wallet: str, condition_id: str, size_usd: float = 20.0
         max_total_open=(copy_settings["total_open_cap"] if copy_settings["cap_enabled"] else None),
     )
     if not decision["ok"]:
-        db.record_paper_trade_attempt(
+        _safe_record_paper_trade_attempt(
             source="manual_api",
             strategy="copy",
             outcome="blocked",
@@ -1488,7 +1545,7 @@ async def mirror_position(wallet: str, condition_id: str, size_usd: float = 20.0
         max_total_open=(copy_settings["total_open_cap"] if copy_settings["cap_enabled"] else None),
     )
     if trade_id is None:
-        db.record_paper_trade_attempt(
+        _safe_record_paper_trade_attempt(
             source="manual_api",
             strategy="copy",
             outcome="error",
@@ -1505,7 +1562,7 @@ async def mirror_position(wallet: str, condition_id: str, size_usd: float = 20.0
             status_code=409,
             content={"ok": False, "error": "Copy trade could not be opened.", "reason_code": "open_failed"},
         )
-    db.record_paper_trade_attempt(
+    _safe_record_paper_trade_attempt(
         source="manual_api",
         strategy="copy",
         outcome="allowed",

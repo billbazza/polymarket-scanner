@@ -165,9 +165,22 @@ def journal(entry):
     log.info("JOURNAL: %s — %s", entry.get("action", "?"), entry.get("reason", "")[:80])
 
 
+def _safe_record_paper_trade_attempt(**kwargs):
+    recorder = getattr(db, "record_paper_trade_attempt", None)
+    if not callable(recorder):
+        log.warning("Paper-trade attempt logging unavailable in db module; skipping event")
+        return False
+    try:
+        recorder(**kwargs)
+        return True
+    except Exception as exc:
+        log.warning("Paper-trade attempt logging failed; continuing autonomy cycle: %s", exc)
+        return False
+
+
 def record_attempt(level, strategy, outcome, reason_code, reason, **kwargs):
     """Persist an operator-facing paper-trade attempt or gating event."""
-    db.record_paper_trade_attempt(
+    _safe_record_paper_trade_attempt(
         source="autonomy",
         strategy=strategy,
         outcome=outcome,

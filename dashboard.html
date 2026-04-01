@@ -918,19 +918,27 @@ async function loadPaperAttempts() {
     const data = await r.json();
     const rows = data.attempts || [];
     const summary = data.summary || {};
+    const available = data.available !== false && summary.available !== false;
     getEl('cntPaperAttempts').textContent = rows.length;
-    getEl('paperAttemptsInfo').textContent = rows.length
+    getEl('paperAttemptsInfo').textContent = !available
+      ? 'Paper-trade attempt logging is unavailable on this deployment. Recent gate decisions may only exist in scanner.log.'
+      : rows.length
       ? `${rows.length} recent gate decisions and failures`
       : 'No recent paper-trade gate decisions recorded.';
-    getEl('paperAttemptsSummary').textContent =
-      `${summary.allowed || 0} allowed · ${summary.blocked || 0} blocked · ${summary.errors || 0} errors` +
-      ((summary.top_blockers || []).length
-        ? ` · top blockers: ${(summary.top_blockers || []).map(b => `${b.reason_code} (${b.count})`).join(', ')}`
-        : '');
+    getEl('paperAttemptsSummary').textContent = !available
+      ? `Feed unavailable${data.degraded_reason ? ` · ${data.degraded_reason}` : ''}`
+      : `${summary.allowed || 0} allowed · ${summary.blocked || 0} blocked · ${summary.errors || 0} errors` +
+        ((summary.top_blockers || []).length
+          ? ` · top blockers: ${(summary.top_blockers || []).map(b => `${b.reason_code} (${b.count})`).join(', ')}`
+          : '');
 
     const body = getEl('paperAttemptsBody');
     if (!rows.length) {
-      body.innerHTML = '<tr><td colspan="7" class="empty"><div class="icon">⊘</div>No recent paper-trade gate decisions.</td></tr>';
+      body.innerHTML = `<tr><td colspan="7" class="empty"><div class="icon">⊘</div>${
+        available
+          ? 'No recent paper-trade gate decisions.'
+          : 'Paper-trade attempt logging is unavailable.'
+      }</td></tr>`;
       return;
     }
 

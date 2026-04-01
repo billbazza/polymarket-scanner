@@ -31,6 +31,14 @@ def _add_column_if_missing(conn, table_name, column_name, column_type):
         conn.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_type}")
 
 
+def _table_exists(conn, table_name):
+    row = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+        (table_name,),
+    ).fetchone()
+    return bool(row)
+
+
 def _normalize_query_limit(limit, context: str):
     """Normalize optional LIMIT values before handing them to SQLite.
 
@@ -1004,53 +1012,70 @@ def record_paper_trade_attempt(
     details: dict | None = None,
 ) -> int:
     conn = get_conn()
-    conn.execute(
-        """
-        INSERT INTO paper_trade_attempts (
-            timestamp, source, strategy, outcome, reason_code, reason, event,
-            signal_id, weather_signal_id, trade_id, token_id, wallet, condition_id,
-            autonomy_level, phase, size_usd, details_json
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            time.time(),
-            source,
-            strategy,
-            outcome,
-            reason_code,
-            _sanitize_operator_reason(reason, fallback="Decision recorded."),
-            event,
-            signal_id,
-            weather_signal_id,
-            trade_id,
-            token_id,
-            wallet.lower() if wallet else None,
-            condition_id,
-            autonomy_level,
-            phase,
-            round(float(size_usd), 2) if size_usd is not None else None,
-            json.dumps(details) if details else None,
-        ),
-    )
-    row_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
-    conn.commit()
-    conn.close()
-    return int(row_id)
+    try:
+        if not _table_exists(conn, "paper_trade_attempts"):
+            log.warning("paper_trade_attempts table unavailable; skipping attempt log write")
+            return 0
+
+        conn.execute(
+            """
+            INSERT INTO paper_trade_attempts (
+                timestamp, source, strategy, outcome, reason_code, reason, event,
+                signal_id, weather_signal_id, trade_id, token_id, wallet, condition_id,
+                autonomy_level, phase, size_usd, details_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                time.time(),
+                source,
+                strategy,
+                outcome,
+                reason_code,
+                _sanitize_operator_reason(reason, fallback="Decision recorded."),
+                event,
+                signal_id,
+                weather_signal_id,
+                trade_id,
+                token_id,
+                wallet.lower() if wallet else None,
+                condition_id,
+                autonomy_level,
+                phase,
+                round(float(size_usd), 2) if size_usd is not None else None,
+                json.dumps(details) if details else None,
+            ),
+        )
+        row_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+        conn.commit()
+        return int(row_id)
+    except sqlite3.Error as exc:
+        log.warning("Failed to record paper trade attempt: %s", exc)
+        return 0
+    finally:
+        conn.close()
 
 
 def get_paper_trade_attempts(limit: int = 50) -> list[dict]:
     limit = _normalize_query_limit(limit, "get_paper_trade_attempts")
     conn = get_conn()
-    query = """
-        SELECT *
-        FROM paper_trade_attempts
-        ORDER BY timestamp DESC, id DESC
-    """
-    if limit is None:
-        rows = conn.execute(query).fetchall()
-    else:
-        rows = conn.execute(query + " LIMIT ?", (limit,)).fetchall()
-    conn.close()
+    try:
+        if not _table_exists(conn, "paper_trade_attempts"):
+            return []
+
+        query = """
+            SELECT *
+            FROM paper_trade_attempts
+            ORDER BY timestamp DESC, id DESC
+        """
+        if limit is None:
+            rows = conn.execute(query).fetchall()
+        else:
+            rows = conn.execute(query + " LIMIT ?", (limit,)).fetchall()
+    except sqlite3.Error as exc:
+        log.warning("Failed to query paper trade attempts: %s", exc)
+        return []
+    finally:
+        conn.close()
 
     attempts = []
     for row in rows:
@@ -1077,6 +1102,7 @@ def get_paper_trade_attempt_summary(limit: int = 50) -> dict:
         for code, count in sorted(reason_counts.items(), key=lambda item: (-item[1], item[0]))
     ][:5]
     return {
+        "available": True,
         "recent_count": len(attempts),
         "allowed": allowed,
         "blocked": blocked,
