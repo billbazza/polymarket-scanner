@@ -424,6 +424,14 @@ async def paper_account():
     return db.get_paper_account_state(refresh_unrealized=True)
 
 
+@app.get("/api/paper-trade-attempts")
+async def paper_trade_attempts(limit: int = 50):
+    return {
+        "attempts": db.get_paper_trade_attempts(limit=limit),
+        "summary": db.get_paper_trade_attempt_summary(limit=limit),
+    }
+
+
 @app.get("/api/cointegration/trial")
 async def cointegration_trial_status():
     settings = cointegration_trial.get_trial_settings()
@@ -1028,6 +1036,17 @@ async def create_trade(signal_id: int, size_usd: float = 100):
     """Open a paper trade from a signal."""
     decision = db.inspect_pairs_trade_open(signal_id, size_usd=size_usd)
     if not decision["ok"]:
+        db.record_paper_trade_attempt(
+            source="manual_api",
+            strategy="pairs",
+            outcome="blocked",
+            reason_code=decision["reason_code"],
+            reason=decision["reason"],
+            event=((decision.get("signal") or {}).get("event")),
+            signal_id=signal_id,
+            size_usd=size_usd,
+            details={"path": "/api/trades"},
+        )
         status_code = 404 if decision["reason_code"] == "signal_not_found" else 409
         if decision["reason_code"] == "insufficient_cash":
             status_code = 400
@@ -1048,10 +1067,33 @@ async def create_trade(signal_id: int, size_usd: float = 100):
         )
     trade_id = db.open_trade(signal_id, size_usd=size_usd)
     if not trade_id:
+        db.record_paper_trade_attempt(
+            source="manual_api",
+            strategy="pairs",
+            outcome="error",
+            reason_code="open_failed",
+            reason="Pairs trade could not be opened after preflight passed.",
+            event=((decision.get("signal") or {}).get("event")),
+            signal_id=signal_id,
+            size_usd=size_usd,
+            details={"path": "/api/trades"},
+        )
         return JSONResponse(
             status_code=409,
             content={"ok": False, "error": "Pairs trade could not be opened.", "reason_code": "open_failed"},
         )
+    db.record_paper_trade_attempt(
+        source="manual_api",
+        strategy="pairs",
+        outcome="allowed",
+        reason_code="opened",
+        reason="Paper pairs trade opened.",
+        event=((decision.get("signal") or {}).get("event")),
+        signal_id=signal_id,
+        trade_id=trade_id,
+        size_usd=size_usd,
+        details={"path": "/api/trades"},
+    )
     return {
         "ok": True,
         "trade_id": trade_id,
@@ -1079,6 +1121,18 @@ async def open_weather_trade(signal_id: int, size_usd: float = 20):
     """Open a paper trade from a weather signal."""
     decision = db.inspect_weather_trade_open(signal_id, size_usd=size_usd)
     if not decision["ok"]:
+        db.record_paper_trade_attempt(
+            source="manual_api",
+            strategy="weather",
+            outcome="blocked",
+            reason_code=decision["reason_code"],
+            reason=decision["reason"],
+            event=((decision.get("signal") or {}).get("event")),
+            weather_signal_id=signal_id,
+            token_id=decision.get("entry_token"),
+            size_usd=size_usd,
+            details={"path": "/api/weather/{signal_id}/trade"},
+        )
         status_code = 404 if decision["reason_code"] == "signal_not_found" else 409
         if decision["reason_code"] == "insufficient_cash":
             status_code = 400
@@ -1099,10 +1153,35 @@ async def open_weather_trade(signal_id: int, size_usd: float = 20):
         )
     trade_id = db.open_weather_trade(signal_id, size_usd=size_usd)
     if not trade_id:
+        db.record_paper_trade_attempt(
+            source="manual_api",
+            strategy="weather",
+            outcome="error",
+            reason_code="open_failed",
+            reason="Weather trade could not be opened after preflight passed.",
+            event=((decision.get("signal") or {}).get("event")),
+            weather_signal_id=signal_id,
+            token_id=decision.get("entry_token"),
+            size_usd=size_usd,
+            details={"path": "/api/weather/{signal_id}/trade"},
+        )
         return JSONResponse(
             status_code=409,
             content={"ok": False, "error": "Weather trade could not be opened.", "reason_code": "open_failed"},
         )
+    db.record_paper_trade_attempt(
+        source="manual_api",
+        strategy="weather",
+        outcome="allowed",
+        reason_code="opened",
+        reason="Paper weather trade opened.",
+        event=((decision.get("signal") or {}).get("event")),
+        weather_signal_id=signal_id,
+        trade_id=trade_id,
+        token_id=decision.get("entry_token"),
+        size_usd=size_usd,
+        details={"path": "/api/weather/{signal_id}/trade"},
+    )
     return {
         "ok": True,
         "trade_id": trade_id,
@@ -1215,6 +1294,15 @@ def _run_autonomy_background():
         log.info("Autonomy cycle complete in %.1fs", duration)
     except Exception as e:
         log.exception("Autonomy cycle failed in background thread: %s", e)
+        db.record_paper_trade_attempt(
+            source="autonomy_runner",
+            strategy="system",
+            outcome="error",
+            reason_code="autonomy_cycle_failed",
+            reason=f"Autonomy cycle failed: {e}",
+            event="Autonomy cycle",
+            details={"path": "/api/autonomy"},
+        )
         _autonomy_status["last_result"] = {"ok": False, "error": str(e)}
     finally:
         _autonomy_status["running"] = False
@@ -1361,6 +1449,19 @@ async def mirror_position(wallet: str, condition_id: str, size_usd: float = 20.0
         max_total_open=(copy_settings["total_open_cap"] if copy_settings["cap_enabled"] else None),
     )
     if not decision["ok"]:
+        db.record_paper_trade_attempt(
+            source="manual_api",
+            strategy="copy",
+            outcome="blocked",
+            reason_code=decision["reason_code"],
+            reason=decision["reason"],
+            event=pos.get("title"),
+            token_id=pos.get("asset"),
+            wallet=wallet,
+            condition_id=condition_id,
+            size_usd=size_usd,
+            details={"path": "/api/copy/mirror"},
+        )
         status_code = 400 if decision["reason_code"] == "insufficient_cash" else 409
         return JSONResponse(
             status_code=status_code,
@@ -1387,10 +1488,37 @@ async def mirror_position(wallet: str, condition_id: str, size_usd: float = 20.0
         max_total_open=(copy_settings["total_open_cap"] if copy_settings["cap_enabled"] else None),
     )
     if trade_id is None:
+        db.record_paper_trade_attempt(
+            source="manual_api",
+            strategy="copy",
+            outcome="error",
+            reason_code="open_failed",
+            reason="Copy trade could not be opened after preflight passed.",
+            event=pos.get("title"),
+            token_id=pos.get("asset"),
+            wallet=wallet,
+            condition_id=condition_id,
+            size_usd=size_usd,
+            details={"path": "/api/copy/mirror"},
+        )
         return JSONResponse(
             status_code=409,
             content={"ok": False, "error": "Copy trade could not be opened.", "reason_code": "open_failed"},
         )
+    db.record_paper_trade_attempt(
+        source="manual_api",
+        strategy="copy",
+        outcome="allowed",
+        reason_code="opened",
+        reason="Paper copy trade opened.",
+        event=pos.get("title"),
+        trade_id=trade_id,
+        token_id=pos.get("asset"),
+        wallet=wallet,
+        condition_id=condition_id,
+        size_usd=size_usd,
+        details={"path": "/api/copy/mirror", "label": label, "outcome": pos.get("outcome")},
+    )
     return {"ok": True, "trade_id": trade_id, "label": label,
             "market": pos.get("title"), "outcome": pos.get("outcome"),
             "price": pos.get("curPrice"), "size_usd": size_usd,

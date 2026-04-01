@@ -518,6 +518,38 @@ def _migration_008_cointegration_trial_fields(conn):
     _migration_002_backfill_columns(conn)
 
 
+def _migration_009_paper_trade_attempts(conn):
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS paper_trade_attempts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp REAL NOT NULL,
+            source TEXT NOT NULL,
+            strategy TEXT NOT NULL,
+            outcome TEXT NOT NULL,
+            reason_code TEXT,
+            reason TEXT,
+            event TEXT,
+            signal_id INTEGER,
+            weather_signal_id INTEGER,
+            trade_id INTEGER,
+            token_id TEXT,
+            wallet TEXT,
+            condition_id TEXT,
+            autonomy_level TEXT,
+            phase TEXT,
+            size_usd REAL,
+            details_json TEXT
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_paper_trade_attempts_ts
+            ON paper_trade_attempts(timestamp DESC);
+        CREATE INDEX IF NOT EXISTS idx_paper_trade_attempts_outcome
+            ON paper_trade_attempts(outcome);
+        CREATE INDEX IF NOT EXISTS idx_paper_trade_attempts_strategy
+            ON paper_trade_attempts(strategy);
+    """)
+
+
 _MIGRATIONS = [
     ("001_base_schema", _migration_001_base_schema),
     ("002_backfill_columns", _migration_002_backfill_columns),
@@ -527,6 +559,7 @@ _MIGRATIONS = [
     ("006_paper_account", _migration_006_paper_account),
     ("007_copy_no_entry_price_fix", _migration_007_copy_no_entry_price_fix),
     ("008_cointegration_trial_fields", _migration_008_cointegration_trial_fields),
+    ("009_paper_trade_attempts", _migration_009_paper_trade_attempts),
 ]
 
 
@@ -939,6 +972,116 @@ def can_open_paper_trade(size_usd: float) -> dict:
         "available_cash": account["available_cash"],
         "shortfall_usd": round(max(0.0, requested - account["available_cash"]), 2),
         "account": account,
+    }
+
+
+def _sanitize_operator_reason(reason, fallback: str = "Decision recorded.") -> str:
+    if reason is None:
+        return fallback
+    text = " ".join(str(reason).replace("\n", " ").split()).strip()
+    if not text:
+        return fallback
+    return text[:240]
+
+
+def record_paper_trade_attempt(
+    *,
+    source: str,
+    strategy: str,
+    outcome: str,
+    reason_code: str | None = None,
+    reason: str | None = None,
+    event: str | None = None,
+    signal_id: int | None = None,
+    weather_signal_id: int | None = None,
+    trade_id: int | None = None,
+    token_id: str | None = None,
+    wallet: str | None = None,
+    condition_id: str | None = None,
+    autonomy_level: str | None = None,
+    phase: str | None = None,
+    size_usd: float | None = None,
+    details: dict | None = None,
+) -> int:
+    conn = get_conn()
+    conn.execute(
+        """
+        INSERT INTO paper_trade_attempts (
+            timestamp, source, strategy, outcome, reason_code, reason, event,
+            signal_id, weather_signal_id, trade_id, token_id, wallet, condition_id,
+            autonomy_level, phase, size_usd, details_json
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            time.time(),
+            source,
+            strategy,
+            outcome,
+            reason_code,
+            _sanitize_operator_reason(reason, fallback="Decision recorded."),
+            event,
+            signal_id,
+            weather_signal_id,
+            trade_id,
+            token_id,
+            wallet.lower() if wallet else None,
+            condition_id,
+            autonomy_level,
+            phase,
+            round(float(size_usd), 2) if size_usd is not None else None,
+            json.dumps(details) if details else None,
+        ),
+    )
+    row_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+    conn.commit()
+    conn.close()
+    return int(row_id)
+
+
+def get_paper_trade_attempts(limit: int = 50) -> list[dict]:
+    limit = _normalize_query_limit(limit, "get_paper_trade_attempts")
+    conn = get_conn()
+    query = """
+        SELECT *
+        FROM paper_trade_attempts
+        ORDER BY timestamp DESC, id DESC
+    """
+    if limit is None:
+        rows = conn.execute(query).fetchall()
+    else:
+        rows = conn.execute(query + " LIMIT ?", (limit,)).fetchall()
+    conn.close()
+
+    attempts = []
+    for row in rows:
+        item = dict(row)
+        item["details"] = json.loads(item["details_json"]) if item.get("details_json") else None
+        item.pop("details_json", None)
+        attempts.append(item)
+    return attempts
+
+
+def get_paper_trade_attempt_summary(limit: int = 50) -> dict:
+    attempts = get_paper_trade_attempts(limit=limit)
+    blocked = sum(1 for item in attempts if item.get("outcome") == "blocked")
+    allowed = sum(1 for item in attempts if item.get("outcome") == "allowed")
+    errors = sum(1 for item in attempts if item.get("outcome") == "error")
+    reason_counts = {}
+    for item in attempts:
+        if item.get("outcome") == "allowed":
+            continue
+        code = item.get("reason_code") or "unknown"
+        reason_counts[code] = reason_counts.get(code, 0) + 1
+    top_blockers = [
+        {"reason_code": code, "count": count}
+        for code, count in sorted(reason_counts.items(), key=lambda item: (-item[1], item[0]))
+    ][:5]
+    return {
+        "recent_count": len(attempts),
+        "allowed": allowed,
+        "blocked": blocked,
+        "errors": errors,
+        "top_blockers": top_blockers,
     }
 
 

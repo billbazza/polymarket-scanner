@@ -459,6 +459,7 @@
     <div class="tab"        data-tab="weather"  onclick="switchTab('weather')">Weather <span class="badge-count" id="cntWeather">0</span></div>
     <div class="tab"        data-tab="whales"   onclick="switchTab('whales')">Whales <span class="badge-count" id="cntWhales" style="background:rgba(239,68,68,0.2);color:var(--red)">0</span></div>
     <div class="tab"        data-tab="copy"     onclick="switchTab('copy')">Copy Trader <span class="badge-count" id="cntCopy">0</span></div>
+    <div class="tab"        data-tab="paper-attempts" onclick="switchTab('paper-attempts')">Paper Gate <span class="badge-count" id="cntPaperAttempts">0</span></div>
     <div class="tab"        data-tab="trades"   onclick="switchTab('trades')">Open Trades</div>
     <div class="tab"        data-tab="history"  onclick="switchTab('history')">Trade History</div>
     <div class="tab"        data-tab="scans"    onclick="switchTab('scans')">Scan Log</div>
@@ -653,7 +654,28 @@
       <span style="color:var(--text2);font-size:12px">No candidates yet — run discovery or wait for next autonomy cycle (every 6h).</span>
     </div>
 
-    <div id="copyBody"></div>
+  <div id="copyBody"></div>
+  </div>
+
+  <div id="panel-paper-attempts" style="display:none">
+    <div class="panel-toolbar">
+      <span class="info" id="paperAttemptsInfo">Recent paper-trade gate decisions and autonomy failures.</span>
+      <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
+        <span id="paperAttemptsSummary" style="color:var(--text2);font-size:12px">Loading…</span>
+        <button class="btn sm" onclick="loadPaperAttempts()">Refresh</button>
+      </div>
+    </div>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>Time</th><th>Source</th><th>Strategy</th><th>Decision</th>
+            <th>Event</th><th>Reason</th><th>Refs</th>
+          </tr>
+        </thead>
+        <tbody id="paperAttemptsBody"></tbody>
+      </table>
+    </div>
   </div>
 
   <!-- ── Trade History ── -->
@@ -732,7 +754,7 @@
 
 <script>
 const API = '';
-const ALL_PANELS = ['signals','locked','weather','whales','copy','trades','history','scans','reports','console'];
+const ALL_PANELS = ['signals','locked','weather','whales','copy','paper-attempts','trades','history','scans','reports','console'];
 const UI_PREFS_KEY = 'polymarket-scanner-ui-prefs-v1';
 
 // ── Utilities ──────────────────────────────────────────────────────────────
@@ -834,6 +856,7 @@ function switchTab(name) {
   if (name === 'weather') loadWeather();
   if (name === 'whales')  loadWhales();
   if (name === 'copy')    { loadCopy(); loadCandidates(); }
+  if (name === 'paper-attempts') loadPaperAttempts();
 }
 
 // ── Stats ──────────────────────────────────────────────────────────────────
@@ -877,6 +900,73 @@ async function loadStats() {
     document.getElementById('statScans').textContent = s.total_scans;
     drawPnlChart(s.pnl_series);
   } catch(e) {}
+}
+
+function formatAttemptRef(row) {
+  const refs = [];
+  if (row.trade_id) refs.push(`trade #${row.trade_id}`);
+  if (row.signal_id) refs.push(`signal #${row.signal_id}`);
+  if (row.weather_signal_id) refs.push(`weather #${row.weather_signal_id}`);
+  if (row.condition_id) refs.push(`cond ${row.condition_id.slice(0, 8)}`);
+  if (row.token_id) refs.push(`token ${String(row.token_id).slice(0, 8)}`);
+  return refs.length ? refs.join(' · ') : '—';
+}
+
+async function loadPaperAttempts() {
+  try {
+    const r = await fetch(API + '/api/paper-trade-attempts?limit=60');
+    const data = await r.json();
+    const rows = data.attempts || [];
+    const summary = data.summary || {};
+    getEl('cntPaperAttempts').textContent = rows.length;
+    getEl('paperAttemptsInfo').textContent = rows.length
+      ? `${rows.length} recent gate decisions and failures`
+      : 'No recent paper-trade gate decisions recorded.';
+    getEl('paperAttemptsSummary').textContent =
+      `${summary.allowed || 0} allowed · ${summary.blocked || 0} blocked · ${summary.errors || 0} errors` +
+      ((summary.top_blockers || []).length
+        ? ` · top blockers: ${(summary.top_blockers || []).map(b => `${b.reason_code} (${b.count})`).join(', ')}`
+        : '');
+
+    const body = getEl('paperAttemptsBody');
+    if (!rows.length) {
+      body.innerHTML = '<tr><td colspan="7" class="empty"><div class="icon">⊘</div>No recent paper-trade gate decisions.</td></tr>';
+      return;
+    }
+
+    body.innerHTML = rows.map(row => {
+      const decisionColor = row.outcome === 'allowed'
+        ? 'var(--green)'
+        : row.outcome === 'blocked'
+          ? 'var(--amber)'
+          : 'var(--red)';
+      const decisionLabel = row.outcome === 'allowed'
+        ? 'ALLOWED'
+        : row.outcome === 'blocked'
+          ? 'BLOCKED'
+          : 'ERROR';
+      const source = row.source === 'manual_api'
+        ? 'manual'
+        : row.source === 'autonomy_runner'
+          ? 'runner'
+          : row.source;
+      const strategy = row.strategy === 'system' ? 'system' : row.strategy;
+      return `<tr>
+        <td>${fmt(row.timestamp)}</td>
+        <td>${esc(source)}${row.autonomy_level ? `<div style="color:var(--text2);font-size:10px">${esc(row.autonomy_level)}</div>` : ''}</td>
+        <td>${esc(strategy)}${row.phase ? `<div style="color:var(--text2);font-size:10px" title="${esc(row.phase)}">${esc(row.phase)}</div>` : ''}</td>
+        <td><span class="badge" style="background:rgba(15,23,42,0.85);color:${decisionColor};border:1px solid ${decisionColor}">${decisionLabel}</span></td>
+        <td class="event-name" title="${esc(row.event || '')}">${esc(row.event || '—')}</td>
+        <td title="${esc(row.reason || '')}">
+          <div style="font-weight:600">${esc(row.reason_code || 'unknown')}</div>
+          <div style="color:var(--text2);font-size:11px;white-space:normal;max-width:460px">${esc(row.reason || '—')}</div>
+        </td>
+        <td style="color:var(--text2);font-size:11px">${esc(formatAttemptRef(row))}${row.size_usd != null ? `<div>${fmtUsd(row.size_usd)}</div>` : ''}</td>
+      </tr>`;
+    }).join('');
+  } catch (e) {
+    console.error('Paper attempts error:', e);
+  }
 }
 
 // ── P&L Chart ──────────────────────────────────────────────────────────────
@@ -1335,8 +1425,10 @@ async function openWeatherTrade(signalId, btn) {
       btn.textContent = 'traded';
       btn.disabled = true;
       btn.style.opacity = '0.5';
+      loadPaperAttempts();
     } else {
       toast(`Error: ${data.reason || data.detail || data.error || JSON.stringify(data)}`, true);
+      loadPaperAttempts();
       btn.disabled = false;
       btn.textContent = 'Trade';
     }
@@ -1369,7 +1461,7 @@ async function runAutoTrade() {
           const res = status.last_result;
           if (res && res.ok)
             toast(`Done: ${res.signals_found} signals, ${res.trades_opened} opened, ${res.trades_closed} closed (${res.duration_secs}s)`);
-          loadStats(); loadSignals(); loadTrades(); loadWeather();
+          loadStats(); loadSignals(); loadTrades(); loadWeather(); loadPaperAttempts();
         }
       } catch(e) { clearInterval(poll); btn.disabled = false; btn.innerHTML = 'Auto Trade'; }
     }, 5000);
@@ -1413,10 +1505,11 @@ async function paperTrade(signalId) {
     const data = await r.json();
     if (!r.ok || data.ok === false) {
       toast(`Failed: ${data.reason || data.detail || data.error || 'Request failed'}`, true);
+      loadPaperAttempts();
       return;
     }
     toast(`Paper trade opened (ID: ${data.trade_id})`);
-    loadSignals(); loadTrades(); loadStats();
+    loadSignals(); loadTrades(); loadStats(); loadPaperAttempts();
   } catch(e) { toast('Failed: ' + e.message); }
 }
 
@@ -2169,7 +2262,7 @@ async function mirrorTrade(wallet, conditionId, btn) {
       btn.textContent = '✓ Mirrored';
       btn.style.background = 'var(--green)'; btn.style.color = '#000';
       toast(`Mirror trade #${data.trade_id}: ${data.outcome} on ${(data.market||'').slice(0,40)}`);
-      loadTrades(); loadStats();
+      loadTrades(); loadStats(); loadPaperAttempts();
     } else {
       // Handle specific error cases
       if (data.reason_code === 'position_already_open' || (data.error && data.error.includes('Already have an open copy trade'))) {
@@ -2180,6 +2273,7 @@ async function mirrorTrade(wallet, conditionId, btn) {
         toast(data.reason || data.error || 'Mirror failed', true);
         btn.disabled = false; btn.textContent = 'Mirror $20';
       }
+      loadPaperAttempts();
     }
   } catch(e) { 
     toast('Error: ' + e, true); 
@@ -2193,9 +2287,11 @@ async function mirrorTrade(wallet, conditionId, btn) {
 loadUiPrefs();
 loadStats();
 loadSignals();
+loadPaperAttempts();
 checkWhaleAlerts();
 setInterval(loadStats, 60000);
 setInterval(loadTrades, 60000);
+setInterval(loadPaperAttempts, 60000);
 setInterval(checkWhaleAlerts, 60000);
 setInterval(() => { if (document.querySelector('.tab[data-tab="copy"]')?.classList.contains('active')) loadCopy(); }, 120000);
 </script>

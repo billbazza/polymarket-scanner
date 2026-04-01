@@ -165,6 +165,20 @@ def journal(entry):
     log.info("JOURNAL: %s — %s", entry.get("action", "?"), entry.get("reason", "")[:80])
 
 
+def record_attempt(level, strategy, outcome, reason_code, reason, **kwargs):
+    """Persist an operator-facing paper-trade attempt or gating event."""
+    db.record_paper_trade_attempt(
+        source="autonomy",
+        strategy=strategy,
+        outcome=outcome,
+        reason_code=reason_code,
+        reason=reason,
+        autonomy_level=level,
+        phase=kwargs.pop("phase", None),
+        **kwargs,
+    )
+
+
 # --- Performance Metrics ---
 
 def get_performance(state):
@@ -264,6 +278,15 @@ def run_cycle(state):
             except Exception as e2:
                 log.error("Scan failed: %s", e2)
                 journal({"action": "scan_failed", "reason": str(e2), "level": level})
+                record_attempt(
+                    level,
+                    "system",
+                    "error",
+                    "scan_failed",
+                    f"Autonomy scan failed: {e2}",
+                    event="Autonomy scan",
+                    phase=current_stage,
+                )
                 return state
 
         opportunities = scan_result["opportunities"]
@@ -308,6 +331,29 @@ def run_cycle(state):
                 new_signal_ids.append(sid)
             except Exception as e:
                 log.warning("Failed to save signal: %s", e)
+
+        for opp in opportunities:
+            if not paper_mode:
+                continue
+            if opp.get("admit_trade"):
+                continue
+            record_attempt(
+                level,
+                "pairs",
+                "blocked",
+                opp.get("experiment_reason_code") or "strategy_not_tradeable",
+                opp.get("experiment_reason") or "Signal did not pass autonomy strategy filters.",
+                event=opp.get("event"),
+                signal_id=opp.get("id"),
+                size_usd=config.get("size_usd"),
+                phase="step 1 strategy admission",
+                details={
+                    "grade_label": opp.get("grade_label"),
+                    "tradeable": bool(opp.get("tradeable")),
+                    "paper_tradeable": bool(opp.get("paper_tradeable")),
+                    "admission_path": opp.get("admission_path"),
+                },
+            )
 
         tradeable = [o for o in opportunities if o.get("tradeable")]
         log.info(
@@ -356,6 +402,15 @@ def run_cycle(state):
                                  pnl_info.get("pnl_usd", 0))
         except Exception as e:
             log.warning("Trade monitoring failed during %s: %s", current_stage, e)
+            record_attempt(
+                level,
+                "system",
+                "error",
+                "refresh_open_trades_failed",
+                f"Open-trade refresh failed: {e}",
+                event="Open trade refresh",
+                phase=current_stage,
+            )
 
         # Step 2b: Manage pending maker orders (check fills, cancel expired)
         current_stage = "step 2b manage maker orders"
@@ -366,6 +421,15 @@ def run_cycle(state):
                          order_result["filled"], order_result["cancelled"])
         except Exception as e:
             log.warning("Maker order management failed during %s: %s", current_stage, e)
+            record_attempt(
+                level,
+                "system",
+                "error",
+                "maker_order_management_failed",
+                f"Maker-order management failed: {e}",
+                event="Maker orders",
+                phase=current_stage,
+            )
 
         # Step 3: Auto-close reverted trades
         current_stage = "step 3 auto-close"
@@ -400,6 +464,15 @@ def run_cycle(state):
                              c["trade_id"], pnl, c.get("z_score", 0))
         except Exception as e:
             log.warning("Auto-close failed during %s: %s", current_stage, e)
+            record_attempt(
+                level,
+                "system",
+                "error",
+                "auto_close_failed",
+                f"Auto-close failed: {e}",
+                event="Auto-close",
+                phase=current_stage,
+            )
 
         # Step 4: Open new trades (if allowed at this level)
         current_stage = "step 4 open pairs preflight"
@@ -419,6 +492,16 @@ def run_cycle(state):
                      open_count, max_open)
             journal({"action": "skip_trade", "level": level,
                      "reason": f"At max positions ({open_count}/{max_open})"})
+            record_attempt(
+                level,
+                "pairs",
+                "blocked",
+                "max_open_reached",
+                f"At max positions ({open_count}/{max_open}).",
+                event="Pairs autonomy preflight",
+                phase=current_stage,
+                details={"open_count": open_count, "max_open": max_open},
+            )
             save_state(state)
             return state
 
@@ -466,12 +549,34 @@ def run_cycle(state):
                 log.info("  Skip: signal %d already has an open trade", signal_id)
                 journal({"action": "skip_trade", "level": level,
                          "reason": f"Signal {signal_id} already open"})
+                if paper_mode:
+                    record_attempt(
+                        level,
+                        "pairs",
+                        "blocked",
+                        "signal_already_open",
+                        f"Signal {signal_id} already has an open trade.",
+                        event=event_name,
+                        signal_id=signal_id,
+                        phase=current_stage,
+                    )
                 continue
 
             if event_name in open_events or event_name in this_cycle_events:
                 log.info("  Skip: already have position in '%s'", event_name[:40])
                 journal({"action": "skip_trade", "level": level,
                          "reason": f"Already trading event: {event_name[:40]}"})
+                if paper_mode:
+                    record_attempt(
+                        level,
+                        "pairs",
+                        "blocked",
+                        "event_already_open",
+                        f"Already trading event: {event_name[:60]}",
+                        event=event_name,
+                        signal_id=signal_id,
+                        phase=current_stage,
+                    )
                 continue
 
             # Determine size for this trade
@@ -506,6 +611,18 @@ def run_cycle(state):
                         "event": event_name[:60],
                         "reason": brain_reasoning,
                     })
+                    if mode == "paper":
+                        record_attempt(
+                            level,
+                            "pairs",
+                            "blocked",
+                            "brain_rejected",
+                            brain_reasoning,
+                            event=event_name,
+                            signal_id=signal_id,
+                            size_usd=trade_size,
+                            phase="step 4.5 brain validation",
+                        )
                     continue
                 log.info("  Brain VALIDATED trade: %s", brain_reasoning)
                 opp["brain_reasoning"] = brain_reasoning
@@ -520,6 +637,24 @@ def run_cycle(state):
                     traded += 1
                     this_cycle_signal_ids.add(signal_id)
                     this_cycle_events.add(event_name)
+                    if mode == "paper":
+                        record_attempt(
+                            level,
+                            "pairs",
+                            "allowed",
+                            "opened",
+                            "Paper pairs trade opened.",
+                            event=event_name,
+                            signal_id=signal_id,
+                            trade_id=result.get("trade_id"),
+                            size_usd=trade_size,
+                            phase=current_stage,
+                            details={
+                                "grade": opp.get("grade_label"),
+                                "admission_path": opp.get("admission_path"),
+                                "experiment_status": opp.get("experiment_status"),
+                            },
+                        )
                     journal({
                         "action": "trade_opened",
                         "level": level,
@@ -536,6 +671,19 @@ def run_cycle(state):
                         "reason": opp.get("experiment_reason") or f"Signal admitted, z={opp.get('z_score', 0):+.2f}",
                     })
                 else:
+                    if mode == "paper":
+                        record_attempt(
+                            level,
+                            "pairs",
+                            "blocked",
+                            "execution_rejected",
+                            result.get("error", "Trade execution rejected."),
+                            event=event_name,
+                            signal_id=signal_id,
+                            size_usd=trade_size,
+                            phase=current_stage,
+                            details={"grade": opp.get("grade_label")},
+                        )
                     journal({
                         "action": "trade_rejected",
                         "level": level,
@@ -546,6 +694,18 @@ def run_cycle(state):
                     })
             except Exception as e:
                 log.error("  Trade execution failed: %s", e)
+                if mode == "paper":
+                    record_attempt(
+                        level,
+                        "pairs",
+                        "error",
+                        "trade_execution_failed",
+                        f"Trade execution failed: {e}",
+                        event=event_name,
+                        signal_id=signal_id,
+                        size_usd=trade_size,
+                        phase=current_stage,
+                    )
                 journal({"action": "trade_error", "level": level,
                          "event": event_name[:60], "reason": str(e)})
 
@@ -577,6 +737,18 @@ def run_cycle(state):
                             max_total_open=max_open,
                         )
                         if not decision["ok"]:
+                            record_attempt(
+                                level,
+                                "weather",
+                                "blocked",
+                                decision["reason_code"],
+                                decision["reason"],
+                                event=w_opp.get("event", w_opp.get("market", "")),
+                                weather_signal_id=w_id,
+                                token_id=decision.get("entry_token"),
+                                size_usd=trade_size,
+                                phase=current_stage,
+                            )
                             journal({
                                 "action": "skip_trade",
                                 "level": level,
@@ -587,6 +759,19 @@ def run_cycle(state):
                             continue
                         t_id = db.open_weather_trade(w_id, size_usd=trade_size)
                         if t_id:
+                            record_attempt(
+                                level,
+                                "weather",
+                                "allowed",
+                                "opened",
+                                "Paper weather trade opened.",
+                                event=w_opp.get("event", w_opp.get("market", "")),
+                                weather_signal_id=w_id,
+                                trade_id=t_id,
+                                token_id=decision.get("entry_token"),
+                                size_usd=trade_size,
+                                phase=current_stage,
+                            )
                             weather_traded += 1
                             journal({
                                 "action": "trade_opened",
@@ -601,10 +786,28 @@ def run_cycle(state):
                             })
                     except Exception as e:
                         log.warning("Weather trade open failed: %s", e)
+                        record_attempt(
+                            level,
+                            "weather",
+                            "error",
+                            "trade_open_failed",
+                            f"Weather trade open failed: {e}",
+                            event=w_opp.get("event", w_opp.get("market", "")),
+                            phase=current_stage,
+                        )
                 if weather_traded:
                     log.info("Step 4b: Opened %d weather trades", weather_traded)
             except Exception as e:
                 log.debug("Weather scan skipped during %s: %s", current_stage, e)
+                record_attempt(
+                    level,
+                    "weather",
+                    "error",
+                    "weather_scan_failed",
+                    f"Weather scan failed: {e}",
+                    event="Weather scan",
+                    phase=current_stage,
+                )
 
         # Step 4c: Longshot bias scanner (scan for NO maker opportunities on 3–15¢ markets)
         current_stage = "step 4c longshot scan"
@@ -685,6 +888,16 @@ def run_cycle(state):
                     positions = copy_scanner.get_positions(address)
                 except Exception as e:
                     log.warning("Copy: failed to fetch positions for %s: %s", label, e)
+                    record_attempt(
+                        level,
+                        "copy",
+                        "error",
+                        "copy_positions_fetch_failed",
+                        f"Copy positions fetch failed for {label}: {e}",
+                        event=label,
+                        wallet=address,
+                        phase=current_stage,
+                    )
                     continue
 
                 # Forward-only: on first scan after adding a wallet, snapshot all
@@ -724,6 +937,19 @@ def run_cycle(state):
                             max_total_open=max_copy_total_open,
                         )
                         if not decision["ok"]:
+                            record_attempt(
+                                level,
+                                "copy",
+                                "blocked",
+                                decision["reason_code"],
+                                decision["reason"],
+                                event=f"{label}: {pos.get('title','')}",
+                                token_id=pos.get("asset"),
+                                wallet=address,
+                                condition_id=cid,
+                                size_usd=20,
+                                phase=current_stage,
+                            )
                             journal({
                                 "action": "skip_trade",
                                 "level": level,
@@ -742,6 +968,20 @@ def run_cycle(state):
                             max_total_open=max_copy_total_open,
                         )
                         if t_id:
+                            record_attempt(
+                                level,
+                                "copy",
+                                "allowed",
+                                "opened",
+                                "Paper copy trade opened.",
+                                event=f"{label}: {pos.get('title','')}",
+                                trade_id=t_id,
+                                token_id=pos.get("asset"),
+                                wallet=address,
+                                condition_id=cid,
+                                size_usd=20,
+                                phase=current_stage,
+                            )
                             copy_opened += 1
                             journal({
                                 "action": "trade_opened",
@@ -777,6 +1017,15 @@ def run_cycle(state):
                 log.info("Step 4e: Copy trader — %d opened, %d closed", copy_opened, copy_closed)
         except Exception as e:
             log.debug("Copy trader step skipped during %s: %s", current_stage, e)
+            record_attempt(
+                level,
+                "copy",
+                "error",
+                "copy_trader_step_failed",
+                f"Copy trader step failed: {e}",
+                event="Copy trader",
+                phase=current_stage,
+            )
 
         # Step 4f: Wallet discovery (every 6 hours)
         current_stage = "step 4f wallet discovery"
@@ -843,6 +1092,15 @@ def run_cycle(state):
         return state
     except Exception:
         log.exception("Autonomy cycle failed during %s", current_stage)
+        record_attempt(
+            level,
+            "system",
+            "error",
+            "autonomy_cycle_failed",
+            f"Autonomy cycle failed during {current_stage}.",
+            event="Autonomy cycle",
+            phase=current_stage,
+        )
         raise
 
 
