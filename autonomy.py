@@ -48,7 +48,8 @@ import math_engine
 
 # --- Configuration ---
 
-STATE_FILE = Path(__file__).parent / "autonomy_state.json"
+STATE_FILE = Path(__file__).parent / "logs" / "autonomy_state.json"
+LEGACY_STATE_FILE = Path(__file__).parent / "autonomy_state.json"
 JOURNAL_FILE = Path(__file__).parent / "logs" / "journal.jsonl"
 
 LEVELS = {
@@ -99,13 +100,8 @@ LEVELS = {
 
 # --- State Management ---
 
-def load_state():
-    """Load autonomy state from disk."""
-    if STATE_FILE.exists():
-        try:
-            return json.loads(STATE_FILE.read_text())
-        except Exception:
-            pass
+def default_state():
+    """Return the default autonomy state."""
     return {
         "level": "scout",
         "promoted_at": None,
@@ -117,9 +113,46 @@ def load_state():
     }
 
 
+def _read_state_file(path):
+    """Read a state file, returning None on failure."""
+    try:
+        if path.exists():
+            return json.loads(path.read_text())
+    except Exception as exc:
+        log.warning("Failed to read autonomy state from %s: %s", path, exc)
+    return None
+
+
+def _normalize_state(state):
+    """Merge persisted state onto defaults so older files remain valid."""
+    merged = default_state()
+    if isinstance(state, dict):
+        merged.update(state)
+    return merged
+
+
+def load_state():
+    """Load autonomy state from disk, migrating the legacy repo-root file if needed."""
+    state = _read_state_file(STATE_FILE)
+    if state is not None:
+        return _normalize_state(state)
+
+    legacy_state = _read_state_file(LEGACY_STATE_FILE)
+    if legacy_state is not None:
+        state = _normalize_state(legacy_state)
+        save_state(state)
+        log.info("Migrated autonomy state from %s to %s", LEGACY_STATE_FILE, STATE_FILE)
+        return state
+
+    return default_state()
+
+
 def save_state(state):
     """Persist state to disk."""
-    STATE_FILE.write_text(json.dumps(state, indent=2))
+    STATE_FILE.parent.mkdir(exist_ok=True)
+    tmp_path = STATE_FILE.with_suffix(f"{STATE_FILE.suffix}.tmp")
+    tmp_path.write_text(json.dumps(state, indent=2))
+    tmp_path.replace(STATE_FILE)
 
 
 def journal(entry):

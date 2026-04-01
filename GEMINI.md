@@ -30,6 +30,7 @@ Execution:     execution.py (paper/live trading) → blockchain.py (web3/Polygon
                     |
 Persistence:   db.py (SQLite) → scanner.db
                Tables: signals, trades, snapshots, scan_runs, weather_signals, locked_arb
+               Runtime state: logs/autonomy_state.json (local only; legacy root file auto-migrates)
                     |
 Monitoring:    log_setup.py → logs/scanner.log + logs/journal.jsonl (trade audit trail)
 ```

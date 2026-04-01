@@ -10,6 +10,7 @@ import tempfile
 import time
 import traceback
 from datetime import date, timedelta
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 # ── Redirect DB to a temp file so tests never touch scanner.db ──────────────
@@ -791,6 +792,8 @@ def test_autonomy():
     check("scout cannot trade", not levels["scout"]["can_trade"])
     check("paper can trade", levels["paper"]["can_trade"])
     check("book max_open > 0", levels["book"]["max_open"] > 0)
+    check("autonomy state stored in logs", autonomy.STATE_FILE.parent.name == "logs",
+          f"path={autonomy.STATE_FILE}")
 
     # Graduation criteria exist for non-top levels
     for level in ["paper", "penny"]:
@@ -800,6 +803,27 @@ def test_autonomy():
         check(f"{level} graduation has min_win_rate", "min_win_rate" in grad)
 
     check("book graduation is None (top level)", levels["book"]["graduation"] is None)
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmpdir_path = Path(tmpdir)
+        runtime_state = tmpdir_path / "logs" / "autonomy_state.json"
+        legacy_state = tmpdir_path / "autonomy_state.json"
+
+        with patch.object(autonomy, "STATE_FILE", runtime_state), \
+             patch.object(autonomy, "LEGACY_STATE_FILE", legacy_state):
+            baseline = autonomy.default_state()
+            baseline["level"] = "paper"
+            autonomy.save_state(baseline)
+            check("save_state creates runtime file", runtime_state.exists())
+            check("load_state reads runtime file", autonomy.load_state()["level"] == "paper")
+
+            runtime_state.unlink()
+            legacy_payload = autonomy.default_state()
+            legacy_payload["level"] = "penny"
+            legacy_state.write_text(json.dumps(legacy_payload, indent=2))
+            migrated = autonomy.load_state()
+            check("load_state migrates legacy file", migrated["level"] == "penny")
+            check("migration recreates runtime file", runtime_state.exists())
 
 run("autonomy", test_autonomy)
 

@@ -2,6 +2,8 @@ scanner.db
 polymarket.db
 .env
 logs/
+autonomy_state.json
+logs/autonomy_state.json
 __pycache__/
 *.pyc
 *.pyo
