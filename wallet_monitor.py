@@ -116,8 +116,34 @@ def _record_event(
         log.warning("Monitor: wallet event log failed for %s: %s", label, exc)
 
 
-def _position_key(address: str, condition_id: str) -> tuple[str, str]:
-    return ((address or "").lower(), condition_id or "")
+def _position_key(address: str, position: dict | None = None, trade: dict | None = None) -> tuple[str, str]:
+    if position is not None:
+        identity = db.get_position_identity(position, wallet=address)
+    elif trade is not None:
+        identity = {
+            "canonical_ref": db.get_trade_reconciliation_key(trade),
+            "external_position_id": trade.get("external_position_id") or trade.get("token_id_a"),
+            "condition_id": trade.get("copy_condition_id"),
+        }
+    else:
+        identity = {"canonical_ref": None, "external_position_id": None, "condition_id": None}
+    return (
+        (address or "").lower(),
+        identity.get("canonical_ref")
+        or identity.get("external_position_id")
+        or identity.get("condition_id")
+        or "",
+    )
+
+
+def _baseline_matches_position(baseline: set[str], position: dict) -> bool:
+    identity = db.get_position_identity(position)
+    keys = {
+        identity.get("canonical_ref"),
+        identity.get("external_position_id"),
+        identity.get("condition_id"),
+    }
+    return any(key in baseline for key in keys if key)
 
 
 # ── Scoring ────────────────────────────────────────────────────────────────────
@@ -270,58 +296,65 @@ def _check_wallet(address: str, label: str, will_copy: bool) -> tuple[int, int]:
         )
         return 0, 0
 
-    current_cids = {p["conditionId"] for p in positions if p.get("conditionId")}
-    prev_cids = _known_positions.get(address, None)
-    _known_positions[address] = current_cids
+    current_positions = [p for p in positions if p.get("conditionId")]
+    current_keys = {_position_key(address, position=p)[1] for p in current_positions}
+    prev_keys = _known_positions.get(address, None)
+    _known_positions[address] = current_keys
     db.update_watched_wallet_poll_status(
         address,
         checked_at=checked_at,
-        positions_count=len(current_cids),
+        positions_count=len(current_keys),
     )
 
-    if prev_cids is None:
+    if prev_keys is None:
         # First time seeing this wallet — record state, don't trade.
         # Also set the DB baseline if not already set (forward-only copy trading).
         baseline = db.get_wallet_baseline(address)
         if baseline is None:
-            db.set_wallet_baseline(address, list(current_cids))
+            db.set_wallet_baseline(address, sorted(current_keys))
             log.info("Monitor: %s — baseline set: %d existing positions (skipped)",
-                     label, len(current_cids))
+                     label, len(current_keys))
             _record_event(
                 source="wallet_monitor",
                 wallet=address,
                 label=label,
                 event_type="baseline_set",
                 status="baseline_skipped",
-                reason=f"Baseline set from {len(current_cids)} existing positions; only future positions will mirror.",
+                reason=f"Baseline set from {len(current_keys)} existing positions; only future positions will mirror.",
                 checked_at=checked_at,
-                positions_count=len(current_cids),
-                details={"baseline_positions": sorted(current_cids)},
+                positions_count=len(current_keys),
+                details={"baseline_positions": sorted(current_keys)},
             )
         else:
-            log.info("Monitor: %s — initial snapshot: %d positions", label, len(current_cids))
+            log.info("Monitor: %s — initial snapshot: %d positions", label, len(current_keys))
             _record_event(
                 source="wallet_monitor",
                 wallet=address,
                 label=label,
                 event_type="wallet_polled",
                 status="initial_snapshot",
-                reason=f"Initial snapshot loaded with {len(current_cids)} live positions.",
+                reason=f"Initial snapshot loaded with {len(current_keys)} live positions.",
                 checked_at=checked_at,
-                positions_count=len(current_cids),
+                positions_count=len(current_keys),
             )
         return 0, 0
 
     opened = 0
     closed = 0
-    pos_by_cid = {p["conditionId"]: p for p in positions if p.get("conditionId")}
+    pos_by_key = {
+        _position_key(address, position=p)[1]: p
+        for p in current_positions
+    }
 
     # New positions (skip any in the baseline — pre-existing when wallet was added)
     baseline = db.get_wallet_baseline(address) or set()
-    for cid in current_cids - prev_cids - baseline:
-        pos = pos_by_cid.get(cid)
+    for key in current_keys - prev_keys:
+        pos = pos_by_key.get(key)
         if not pos:
             continue
+        if _baseline_matches_position(baseline, pos):
+            continue
+        cid = pos.get("conditionId")
         size = pos.get("currentValue", 0)
         title = pos.get("title", "")
         price = pos.get("curPrice", 0)
@@ -356,7 +389,7 @@ def _check_wallet(address: str, label: str, will_copy: bool) -> tuple[int, int]:
                     price=price,
                     position_value_usd=size,
                     checked_at=checked_at,
-                    positions_count=len(current_cids),
+                    positions_count=len(current_keys),
                 )
                 continue
             t_id = db.open_copy_trade(
@@ -386,7 +419,7 @@ def _check_wallet(address: str, label: str, will_copy: bool) -> tuple[int, int]:
                     price=price,
                     position_value_usd=size,
                     checked_at=checked_at,
-                    positions_count=len(current_cids),
+                    positions_count=len(current_keys),
                     details={"trade_id": t_id, "size_usd": COPY_SIZE_USD},
                 )
             else:
@@ -405,7 +438,7 @@ def _check_wallet(address: str, label: str, will_copy: bool) -> tuple[int, int]:
                     price=price,
                     position_value_usd=size,
                     checked_at=checked_at,
-                    positions_count=len(current_cids),
+                    positions_count=len(current_keys),
                 )
         else:
             log.info("Monitor: %s scored below copy threshold — not mirroring", label)
@@ -423,19 +456,19 @@ def _check_wallet(address: str, label: str, will_copy: bool) -> tuple[int, int]:
                 price=price,
                 position_value_usd=size,
                 checked_at=checked_at,
-                positions_count=len(current_cids),
+                positions_count=len(current_keys),
             )
 
     # Exited positions — close our mirrors
     open_copy = {
-        _position_key(t.get("copy_wallet"), t.get("copy_condition_id")): t
+        _position_key(t.get("copy_wallet"), trade=t): t
         for t in db.get_trades(status="open", limit=500)
         if t.get("trade_type") == "copy"
         and t.get("copy_wallet") == address
-        and t.get("copy_condition_id")
+        and (_position_key(t.get("copy_wallet"), trade=t)[1])
     }
-    for cid in prev_cids - current_cids:
-        trade = open_copy.get(_position_key(address, cid))
+    for key in prev_keys - current_keys:
+        trade = open_copy.get((address.lower(), key))
         if trade:
             pnl = db.close_trade(trade["id"], exit_price_a=trade["entry_price_a"],
                                  notes=f"auto-close: {label} exited position")
@@ -450,12 +483,12 @@ def _check_wallet(address: str, label: str, will_copy: bool) -> tuple[int, int]:
                 status="closed",
                 reason_code="wallet_exited_position",
                 reason=f"Mirrored trade #{trade['id']} closed because watched wallet exited the position.",
-                condition_id=cid,
+                condition_id=trade.get("copy_condition_id"),
                 outcome_name=trade.get("copy_outcome"),
                 market_title=trade.get("event"),
                 position_value_usd=trade.get("size_usd"),
                 checked_at=checked_at,
-                positions_count=len(current_cids),
+                positions_count=len(current_keys),
                 details={"trade_id": trade["id"], "pnl": pnl},
             )
 
@@ -466,9 +499,9 @@ def _check_wallet(address: str, label: str, will_copy: bool) -> tuple[int, int]:
             label=label,
             event_type="wallet_polled",
             status="no_change",
-            reason=f"Polled successfully: {len(current_cids)} live positions, no new copy-trading actions.",
+            reason=f"Polled successfully: {len(current_keys)} live positions, no new copy-trading actions.",
             checked_at=checked_at,
-            positions_count=len(current_cids),
+            positions_count=len(current_keys),
         )
     else:
         _record_event(
@@ -477,9 +510,9 @@ def _check_wallet(address: str, label: str, will_copy: bool) -> tuple[int, int]:
             label=label,
             event_type="wallet_polled",
             status="changes_seen",
-            reason=f"Poll processed: {opened} mirrored, {closed} closed, {len(current_cids)} live positions.",
+            reason=f"Poll processed: {opened} mirrored, {closed} closed, {len(current_keys)} live positions.",
             checked_at=checked_at,
-            positions_count=len(current_cids),
+            positions_count=len(current_keys),
             details={"opened": opened, "closed": closed},
         )
 

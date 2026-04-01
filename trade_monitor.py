@@ -136,11 +136,16 @@ def _wallet_position_state(trade: dict, cache: dict[str, list[dict]]) -> dict | 
     if trade.get("trade_type") != "copy" or not trade.get("copy_wallet"):
         return None
     wallet = (trade.get("copy_wallet") or "").lower()
+    required_key = db.get_trade_reconciliation_key(trade)
     if wallet not in cache:
         cache[wallet] = get_positions(wallet)
     positions = cache.get(wallet) or []
     for pos in positions:
-        if pos.get("conditionId") != trade.get("copy_condition_id"):
+        identity = db.get_position_identity(pos, wallet=wallet)
+        position_key = identity["canonical_ref"] or identity["condition_id"]
+        if required_key and position_key != required_key:
+            continue
+        if not required_key and pos.get("conditionId") != trade.get("copy_condition_id"):
             continue
         if trade.get("copy_outcome") and pos.get("outcome") and pos.get("outcome") != trade.get("copy_outcome"):
             continue
@@ -148,11 +153,13 @@ def _wallet_position_state(trade: dict, cache: dict[str, list[dict]]) -> dict | 
             "wallet": wallet,
             "attached": True,
             "position": pos,
+            "position_key": position_key,
         }
     return {
         "wallet": wallet,
         "attached": False,
         "position": None,
+        "position_key": required_key,
     }
 
 
@@ -227,6 +234,8 @@ def classify_trade(trade: dict, wallet_positions_cache: dict[str, list[dict]] | 
     market, market_lookup = _load_trade_market(trade)
     price_state = _price_state_for_trade(trade, market)
     wallet_state = _wallet_position_state(trade, wallet_positions_cache)
+    trade_state_mode = trade.get("trade_state_mode") or db.TRADE_STATE_PAPER
+    canonical_ref = db.get_trade_reconciliation_key(trade)
 
     now = time.time()
     end_ts = _parse_iso8601(market.get("endDate") if market else None)
@@ -248,6 +257,9 @@ def classify_trade(trade: dict, wallet_positions_cache: dict[str, list[dict]] | 
         "price": price_state.get("price"),
         "expected_close_ts": expected_close_ts,
         "past_expected_close": past_expected_close,
+        "trade_state_mode": trade_state_mode,
+        "reconciliation_mode": trade.get("reconciliation_mode"),
+        "canonical_ref": canonical_ref,
     }
     if wallet_state is not None:
         details["wallet_attached"] = wallet_state["attached"]
@@ -259,6 +271,18 @@ def classify_trade(trade: dict, wallet_positions_cache: dict[str, list[dict]] | 
                 "curPrice": wallet_state["position"].get("curPrice"),
                 "currentValue": wallet_state["position"].get("currentValue"),
             }
+
+    if trade_state_mode in {db.TRADE_STATE_WALLET, db.TRADE_STATE_LIVE} and not canonical_ref:
+        return {
+            "trade_id": trade["id"],
+            "trade_status": trade.get("status"),
+            "classification": "unpriceable-but-identifiable",
+            "status": "manual_review",
+            "reason_code": "missing_canonical_identity",
+            "reason": "Externally attached trade is missing its canonical reconciliation identifier.",
+            "remediation_action": "flag_missing_canonical_identity",
+            "details": details,
+        }
 
     if market_resolved:
         final_price = _extract_token_price(market, trade.get("token_id_a"))

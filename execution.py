@@ -229,6 +229,8 @@ def _execute_paper(signal, size_usd, price_a, price_b,
         size_usd=size_usd,
         metadata={
             "strategy_name": "cointegration",
+            "trade_state_mode": db.TRADE_STATE_PAPER,
+            "reconciliation_mode": db.RECONCILIATION_INTERNAL,
             "entry_grade_label": signal.get("grade_label"),
             "admission_path": signal.get("admission_path"),
             "experiment_name": signal.get("experiment_name"),
@@ -245,33 +247,6 @@ def _execute_paper(signal, size_usd, price_a, price_b,
         log.error("Failed to open trade in DB for signal %s", signal_id)
         return {"ok": False, "error": "DB open_trade failed", "mode": "paper"}
     account = db.get_paper_account_state(refresh_unrealized=False)
-
-    now = time.time()
-    half = size_usd / 2
-
-    # Save open order records for both legs (useful for tracking in maker mode)
-    expires = now + ORDER_TTL_HOURS * 3600
-    for leg, token_id, side, price in [
-        ("a", signal.get("token_id_a") or signal["market_a"], side_a, price_a),
-        ("b", signal.get("token_id_b") or signal["market_b"], side_b, price_b),
-    ]:
-        db.save_open_order({
-            "order_id":    f"paper-{trade_id}-{leg}-{int(now*1000)}",
-            "trade_id":    trade_id,
-            "signal_id":   signal_id,
-            "token_id":    token_id,
-            "side":        side,
-            "leg":         leg,
-            "limit_price": price,
-            "size_shares": round(half / price, 4) if price > 0 else 0,
-            "size_usd":    half,
-            "status":      "filled",   # paper = immediate fill
-            "mode":        "paper",
-            "placed_at":   now,
-            "filled_at":   now,
-            "fill_price":  price,
-            "expires_at":  expires,
-        })
 
     log.info("PAPER %s FILL: trade=%d | A(%s)=%.4f B(%s)=%.4f | $%.2f | bal=$%.2f",
              exec_mode.upper(), trade_id, side_a, price_a, side_b, price_b,
@@ -351,9 +326,25 @@ def _execute_live(signal, size_usd, price_a, price_b,
         })
 
         signal_id = signal.get("id")
+        wallet_address = None
+        try:
+            import blockchain
+            wallet_address = blockchain.get_wallet_address()
+        except Exception:
+            wallet_address = None
+        live_identity = db.build_live_trade_identity(str(order_a), str(order_b), wallet=wallet_address)
         # In maker mode the trade is pending until both legs fill
         trade_status = "pending_fill" if exec_mode == "maker" else "open"
-        trade_id = db.open_trade(signal_id, size_usd=size_usd) if signal_id else None
+        trade_id = db.open_trade(
+            signal_id,
+            size_usd=size_usd,
+            metadata={
+                "strategy_name": "cointegration_live",
+                "trade_state_mode": db.TRADE_STATE_LIVE,
+                "reconciliation_mode": db.RECONCILIATION_ORDERS,
+                **live_identity,
+            },
+        ) if signal_id else None
 
         now = time.time()
         expires = now + ORDER_TTL_HOURS * 3600
@@ -385,6 +376,7 @@ def _execute_live(signal, size_usd, price_a, price_b,
             "mode": "live",
             "exec_mode": exec_mode,
             "trade_id": trade_id,
+            "canonical_ref": live_identity["canonical_ref"],
             "order_a": str(order_a),
             "order_b": str(order_b),
             "fill_price_a": price_a,

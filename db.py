@@ -13,6 +13,14 @@ _INIT_LOCK = threading.Lock()
 _DB_INITIALIZED = False
 log = logging.getLogger("scanner.db")
 
+TRADE_STATE_PAPER = "paper_research"
+TRADE_STATE_WALLET = "wallet_attached"
+TRADE_STATE_LIVE = "live_exchange"
+
+RECONCILIATION_INTERNAL = "internal_simulation"
+RECONCILIATION_WALLET = "wallet_position"
+RECONCILIATION_ORDERS = "exchange_orders"
+
 
 def _connect():
     conn = sqlite3.connect(str(DB_PATH))
@@ -619,6 +627,135 @@ def _migration_011_trade_monitor_events(conn):
     """)
 
 
+def _migration_012_trade_state_modes(conn):
+    for col, coltype in [
+        ("trade_state_mode", f"TEXT DEFAULT '{TRADE_STATE_PAPER}'"),
+        ("reconciliation_mode", f"TEXT DEFAULT '{RECONCILIATION_INTERNAL}'"),
+        ("canonical_ref", "TEXT"),
+        ("external_position_id", "TEXT"),
+        ("external_order_id_a", "TEXT"),
+        ("external_order_id_b", "TEXT"),
+        ("external_source", "TEXT"),
+        ("event", "TEXT"),
+        ("market_a", "TEXT"),
+    ]:
+        _add_column_if_missing(conn, "trades", col, coltype)
+
+    conn.execute(
+        f"""
+        UPDATE trades
+        SET trade_state_mode = CASE
+                WHEN trade_type='copy' THEN '{TRADE_STATE_WALLET}'
+                WHEN EXISTS (
+                    SELECT 1
+                    FROM open_orders oo
+                    WHERE oo.trade_id = trades.id
+                      AND oo.mode = 'live'
+                ) THEN '{TRADE_STATE_LIVE}'
+                ELSE '{TRADE_STATE_PAPER}'
+            END
+        WHERE trade_state_mode IS NULL OR trade_state_mode = ''
+        """
+    )
+    conn.execute(
+        f"""
+        UPDATE trades
+        SET reconciliation_mode = CASE
+                WHEN trade_type='copy' THEN '{RECONCILIATION_WALLET}'
+                WHEN EXISTS (
+                    SELECT 1
+                    FROM open_orders oo
+                    WHERE oo.trade_id = trades.id
+                      AND oo.mode = 'live'
+                ) THEN '{RECONCILIATION_ORDERS}'
+                ELSE '{RECONCILIATION_INTERNAL}'
+            END
+        WHERE reconciliation_mode IS NULL OR reconciliation_mode = ''
+        """
+    )
+    conn.execute(
+        """
+        UPDATE trades
+        SET external_source = CASE
+                WHEN trade_type='copy' THEN 'watched_wallet'
+                WHEN EXISTS (
+                    SELECT 1
+                    FROM open_orders oo
+                    WHERE oo.trade_id = trades.id
+                      AND oo.mode = 'live'
+                ) THEN 'polymarket_clob'
+                ELSE external_source
+            END
+        WHERE external_source IS NULL OR external_source = ''
+        """
+    )
+    conn.execute(
+        """
+        UPDATE trades
+        SET external_order_id_a = (
+                SELECT oo.order_id
+                FROM open_orders oo
+                WHERE oo.trade_id = trades.id
+                  AND oo.leg = 'a'
+                  AND oo.mode = 'live'
+                ORDER BY oo.id DESC
+                LIMIT 1
+            ),
+            external_order_id_b = (
+                SELECT oo.order_id
+                FROM open_orders oo
+                WHERE oo.trade_id = trades.id
+                  AND oo.leg = 'b'
+                  AND oo.mode = 'live'
+                ORDER BY oo.id DESC
+                LIMIT 1
+            )
+        WHERE trade_state_mode = ?
+          AND (
+                external_order_id_a IS NULL OR external_order_id_a = ''
+             OR external_order_id_b IS NULL OR external_order_id_b = ''
+          )
+        """,
+        (TRADE_STATE_LIVE,),
+    )
+    conn.execute(
+        """
+        UPDATE trades
+        SET external_position_id = CASE
+                WHEN token_id_a IS NOT NULL AND token_id_a != '' THEN token_id_a
+                WHEN copy_condition_id IS NOT NULL AND copy_condition_id != '' THEN
+                    copy_condition_id || ':' || LOWER(COALESCE(copy_outcome, ''))
+                ELSE external_position_id
+            END
+        WHERE trade_type='copy'
+          AND (external_position_id IS NULL OR external_position_id = '')
+        """
+    )
+    conn.execute(
+        """
+        UPDATE trades
+        SET canonical_ref = CASE
+                WHEN trade_type='copy'
+                     AND copy_wallet IS NOT NULL AND copy_wallet != ''
+                     AND copy_condition_id IS NOT NULL AND copy_condition_id != ''
+                     AND copy_outcome IS NOT NULL AND copy_outcome != '' THEN
+                    'wallet:' || LOWER(copy_wallet) || ':condition:' || copy_condition_id || ':outcome:' || LOWER(copy_outcome)
+                WHEN trade_type='copy' AND copy_wallet IS NOT NULL AND copy_wallet != '' THEN
+                    'wallet:' || LOWER(copy_wallet) || ':position:' || COALESCE(external_position_id, '')
+                WHEN EXISTS (
+                    SELECT 1
+                    FROM open_orders oo
+                    WHERE oo.trade_id = trades.id
+                      AND oo.mode = 'live'
+                ) THEN
+                    'live:' || COALESCE(external_order_id_a, '') || ':' || COALESCE(external_order_id_b, '')
+                ELSE canonical_ref
+            END
+        WHERE canonical_ref IS NULL OR canonical_ref = ''
+        """
+    )
+
+
 _MIGRATIONS = [
     ("001_base_schema", _migration_001_base_schema),
     ("002_backfill_columns", _migration_002_backfill_columns),
@@ -631,6 +768,7 @@ _MIGRATIONS = [
     ("009_paper_trade_attempts", _migration_009_paper_trade_attempts),
     ("010_wallet_monitor_events", _migration_010_wallet_monitor_events),
     ("011_trade_monitor_events", _migration_011_trade_monitor_events),
+    ("012_trade_state_modes", _migration_012_trade_state_modes),
 ]
 
 
@@ -837,6 +975,92 @@ def _normalize_probability_price(price):
     if 0.0 <= value <= 1.0:
         return value
     return None
+
+
+def _normalize_trade_state_mode(value: str | None) -> str:
+    if value in {TRADE_STATE_PAPER, TRADE_STATE_WALLET, TRADE_STATE_LIVE}:
+        return value
+    return TRADE_STATE_PAPER
+
+
+def _normalize_reconciliation_mode(value: str | None) -> str:
+    if value in {RECONCILIATION_INTERNAL, RECONCILIATION_WALLET, RECONCILIATION_ORDERS}:
+        return value
+    return RECONCILIATION_INTERNAL
+
+
+def normalize_wallet_position_identifier(
+    wallet: str | None,
+    *,
+    token_id: str | None = None,
+    condition_id: str | None = None,
+    outcome: str | None = None,
+) -> dict:
+    wallet_norm = (wallet or "").lower().strip()
+    token = str(token_id or "").strip()
+    condition = str(condition_id or "").strip()
+    outcome_norm = str(outcome or "").strip().lower()
+    external_position_id = token or (
+        f"{condition}:{outcome_norm}" if condition and outcome_norm else condition
+    )
+    canonical_ref = None
+    if wallet_norm and condition and outcome_norm:
+        canonical_ref = f"wallet:{wallet_norm}:condition:{condition}:outcome:{outcome_norm}"
+    elif wallet_norm and external_position_id:
+        canonical_ref = f"wallet:{wallet_norm}:position:{external_position_id}"
+    return {
+        "wallet": wallet_norm,
+        "token_id": token or None,
+        "condition_id": condition or None,
+        "outcome": outcome_norm or None,
+        "external_position_id": external_position_id or None,
+        "canonical_ref": canonical_ref,
+    }
+
+
+def get_position_identity(position: dict, wallet: str | None = None) -> dict:
+    return normalize_wallet_position_identifier(
+        wallet,
+        token_id=position.get("asset"),
+        condition_id=position.get("conditionId"),
+        outcome=position.get("outcome"),
+    )
+
+
+def build_live_trade_identity(order_id_a: str | None, order_id_b: str | None, wallet: str | None = None) -> dict:
+    order_a = str(order_id_a or "").strip()
+    order_b = str(order_id_b or "").strip()
+    wallet_norm = (wallet or "").lower().strip()
+    if order_a and order_b:
+        canonical_ref = f"live:{wallet_norm or 'wallet'}:{order_a}:{order_b}"
+    elif order_a or order_b:
+        canonical_ref = f"live:{wallet_norm or 'wallet'}:{order_a or order_b}"
+    else:
+        canonical_ref = None
+    return {
+        "external_order_id_a": order_a or None,
+        "external_order_id_b": order_b or None,
+        "canonical_ref": canonical_ref,
+        "external_source": "polymarket_clob" if canonical_ref else None,
+    }
+
+
+def get_trade_reconciliation_key(trade: dict) -> str | None:
+    trade_state_mode = _normalize_trade_state_mode(trade.get("trade_state_mode"))
+    if trade_state_mode == TRADE_STATE_WALLET:
+        return (
+            trade.get("canonical_ref")
+            or trade.get("external_position_id")
+        )
+    if trade_state_mode == TRADE_STATE_LIVE:
+        return (
+            trade.get("canonical_ref")
+            or build_live_trade_identity(
+                trade.get("external_order_id_a"),
+                trade.get("external_order_id_b"),
+            )["canonical_ref"]
+        )
+    return f"paper:{trade.get('id')}" if trade.get("id") else None
 
 
 def calculate_single_leg_mark_to_market(size_usd, entry_price, current_price) -> dict:
@@ -1053,6 +1277,19 @@ def _sanitize_operator_reason(reason, fallback: str = "Decision recorded.") -> s
     if not text:
         return fallback
     return text[:240]
+
+
+def _resolve_trade_state_fields(metadata: dict | None = None) -> dict:
+    metadata = metadata or {}
+    return {
+        "trade_state_mode": _normalize_trade_state_mode(metadata.get("trade_state_mode")),
+        "reconciliation_mode": _normalize_reconciliation_mode(metadata.get("reconciliation_mode")),
+        "canonical_ref": metadata.get("canonical_ref"),
+        "external_position_id": metadata.get("external_position_id"),
+        "external_order_id_a": metadata.get("external_order_id_a"),
+        "external_order_id_b": metadata.get("external_order_id_b"),
+        "external_source": metadata.get("external_source"),
+    }
 
 
 def record_paper_trade_attempt(
@@ -1300,6 +1537,14 @@ def get_paper_trade_attempts(limit: int = 50) -> list[dict]:
     finally:
         conn.close()
 
+    attempts = []
+    for row in rows:
+        item = dict(row)
+        item["details"] = json.loads(item["details_json"]) if item.get("details_json") else None
+        item.pop("details_json", None)
+        attempts.append(item)
+    return attempts
+
 
 def record_trade_monitor_event(
     *,
@@ -1457,15 +1702,6 @@ def get_trade_monitor_summary(open_only: bool = True) -> dict:
         "by_status": by_status,
     }
 
-    attempts = []
-    for row in rows:
-        item = dict(row)
-        item["details"] = json.loads(item["details_json"]) if item.get("details_json") else None
-        item.pop("details_json", None)
-        attempts.append(item)
-    return attempts
-
-
 def get_paper_trade_attempt_summary(limit: int = 50) -> dict:
     attempts = get_paper_trade_attempts(limit=limit)
     blocked = sum(1 for item in attempts if item.get("outcome") == "blocked")
@@ -1582,7 +1818,9 @@ def inspect_copy_trade_open(
 ) -> dict:
     """Return a structured copy-trade open decision."""
     wallet = (wallet or "").lower()
-    condition_id = position.get("conditionId", "")
+    identifiers = get_position_identity(position, wallet=wallet)
+    condition_id = identifiers["condition_id"] or ""
+    external_position_id = identifiers["external_position_id"]
     max_wallet_open = _normalize_optional_cap(max_wallet_open)
     max_total_open = _normalize_optional_cap(max_total_open)
 
@@ -1595,13 +1833,14 @@ def inspect_copy_trade_open(
             **_paper_position_policy_dict(),
         }
 
-    if has_open_copy_trade(wallet, condition_id):
+    if has_open_copy_trade(wallet, condition_id, external_position_id=external_position_id):
         return {
             "ok": False,
             "reason_code": "position_already_open",
             "reason": "Already have an open copy trade for this position.",
             "wallet": wallet,
             "condition_id": condition_id,
+            "external_position_id": external_position_id,
             **_paper_position_policy_dict(),
         }
 
@@ -1642,6 +1881,7 @@ def inspect_copy_trade_open(
             ),
             "wallet": wallet,
             "condition_id": condition_id,
+            "external_position_id": external_position_id,
             "available_cash": account_check["available_cash"],
             "requested_size_usd": account_check["requested_size_usd"],
             "shortfall_usd": account_check["shortfall_usd"],
@@ -1658,6 +1898,7 @@ def inspect_copy_trade_open(
             "reason": f"Invalid copy-trade entry price: {price!r}.",
             "wallet": wallet,
             "condition_id": condition_id,
+            "external_position_id": external_position_id,
             **_paper_position_policy_dict(),
         }
 
@@ -1667,6 +1908,8 @@ def inspect_copy_trade_open(
         "reason": "Ready to open copy trade.",
         "wallet": wallet,
         "condition_id": condition_id,
+        "external_position_id": external_position_id,
+        "canonical_ref": identifiers["canonical_ref"],
         "entry_price": entry_price,
         "requested_size_usd": round(float(size_usd), 2),
         "max_wallet_open": max_wallet_open,
@@ -1701,6 +1944,7 @@ def open_trade(signal_id, size_usd=100, metadata=None):
     ev = metadata.get("ev") or {}
     slippage = metadata.get("slippage") or {}
     guardrails = metadata.get("guardrails") or {}
+    state_fields = _resolve_trade_state_fields(metadata)
 
     conn.execute("""
         INSERT INTO trades (signal_id, opened_at, side_a, side_b,
@@ -1709,8 +1953,11 @@ def open_trade(signal_id, size_usd=100, metadata=None):
             entry_z_score, entry_ev_pct, entry_half_life, entry_liquidity,
             entry_slippage_pct_a, entry_slippage_pct_b,
             reversion_exit_z, stop_z_threshold, max_hold_hours,
-            regime_break_threshold, regime_break_flag)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            regime_break_threshold, regime_break_flag,
+            token_id_a, token_id_b, event, market_a,
+            trade_state_mode, reconciliation_mode, canonical_ref,
+            external_position_id, external_order_id_a, external_order_id_b, external_source)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (
         signal_id, time.time(), side_a, side_b,
         sig["price_a"], sig["price_b"], size_usd, "open",
@@ -1730,6 +1977,17 @@ def open_trade(signal_id, size_usd=100, metadata=None):
         guardrails.get("max_hold_hours"),
         guardrails.get("regime_break_threshold"),
         0,
+        sig.get("token_id_a"),
+        sig.get("token_id_b"),
+        sig.get("event"),
+        sig.get("market_a"),
+        state_fields["trade_state_mode"],
+        state_fields["reconciliation_mode"],
+        state_fields["canonical_ref"],
+        state_fields["external_position_id"],
+        state_fields["external_order_id_a"],
+        state_fields["external_order_id_b"],
+        state_fields["external_source"],
     ))
     trade_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
     conn.execute("UPDATE signals SET status=? WHERE id=?", ("traded", signal_id))
@@ -1749,13 +2007,26 @@ def has_open_weather_trade(token_id):
     return row is not None
 
 
-def has_open_copy_trade(wallet: str, condition_id: str) -> bool:
+def has_open_copy_trade(wallet: str, condition_id: str, external_position_id: str | None = None) -> bool:
     """Return True if we already have an open copy trade for this wallet+market."""
     conn = get_conn()
-    row = conn.execute(
-        "SELECT id FROM trades WHERE copy_wallet=? AND copy_condition_id=? AND status='open'",
-        (wallet, condition_id)
-    ).fetchone()
+    wallet = (wallet or "").lower()
+    if external_position_id:
+        row = conn.execute(
+            """
+            SELECT id
+            FROM trades
+            WHERE copy_wallet=?
+              AND external_position_id=?
+              AND status='open'
+            """,
+            (wallet, external_position_id),
+        ).fetchone()
+    else:
+        row = conn.execute(
+            "SELECT id FROM trades WHERE copy_wallet=? AND copy_condition_id=? AND status='open'",
+            (wallet, condition_id)
+        ).fetchone()
     conn.close()
     return row is not None
 
@@ -1904,7 +2175,8 @@ def open_copy_trade(
     Returns trade_id or None if duplicate.
     """
     wallet = wallet.lower()
-    condition_id = position.get("conditionId", "")
+    identifiers = get_position_identity(position, wallet=wallet)
+    condition_id = identifiers["condition_id"] or ""
     decision = inspect_copy_trade_open(
         wallet,
         position,
@@ -1923,12 +2195,21 @@ def open_copy_trade(
     conn.execute("""
         INSERT INTO trades (trade_type, opened_at, side_a, side_b,
             entry_price_a, entry_price_b, token_id_a, size_usd, status,
-            copy_wallet, copy_label, copy_condition_id, copy_outcome)
-        VALUES ('copy', ?, ?, '', ?, 0, ?, ?, 'open', ?, ?, ?, ?)
+            copy_wallet, copy_label, copy_condition_id, copy_outcome,
+            event, market_a, trade_state_mode, reconciliation_mode,
+            canonical_ref, external_position_id, external_source)
+        VALUES ('copy', ?, ?, '', ?, 0, ?, ?, 'open', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (
         time.time(), side, entry_price,
         position.get("asset", ""), size_usd,
         wallet, label, condition_id, outcome,
+        position.get("title"),
+        outcome,
+        TRADE_STATE_WALLET,
+        RECONCILIATION_WALLET,
+        decision.get("canonical_ref") or identifiers["canonical_ref"],
+        decision.get("external_position_id") or identifiers["external_position_id"],
+        "watched_wallet",
     ))
     trade_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
     conn.commit()
@@ -1959,9 +2240,16 @@ def open_weather_trade(weather_signal_id, size_usd=100):
     conn.execute("""
         INSERT INTO trades (signal_id, weather_signal_id, trade_type, opened_at,
             side_a, side_b, entry_price_a, entry_price_b,
-            token_id_a, size_usd, status)
-        VALUES (NULL, ?, 'weather', ?, ?, '', ?, 0, ?, ?, 'open')
-    """, (weather_signal_id, time.time(), action, entry_price, token, size_usd))
+            token_id_a, size_usd, status, event, market_a,
+            trade_state_mode, reconciliation_mode)
+        VALUES (NULL, ?, 'weather', ?, ?, '', ?, 0, ?, ?, 'open', ?, ?, ?, ?)
+    """, (
+        weather_signal_id, time.time(), action, entry_price, token, size_usd,
+        decision["signal"].get("event"),
+        decision["signal"].get("market"),
+        TRADE_STATE_PAPER,
+        RECONCILIATION_INTERNAL,
+    ))
     trade_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
     conn.execute("UPDATE weather_signals SET status='traded' WHERE id=?", (weather_signal_id,))
     conn.commit()
@@ -2048,6 +2336,8 @@ _TRADES_SELECT = """
         t.entry_slippage_pct_b, t.reversion_exit_z, t.stop_z_threshold, t.max_hold_hours,
         t.closed_z_score, t.exit_reason, t.max_unrealized_profit, t.max_unrealized_drawdown,
         t.regime_break_threshold, t.regime_break_flag, t.regime_break_notes,
+        t.trade_state_mode, t.reconciliation_mode, t.canonical_ref,
+        t.external_position_id, t.external_order_id_a, t.external_order_id_b, t.external_source,
         ww.active AS copy_wallet_active,
         ww.auto_drop_reason AS copy_wallet_reason,
         COALESCE(s.event, ws.event, t.copy_label, t.event) AS event,

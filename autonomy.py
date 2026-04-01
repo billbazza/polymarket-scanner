@@ -934,9 +934,9 @@ def run_cycle(state):
 
             # Build index of currently open copy trades: (wallet, condition_id) → trade
             open_copy = {
-                ((t.get("copy_wallet") or "").lower(), t.get("copy_condition_id")): t
+                ((t.get("copy_wallet") or "").lower(), db.get_trade_reconciliation_key(t)): t
                 for t in db.get_trades(status="open", limit=None)
-                if t.get("trade_type") == "copy" and t.get("copy_condition_id") and t.get("copy_wallet")
+                if t.get("trade_type") == "copy" and db.get_trade_reconciliation_key(t) and t.get("copy_wallet")
             }
             # Track which (wallet, condition_id) tuples are still held this cycle
             live_position_keys = set()
@@ -980,15 +980,21 @@ def run_cycle(state):
                 baseline = db.get_wallet_baseline(address)
                 if baseline is None:
                     # First scan — record current positions as baseline, don't mirror
-                    baseline_ids = [p.get("conditionId", "") for p in positions if p.get("conditionId")]
+                    baseline_ids = sorted({
+                        (db.get_position_identity(p, wallet=address)["canonical_ref"]
+                         or db.get_position_identity(p, wallet=address)["condition_id"])
+                        for p in positions
+                        if p.get("conditionId")
+                    })
                     db.set_wallet_baseline(address, baseline_ids)
                     log.info("Step 4e: Baseline set for %s — %d existing positions (skipped)",
                              label, len(baseline_ids))
                     # Still track live IDs for close detection on OTHER wallets
                     for pos in positions:
-                        cid = pos.get("conditionId", "")
-                        if cid:
-                            live_position_keys.add((address.lower(), cid))
+                        identity = db.get_position_identity(pos, wallet=address)
+                        reconciliation_key = identity["canonical_ref"] or identity["condition_id"]
+                        if reconciliation_key:
+                            live_position_keys.add((address.lower(), reconciliation_key))
                     _record_wallet_event(
                         source="autonomy",
                         wallet=address,
@@ -1007,14 +1013,25 @@ def run_cycle(state):
                     cid = pos.get("conditionId", "")
                     if not cid:
                         continue
-                    live_position_keys.add((address.lower(), cid))
+                    identity = db.get_position_identity(pos, wallet=address)
+                    reconciliation_key = identity["canonical_ref"] or identity["condition_id"]
+                    if reconciliation_key:
+                        live_position_keys.add((address.lower(), reconciliation_key))
 
                     # Skip positions that existed before we started watching
-                    if cid in baseline:
+                    if any(
+                        key in baseline
+                        for key in {
+                            identity["canonical_ref"],
+                            identity["external_position_id"],
+                            identity["condition_id"],
+                        }
+                        if key
+                    ):
                         continue
 
                     # New position — not yet mirrored
-                    position_key = (address.lower(), cid)
+                    position_key = (address.lower(), reconciliation_key)
                     if position_key not in open_copy:
                         decision = db.inspect_copy_trade_open(
                             address,
@@ -1093,6 +1110,8 @@ def run_cycle(state):
                                 "copy_condition_id": cid,
                                 "copy_label": label,
                                 "copy_outcome": pos.get("outcome"),
+                                "canonical_ref": identity["canonical_ref"],
+                                "external_position_id": identity["external_position_id"],
                                 "entry_price_a": decision.get("entry_price"),
                                 "size_usd": 20,
                                 "event": pos.get("title"),

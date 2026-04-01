@@ -1185,6 +1185,8 @@ async def create_trade(signal_id: int, size_usd: float = 100):
         "ok": True,
         "trade_id": trade_id,
         "status": "open",
+        "trade_state_mode": db.TRADE_STATE_PAPER,
+        "reconciliation_mode": db.RECONCILIATION_INTERNAL,
         "paper_account": db.get_paper_account_state(refresh_unrealized=True),
     }
 
@@ -1274,6 +1276,8 @@ async def open_weather_trade(signal_id: int, size_usd: float = 20):
         "trade_id": trade_id,
         "signal_id": signal_id,
         "status": "open",
+        "trade_state_mode": db.TRADE_STATE_PAPER,
+        "reconciliation_mode": db.RECONCILIATION_INTERNAL,
         "paper_account": db.get_paper_account_state(refresh_unrealized=True),
     }
 
@@ -1441,16 +1445,17 @@ async def copy_positions():
     """Return current open positions for all active watched wallets, annotated with mirror status."""
     import copy_scanner
     mirrored = {
-        ((t.get("copy_wallet") or "").lower(), t.get("copy_condition_id"))
+        ((t.get("copy_wallet") or "").lower(), db.get_trade_reconciliation_key(t))
         for t in db.get_trades(status="open", limit=500)
-        if t.get("trade_type") == "copy" and t.get("copy_condition_id") and t.get("copy_wallet")
+        if t.get("trade_type") == "copy" and db.get_trade_reconciliation_key(t) and t.get("copy_wallet")
     }
     out = []
     for row in db.get_watched_wallets(active_only=True):
         address, label = row["address"], row["label"]
         positions = copy_scanner.get_positions(address)
         for p in positions:
-            p["mirrored"] = ((address or "").lower(), p.get("conditionId", "")) in mirrored
+            identity = db.get_position_identity(p, wallet=address)
+            p["mirrored"] = ((address or "").lower(), identity["canonical_ref"] or identity["condition_id"]) in mirrored
         value = copy_scanner.get_portfolio_value(address)
         out.append({
             "address": address,
@@ -1615,6 +1620,9 @@ async def mirror_position(wallet: str, condition_id: str, size_usd: float = 20.0
     return {"ok": True, "trade_id": trade_id, "label": label,
             "market": pos.get("title"), "outcome": pos.get("outcome"),
             "price": pos.get("curPrice"), "size_usd": size_usd,
+            "trade_state_mode": db.TRADE_STATE_WALLET,
+            "reconciliation_mode": db.RECONCILIATION_WALLET,
+            "canonical_ref": decision.get("canonical_ref"),
             "paper_account": db.get_paper_account_state(refresh_unrealized=True)}
 
 
