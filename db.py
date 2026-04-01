@@ -1,5 +1,6 @@
 """SQLite persistence layer for the scanner."""
 import json
+import logging
 import os
 import sqlite3
 import threading
@@ -9,6 +10,7 @@ from pathlib import Path
 DB_PATH = Path(os.environ.get("SCANNER_DB_PATH", Path(__file__).parent / "scanner.db"))
 _INIT_LOCK = threading.Lock()
 _DB_INITIALIZED = False
+log = logging.getLogger("scanner.db")
 
 
 def _connect():
@@ -387,12 +389,33 @@ def _migration_005_settings(conn):
     """)
 
 
+def _migration_006_paper_account(conn):
+    now = time.time()
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS paper_accounts (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            starting_bankroll REAL NOT NULL DEFAULT 2000,
+            created_at REAL NOT NULL,
+            updated_at REAL NOT NULL
+        );
+    """)
+    conn.execute(
+        """
+        INSERT INTO paper_accounts (id, starting_bankroll, created_at, updated_at)
+        VALUES (1, 2000, ?, ?)
+        ON CONFLICT(id) DO NOTHING
+        """,
+        (now, now),
+    )
+
+
 _MIGRATIONS = [
     ("001_base_schema", _migration_001_base_schema),
     ("002_backfill_columns", _migration_002_backfill_columns),
     ("003_scan_jobs", _migration_003_scan_jobs),
     ("004_report_items", _migration_004_report_items),
     ("005_settings", _migration_005_settings),
+    ("006_paper_account", _migration_006_paper_account),
 ]
 
 
@@ -514,6 +537,163 @@ def update_signal_status(signal_id, status):
     conn.close()
 
 
+# --- Paper Account ---
+
+def _paper_account_row(conn):
+    row = conn.execute("SELECT * FROM paper_accounts WHERE id=1").fetchone()
+    if row:
+        return row
+
+    now = time.time()
+    conn.execute(
+        """
+        INSERT INTO paper_accounts (id, starting_bankroll, created_at, updated_at)
+        VALUES (1, 2000, ?, ?)
+        """,
+        (now, now),
+    )
+    conn.commit()
+    return conn.execute("SELECT * FROM paper_accounts WHERE id=1").fetchone()
+
+
+def get_paper_account_config() -> dict:
+    conn = get_conn()
+    row = _paper_account_row(conn)
+    conn.close()
+    return dict(row)
+
+
+def set_paper_starting_bankroll(starting_bankroll: float) -> dict:
+    bankroll = max(0.0, float(starting_bankroll))
+    conn = get_conn()
+    row = _paper_account_row(conn)
+    now = time.time()
+    conn.execute(
+        "UPDATE paper_accounts SET starting_bankroll=?, updated_at=? WHERE id=?",
+        (bankroll, now, row["id"]),
+    )
+    conn.commit()
+    updated = conn.execute("SELECT * FROM paper_accounts WHERE id=1").fetchone()
+    conn.close()
+    return dict(updated)
+
+
+def _paper_unrealized_from_updates(updates):
+    unrealized = 0.0
+    for item in updates or []:
+        pnl = ((item.get("unrealized_pnl") or {}).get("pnl_usd")) or 0.0
+        unrealized += float(pnl)
+    return unrealized
+
+
+def _paper_unrealized_from_snapshots(conn):
+    rows = conn.execute("""
+        SELECT t.id, t.trade_type, t.side_a, t.size_usd, t.entry_price_a, t.entry_price_b,
+               s.price_a, s.price_b
+        FROM trades t
+        LEFT JOIN snapshots s ON s.id = (
+            SELECT s2.id
+            FROM snapshots s2
+            WHERE s2.trade_id = t.id
+            ORDER BY s2.timestamp DESC, s2.id DESC
+            LIMIT 1
+        )
+        WHERE t.status='open'
+    """).fetchall()
+
+    unrealized = 0.0
+    for row in rows:
+        price_a = row["price_a"]
+        entry_a = row["entry_price_a"] or 0
+        if price_a is None or entry_a <= 0:
+            continue
+
+        trade_type = row["trade_type"] or "pairs"
+        if trade_type in {"weather", "copy", "whale"}:
+            pnl = (price_a - entry_a) / entry_a * row["size_usd"]
+        else:
+            price_b = row["price_b"]
+            entry_b = row["entry_price_b"] or 0
+            if price_b is None or entry_b <= 0:
+                continue
+            half = row["size_usd"] / 2
+            shares_a = half / entry_a
+            shares_b = half / entry_b
+            if row["side_a"] == "BUY":
+                pnl = shares_a * (price_a - entry_a) + shares_b * (entry_b - price_b)
+            else:
+                pnl = shares_a * (entry_a - price_a) + shares_b * (price_b - entry_b)
+        unrealized += float(pnl)
+    return unrealized
+
+
+def get_paper_account_state(refresh_unrealized: bool = False) -> dict:
+    conn = get_conn()
+    account = _paper_account_row(conn)
+    starting_bankroll = float(account["starting_bankroll"] or 0.0)
+    committed_capital = float(conn.execute(
+        "SELECT COALESCE(SUM(size_usd), 0) FROM trades WHERE status='open'"
+    ).fetchone()[0] or 0.0)
+    realized_pnl = float(conn.execute(
+        "SELECT COALESCE(SUM(pnl), 0) FROM trades WHERE status='closed'"
+    ).fetchone()[0] or 0.0)
+    cumulative_losses = abs(float(conn.execute(
+        "SELECT COALESCE(SUM(CASE WHEN pnl < 0 THEN pnl ELSE 0 END), 0) FROM trades WHERE status='closed'"
+    ).fetchone()[0] or 0.0))
+    realized_gains = float(conn.execute(
+        "SELECT COALESCE(SUM(CASE WHEN pnl > 0 THEN pnl ELSE 0 END), 0) FROM trades WHERE status='closed'"
+    ).fetchone()[0] or 0.0)
+    open_trades = int(conn.execute(
+        "SELECT COUNT(*) FROM trades WHERE status='open'"
+    ).fetchone()[0] or 0)
+
+    if refresh_unrealized and open_trades:
+        conn.close()
+        try:
+            import tracker
+            unrealized_pnl = _paper_unrealized_from_updates(tracker.refresh_open_trades())
+        except Exception as e:
+            log.warning("Failed to refresh open paper trades for account summary: %s", e)
+            conn = get_conn()
+            try:
+                unrealized_pnl = _paper_unrealized_from_snapshots(conn)
+            finally:
+                conn.close()
+    else:
+        unrealized_pnl = _paper_unrealized_from_snapshots(conn) if open_trades else 0.0
+        conn.close()
+
+    available_cash = starting_bankroll + realized_pnl - committed_capital
+    total_equity = starting_bankroll + realized_pnl + unrealized_pnl
+    bankroll_used_pct = (committed_capital / starting_bankroll * 100) if starting_bankroll > 0 else 0.0
+    return {
+        "starting_bankroll": round(starting_bankroll, 2),
+        "available_cash": round(available_cash, 2),
+        "committed_capital": round(committed_capital, 2),
+        "realized_pnl": round(realized_pnl, 2),
+        "realized_gains": round(realized_gains, 2),
+        "unrealized_pnl": round(unrealized_pnl, 2),
+        "cumulative_losses": round(cumulative_losses, 2),
+        "total_equity": round(total_equity, 2),
+        "open_trades": open_trades,
+        "bankroll_used_pct": round(bankroll_used_pct, 1),
+        "cash_after_open_explanation": "Opening a paper trade deducts its full size from available cash immediately and moves that amount into committed capital until the trade closes.",
+    }
+
+
+def can_open_paper_trade(size_usd: float) -> dict:
+    requested = max(0.0, float(size_usd))
+    account = get_paper_account_state(refresh_unrealized=False)
+    ok = account["available_cash"] >= requested
+    return {
+        "ok": ok,
+        "requested_size_usd": round(requested, 2),
+        "available_cash": account["available_cash"],
+        "shortfall_usd": round(max(0.0, requested - account["available_cash"]), 2),
+        "account": account,
+    }
+
+
 # --- Trades ---
 
 def open_trade(signal_id, size_usd=100):
@@ -533,6 +713,17 @@ def open_trade(signal_id, size_usd=100):
         "SELECT id FROM trades WHERE signal_id=? AND status='open'", (signal_id,)
     ).fetchone()
     if existing:
+        conn.close()
+        return None
+
+    account_check = can_open_paper_trade(size_usd)
+    if not account_check["ok"]:
+        log.warning(
+            "Paper trade blocked for signal %s: need $%.2f cash, have $%.2f",
+            signal_id,
+            float(size_usd),
+            account_check["available_cash"],
+        )
         conn.close()
         return None
 
@@ -623,6 +814,15 @@ def open_copy_trade(
         return None
     if max_total_open is not None and count_open_trades() >= max_total_open:
         return None
+    account_check = can_open_paper_trade(size_usd)
+    if not account_check["ok"]:
+        log.warning(
+            "Paper copy trade blocked for wallet %s: need $%.2f cash, have $%.2f",
+            wallet,
+            float(size_usd),
+            account_check["available_cash"],
+        )
+        return None
 
     outcome = position.get("outcome", "")
     price = position.get("curPrice") or position.get("avgPrice") or 0
@@ -664,6 +864,17 @@ def open_weather_trade(weather_signal_id, size_usd=100):
         (weather_signal_id,)
     ).fetchone()
     if existing:
+        conn.close()
+        return None
+
+    account_check = can_open_paper_trade(size_usd)
+    if not account_check["ok"]:
+        log.warning(
+            "Paper weather trade blocked for signal %s: need $%.2f cash, have $%.2f",
+            weather_signal_id,
+            float(size_usd),
+            account_check["available_cash"],
+        )
         conn.close()
         return None
 
@@ -735,12 +946,6 @@ def close_trade(trade_id, exit_price_a, exit_price_b=None, notes=""):
     """, (time.time(), exit_price_a, exit_b, pnl_usd, notes, trade_id))
     conn.commit()
     conn.close()
-
-    try:
-        import execution
-        execution.settle_paper_trade(trade_id, pnl_usd)
-    except Exception:
-        pass
 
     return pnl_usd
 
@@ -1372,6 +1577,7 @@ def get_stats():
     conn.close()
 
     win_rate = (wins / closed_trades * 100) if closed_trades > 0 else 0
+    paper_account = get_paper_account_state(refresh_unrealized=True)
 
     # Build cumulative series: each point is the running total after that trade closes
     cumulative = 0.0
@@ -1385,12 +1591,15 @@ def get_stats():
         "open_trades": open_trades,
         "closed_trades": closed_trades,
         "total_pnl": round(total_pnl, 2),
+        "realized_pnl": paper_account["realized_pnl"],
+        "unrealized_pnl": paper_account["unrealized_pnl"],
         "wins": wins,
         "losses": losses,
         "win_rate": round(win_rate, 1),
         "total_signals": total_signals,
         "total_scans": total_scans,
         "pnl_series": pnl_series,
+        "paper_account": paper_account,
     }
 
 
@@ -1643,6 +1852,15 @@ def cancel_open_order(row_id: int, reason: str = "expired") -> None:
 
 def open_whale_trade(trade_data):
     """Open a paper trade from a whale alert."""
+    account_check = can_open_paper_trade(trade_data.get("size_usd", 0))
+    if not account_check["ok"]:
+        log.warning(
+            "Paper whale trade blocked for alert %s: need $%.2f cash, have $%.2f",
+            trade_data.get("whale_alert_id"),
+            float(trade_data.get("size_usd", 0) or 0),
+            account_check["available_cash"],
+        )
+        return None
     conn = get_conn()
     try:
         # Insert trade record

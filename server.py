@@ -415,6 +415,11 @@ async def stats():
     return db.get_stats()
 
 
+@app.get("/api/paper-account")
+async def paper_account():
+    return db.get_paper_account_state(refresh_unrealized=True)
+
+
 @app.get("/api/reports/daily")
 async def get_daily_report():
     latest = _latest_daily_report_path()
@@ -989,10 +994,17 @@ async def get_trade(trade_id: int):
 @app.post("/api/trades")
 async def create_trade(signal_id: int, size_usd: float = 100):
     """Open a paper trade from a signal."""
+    balance_check = db.can_open_paper_trade(size_usd)
+    if not balance_check["ok"]:
+        raise HTTPException(
+            400,
+            f"Insufficient paper cash: ${balance_check['available_cash']:.2f} available, "
+            f"${balance_check['requested_size_usd']:.2f} requested",
+        )
     trade_id = db.open_trade(signal_id, size_usd=size_usd)
     if not trade_id:
         raise HTTPException(404, "Signal not found")
-    return {"trade_id": trade_id, "status": "open"}
+    return {"trade_id": trade_id, "status": "open", "paper_account": db.get_paper_account_state(refresh_unrealized=True)}
 
 
 @app.post("/api/trades/{trade_id}/close")
@@ -1001,16 +1013,33 @@ async def close_trade(trade_id: int, exit_price_a: float, exit_price_b: float = 
     pnl = db.close_trade(trade_id, exit_price_a, exit_price_b, notes)
     if pnl is None:
         raise HTTPException(404, "Trade not found")
-    return {"trade_id": trade_id, "pnl": round(pnl, 2), "status": "closed"}
+    return {
+        "trade_id": trade_id,
+        "pnl": round(pnl, 2),
+        "status": "closed",
+        "paper_account": db.get_paper_account_state(refresh_unrealized=True),
+    }
 
 
 @app.post("/api/weather/{signal_id}/trade")
 async def open_weather_trade(signal_id: int, size_usd: float = 20):
     """Open a paper trade from a weather signal."""
+    balance_check = db.can_open_paper_trade(size_usd)
+    if not balance_check["ok"]:
+        raise HTTPException(
+            400,
+            f"Insufficient paper cash: ${balance_check['available_cash']:.2f} available, "
+            f"${balance_check['requested_size_usd']:.2f} requested",
+        )
     trade_id = db.open_weather_trade(signal_id, size_usd=size_usd)
     if not trade_id:
         raise HTTPException(404, "Weather signal not found or already traded")
-    return {"trade_id": trade_id, "signal_id": signal_id, "status": "open"}
+    return {
+        "trade_id": trade_id,
+        "signal_id": signal_id,
+        "status": "open",
+        "paper_account": db.get_paper_account_state(refresh_unrealized=True),
+    }
 
 
 @app.post("/api/whales/{alert_id}/trade")
@@ -1018,6 +1047,13 @@ async def open_whale_trade_endpoint(alert_id: int, size_usd: float = 20):
     """Open a paper trade from a whale alert."""
     log.info("Whale trade request for alert ID: %d", alert_id)
     try:
+        balance_check = db.can_open_paper_trade(size_usd)
+        if not balance_check["ok"]:
+            raise HTTPException(
+                400,
+                f"Insufficient paper cash: ${balance_check['available_cash']:.2f} available, "
+                f"${balance_check['requested_size_usd']:.2f} requested",
+            )
         import whale_detector
         # Get alert from DB
         alerts = db.get_whale_alerts(limit=1000)
@@ -1032,7 +1068,12 @@ async def open_whale_trade_endpoint(alert_id: int, size_usd: float = 20):
             raise HTTPException(500, "Failed to create whale trade")
 
         log.info("Whale trade opened: ID %d from alert %d", trade_id, alert_id)
-        return {"ok": True, "trade_id": trade_id, "status": "open"}
+        return {
+            "ok": True,
+            "trade_id": trade_id,
+            "status": "open",
+            "paper_account": db.get_paper_account_state(refresh_unrealized=True),
+        }
     except Exception as e:
         log.error("Whale trade endpoint error: %s", e)
         if isinstance(e, HTTPException):
@@ -1199,6 +1240,13 @@ async def update_copy_settings(
 async def mirror_position(wallet: str, condition_id: str, size_usd: float = 20.0):
     """Open a paper copy trade mirroring a watched wallet's position."""
     import copy_scanner
+    balance_check = db.can_open_paper_trade(size_usd)
+    if not balance_check["ok"]:
+        raise HTTPException(
+            400,
+            f"Insufficient paper cash: ${balance_check['available_cash']:.2f} available, "
+            f"${balance_check['requested_size_usd']:.2f} requested",
+        )
     wallets = {r["address"]: r["label"] for r in db.get_watched_wallets(active_only=True)}
     label = wallets.get(wallet, wallet[:10] + "...")
     positions = copy_scanner.get_positions(wallet)
@@ -1224,7 +1272,8 @@ async def mirror_position(wallet: str, condition_id: str, size_usd: float = 20.0
         return {"ok": False, "error": "Already have an open copy trade for this position"}
     return {"ok": True, "trade_id": trade_id, "label": label,
             "market": pos.get("title"), "outcome": pos.get("outcome"),
-            "price": pos.get("curPrice"), "size_usd": size_usd}
+            "price": pos.get("curPrice"), "size_usd": size_usd,
+            "paper_account": db.get_paper_account_state(refresh_unrealized=True)}
 
 
 # --- Wallet Discovery ---

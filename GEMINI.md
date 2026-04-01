@@ -11,7 +11,7 @@ Scores opportunities through math filters (EV, Kelly, slippage), optionally vali
 ## Scope Of This File
 This file is a repo-level guidance document for coding agents and humans working in this project.
 It is not automatically enforced by Codex at runtime unless the agent or workflow explicitly opens and follows it.
-`CLAUDE.md` serves the same purpose for this repo.
+`GEMINI.md` serves the same purpose for this repo.
 
 ## Architecture
 
@@ -55,7 +55,7 @@ Every module follows: docstring → imports → `log = logging.getLogger("scanne
 Every opportunity flows: scanner finds pair → `math_engine.score_opportunity()` grades A+ to F → optionally `brain.validate_signal()` for Claude check → `execution.execute_trade()` if tradeable.
 
 ### Trading Modes
-- **Paper** (default): simulates against current prices, tracks in SQLite
+- **Paper** (default): simulates against current prices, tracks in SQLite. There are no limits on numbers of trades while in paper mode.
 - **Live**: requires `POLYMARKET_PRIVATE_KEY` in `.env`, uses py-clob-client
 
 ### Database
@@ -68,6 +68,7 @@ SQLite at `scanner.db`. Schema auto-migrates on import via `db.init_db()`. New c
 - Use `eval()` for JSON parsing. Always `json.loads()`.
 - Skip error recovery on API calls. Every external call needs try/except.
 - Commit `.env` or `scanner.db` to git.
+- Commit code with exposed tokens or API keys
 - Place real money trades without explicit user confirmation.
 - Use FOK (Fill or Kill) orders — use GTC (Good Till Cancelled) instead.
 
@@ -75,7 +76,8 @@ SQLite at `scanner.db`. Schema auto-migrates on import via `db.init_db()`. New c
 - Log every trading decision with timestamp (the log file is the audit trail).
 - Log bug-fix work in a dated markdown file under `fix_logs/` and update that file when behavior changes.
 - Route Daily Report follow-ups explicitly: `Not Working` items can be logged to `fix_logs/` or `reports/diagnostics/`, and improvements should only go to `implementation-plan.md` or `testing-ideas.md` when intentionally promoted.
-- Update `CLAUDE.md` and `GEMINI.md` if the bug-fix logging process or location changes.
+- Update `CLAUDE.md` and `GEMINI.md` and `AGENTS.md` if the bug-fix logging process or location changes.
+- keep `CLAUDE.md` and `GEMINI.md` and `AGENTS.md` in sync and always updates all three files if changes are made.
 - Cap Kelly fraction at 0.25 (quarter-Kelly). Full Kelly is too aggressive.
 - Check slippage before any trade. Skip if >2%.
 - Check balance before any live trade.

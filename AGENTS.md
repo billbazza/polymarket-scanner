@@ -8,6 +8,11 @@ Multi-strategy scanner for Polymarket prediction markets. Three live strategies:
 
 Scores opportunities through math filters (EV, Kelly, slippage), optionally validates with Claude AI, and supports paper + live trading.
 
+## IMPORTANT: Agent Instructions
+You are working in the Polymarket Scanner project. 
+ALWAYS read and strictly follow the full guidelines in this AGENTS.md file before starting any task, making changes, or reviewing code. 
+Reference specific sections (Architecture, Rules, Never Do, Always Do, etc.) in your reasoning.
+
 ## Scope Of This File
 This file is a repo-level guidance document for coding agents and humans working in this project.
 It is not automatically enforced by Codex at runtime unless the agent or workflow explicitly opens and follows it.

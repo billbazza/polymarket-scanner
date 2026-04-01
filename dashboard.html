@@ -29,6 +29,94 @@
     line-height: 1.5;
   }
   .container { margin: 0 auto; padding: 20px; }
+  .hero-panel {
+    background:
+      radial-gradient(circle at top right, rgba(14,165,233,0.14), transparent 34%),
+      linear-gradient(135deg, rgba(17,24,39,0.98), rgba(12,18,30,0.98));
+    border: 1px solid var(--border);
+    border-radius: 16px;
+    padding: 18px;
+    margin-bottom: 18px;
+    box-shadow: 0 20px 40px rgba(2, 6, 23, 0.28);
+  }
+  .hero-head {
+    display: flex;
+    justify-content: space-between;
+    gap: 16px;
+    align-items: flex-start;
+    margin-bottom: 14px;
+    flex-wrap: wrap;
+  }
+  .hero-title { max-width: 760px; }
+  .hero-kicker {
+    color: var(--sky);
+    text-transform: uppercase;
+    letter-spacing: 1.2px;
+    font-size: 10px;
+    font-weight: 700;
+    margin-bottom: 4px;
+  }
+  .hero-title h2 { font-size: 24px; margin-bottom: 4px; }
+  .hero-title p { color: var(--text2); max-width: 72ch; }
+  .hero-equity {
+    min-width: 220px;
+    padding: 14px 16px;
+    border-radius: 12px;
+    background: rgba(15, 23, 42, 0.85);
+    border: 1px solid rgba(59,130,246,0.22);
+  }
+  .hero-equity .label { color: var(--text2); font-size: 11px; text-transform: uppercase; letter-spacing: 0.7px; }
+  .hero-equity .value { font-size: 30px; font-weight: 800; line-height: 1.1; margin-top: 6px; }
+  .hero-equity .subtext { color: var(--text2); font-size: 12px; margin-top: 6px; }
+  .account-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
+    gap: 12px;
+  }
+  .account-card {
+    background: rgba(15, 23, 42, 0.72);
+    border: 1px solid rgba(71, 85, 105, 0.45);
+    border-radius: 12px;
+    padding: 14px;
+  }
+  .account-card .label {
+    color: var(--text2);
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.6px;
+  }
+  .account-card .value {
+    font-size: 24px;
+    font-weight: 750;
+    margin-top: 6px;
+  }
+  .account-card .meta {
+    color: var(--text2);
+    font-size: 12px;
+    margin-top: 6px;
+    line-height: 1.45;
+  }
+  .account-card.accent-cash { border-color: rgba(20,184,166,0.28); }
+  .account-card.accent-commit { border-color: rgba(245,158,11,0.28); }
+  .account-card.accent-realized { border-color: rgba(59,130,246,0.28); }
+  .account-card.accent-unrealized { border-color: rgba(139,92,246,0.28); }
+  .account-explainer {
+    margin-top: 14px;
+    padding: 14px;
+    border-radius: 12px;
+    background: rgba(15, 23, 42, 0.56);
+    border: 1px solid rgba(71, 85, 105, 0.38);
+    color: var(--text2);
+    font-size: 12px;
+    line-height: 1.55;
+  }
+  .account-explainer strong { color: var(--text); }
+  .mini-stats-row {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+    gap: 12px;
+    margin-bottom: 24px;
+  }
 
   header {
     display: flex;
@@ -256,7 +344,10 @@
 
   @media (max-width: 768px) {
     .stats-row { grid-template-columns: repeat(2, 1fr); }
+    .mini-stats-row { grid-template-columns: repeat(2, 1fr); }
     .container { padding: 12px; }
+    .hero-title h2 { font-size: 20px; }
+    .hero-equity .value { font-size: 25px; }
   }
 </style>
 </head>
@@ -272,12 +363,60 @@
     </div>
   </header>
 
-  <!-- Stats -->
-  <div class="stats-row">
-    <div class="stat-card">
-      <div class="label">Total P&L</div>
-      <div class="value" id="statPnl">$0.00</div>
+  <div class="hero-panel">
+    <div class="hero-head">
+      <div class="hero-title">
+        <div class="hero-kicker">Paper Account</div>
+        <h2>Fixed bankroll accounting with cash, commitments, and equity separated cleanly.</h2>
+        <p id="accountSummaryText">Paper trading starts from a fixed bankroll and moves funds from cash into committed capital when a trade opens.</p>
+      </div>
+      <div class="hero-equity">
+        <div class="label">Total Equity</div>
+        <div class="value" id="statEquity">$0.00</div>
+        <div class="subtext" id="statStartingBankroll">Starting bankroll $0.00</div>
+      </div>
     </div>
+
+    <div class="account-grid">
+      <div class="account-card accent-cash">
+        <div class="label">Available Cash</div>
+        <div class="value" id="statAvailableCash">$0.00</div>
+        <div class="meta" id="statCashMeta">Ready for new paper trades.</div>
+      </div>
+      <div class="account-card accent-commit">
+        <div class="label">Committed Capital</div>
+        <div class="value amber" id="statCommitted">$0.00</div>
+        <div class="meta" id="statCommittedMeta">Open positions currently using bankroll.</div>
+      </div>
+      <div class="account-card accent-realized">
+        <div class="label">Realized P&amp;L</div>
+        <div class="value" id="statRealized">$0.00</div>
+        <div class="meta" id="statRealizedMeta">Closed trades only.</div>
+      </div>
+      <div class="account-card accent-unrealized">
+        <div class="label">Unrealized P&amp;L</div>
+        <div class="value" id="statUnrealized">$0.00</div>
+        <div class="meta" id="statUnrealizedMeta">Mark-to-market on open trades.</div>
+      </div>
+      <div class="account-card">
+        <div class="label">Cumulative Losses</div>
+        <div class="value red" id="statLossesUsd">$0.00</div>
+        <div class="meta">Gross losses from losing closed trades, shown separately from net P&amp;L.</div>
+      </div>
+      <div class="account-card">
+        <div class="label">Bankroll In Use</div>
+        <div class="value sky" id="statUtilization" style="color:var(--sky);">0%</div>
+        <div class="meta" id="statUtilizationMeta">0 open positions.</div>
+      </div>
+    </div>
+
+    <div class="account-explainer" id="accountExplainer">
+      <strong>Accounting rule:</strong> opening a paper trade immediately deducts its size from available cash and classifies it as committed capital until the trade closes.
+    </div>
+  </div>
+
+  <!-- Stats -->
+  <div class="mini-stats-row">
     <div class="stat-card">
       <div class="label">Win Rate</div>
       <div class="value blue" id="statWinRate">0%</div>
@@ -310,7 +449,7 @@
 
   <!-- P&L Chart -->
   <div class="chart-container">
-    <div class="chart-label">Cumulative P&L</div>
+    <div class="chart-label">Realized P&amp;L Over Time</div>
     <canvas id="pnlChart"></canvas>
   </div>
 
@@ -701,9 +840,32 @@ async function loadStats() {
   try {
     const r = await fetch(API + '/api/stats');
     const s = await r.json();
-    const pnlEl = document.getElementById('statPnl');
-    pnlEl.textContent = fmtUsd(s.total_pnl);
-    pnlEl.className = 'value ' + (s.total_pnl >= 0 ? 'green' : 'red');
+    const account = s.paper_account || {};
+    const setSignedValue = (id, value) => {
+      const el = document.getElementById(id);
+      el.textContent = fmtUsd(value);
+      el.className = 'value ' + (value >= 0 ? 'green' : 'red');
+    };
+
+    document.getElementById('statEquity').textContent = fmtUsd(account.total_equity);
+    document.getElementById('statStartingBankroll').textContent = `Starting bankroll ${fmtUsd(account.starting_bankroll)}`;
+    document.getElementById('statAvailableCash').textContent = fmtUsd(account.available_cash);
+    document.getElementById('statCashMeta').textContent = `${fmtUsd(account.available_cash)} free to deploy now.`;
+    document.getElementById('statCommitted').textContent = fmtUsd(account.committed_capital);
+    document.getElementById('statCommittedMeta').textContent = `${fmtUsd(account.committed_capital)} tied up across ${account.open_trades || 0} open trade${(account.open_trades || 0) === 1 ? '' : 's'}.`;
+    setSignedValue('statRealized', account.realized_pnl || 0);
+    document.getElementById('statRealizedMeta').textContent = `Closed-trade net: gains ${fmtUsd(account.realized_gains || 0)} vs losses ${fmtUsd(account.cumulative_losses || 0)}.`;
+    setSignedValue('statUnrealized', account.unrealized_pnl || 0);
+    document.getElementById('statUnrealizedMeta').textContent = `Current mark-to-market on open trades.`;
+    document.getElementById('statLossesUsd').textContent = fmtUsd(account.cumulative_losses);
+    document.getElementById('statUtilization').textContent = (account.bankroll_used_pct || 0).toFixed(1) + '%';
+    document.getElementById('statUtilizationMeta').textContent = `${fmtUsd(account.committed_capital || 0)} of ${fmtUsd(account.starting_bankroll || 0)} bankroll currently committed.`;
+    document.getElementById('accountSummaryText').textContent =
+      `Equity ${fmtUsd(account.total_equity)} = cash ${fmtUsd(account.available_cash)} + committed capital ${fmtUsd(account.committed_capital)} + unrealized P&L ${fmtUsd(account.unrealized_pnl)}.`;
+    document.getElementById('accountExplainer').innerHTML =
+      `<strong>Accounting rule:</strong> ${esc(account.cash_after_open_explanation || 'Opening a paper trade deducts its size from available cash immediately.')} ` +
+      `Available cash is computed as starting bankroll ${fmtUsd(account.starting_bankroll)} + realized P&amp;L ${fmtUsd(account.realized_pnl)} - committed capital ${fmtUsd(account.committed_capital)}.`;
+
     document.getElementById('statWinRate').textContent = s.win_rate + '%';
     document.getElementById('statOpen').textContent = s.open_trades;
     document.getElementById('statClosed').textContent = s.closed_trades;

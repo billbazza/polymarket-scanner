@@ -14,7 +14,7 @@ import math_engine
 log = logging.getLogger("scanner.execution")
 
 MAX_SLIPPAGE_PCT  = 2.5
-PAPER_BALANCE_USD = 10_000.0
+PAPER_BALANCE_USD = 2_000.0
 
 # Execution mode: "maker" (GTC limit orders, 0% fee) or "taker" (market orders, 2% fee).
 # Default is maker — post inside the spread, pay no fees, capture better prices.
@@ -26,14 +26,6 @@ MAKER_AGGRESSION = 0.5
 
 # GTC orders expire and are cancelled after this many hours if unfilled.
 ORDER_TTL_HOURS = 4
-
-# In-memory paper balance tracker (resets on restart)
-_paper_state = {
-    "balance": PAPER_BALANCE_USD,
-    "fills": [],
-    "open_trade_sizes": {},
-}
-
 
 def _get_mode():
     """Determine trading mode from environment."""
@@ -55,11 +47,18 @@ def check_balance(mode=None):
     mode = mode or _get_mode()
 
     if mode == "paper":
-        log.debug("Paper balance check: $%.2f", _paper_state["balance"])
+        account = db.get_paper_account_state(refresh_unrealized=False)
+        log.debug(
+            "Paper balance check: available=$%.2f committed=$%.2f equity=$%.2f",
+            account["available_cash"],
+            account["committed_capital"],
+            account["total_equity"],
+        )
         return {
             "ok": True,
-            "balance_usd": _paper_state["balance"],
+            "balance_usd": account["available_cash"],
             "mode": "paper",
+            "paper_account": account,
         }
 
     # Live mode — use blockchain module
@@ -229,9 +228,7 @@ def _execute_paper(signal, size_usd, price_a, price_b,
     if not trade_id:
         log.error("Failed to open trade in DB for signal %s", signal_id)
         return {"ok": False, "error": "DB open_trade failed", "mode": "paper"}
-
-    _paper_state["balance"] -= size_usd
-    _paper_state["open_trade_sizes"][trade_id] = size_usd
+    account = db.get_paper_account_state(refresh_unrealized=False)
 
     now = time.time()
     half = size_usd / 2
@@ -262,7 +259,7 @@ def _execute_paper(signal, size_usd, price_a, price_b,
 
     log.info("PAPER %s FILL: trade=%d | A(%s)=%.4f B(%s)=%.4f | $%.2f | bal=$%.2f",
              exec_mode.upper(), trade_id, side_a, price_a, side_b, price_b,
-             size_usd, _paper_state["balance"])
+             size_usd, account["available_cash"])
 
     return {
         "ok": True,
@@ -273,19 +270,21 @@ def _execute_paper(signal, size_usd, price_a, price_b,
         "fill_price_a": price_a,
         "fill_price_b": price_b,
         "size_usd": size_usd,
-        "remaining_balance": _paper_state["balance"],
+        "remaining_balance": account["available_cash"],
+        "paper_account": account,
     }
 
 
 def settle_paper_trade(trade_id, pnl_usd):
-    """Credit principal plus realized P&L for tracked paper trades."""
-    size_usd = _paper_state["open_trade_sizes"].pop(trade_id, None)
-    if size_usd is None:
-        return False
-
-    _paper_state["balance"] += size_usd + (pnl_usd or 0)
-    log.info("PAPER CLOSE: trade=%d | pnl=$%.2f | bal=$%.2f",
-             trade_id, pnl_usd or 0, _paper_state["balance"])
+    """Retained for compatibility. Paper accounting is now derived from SQLite."""
+    account = db.get_paper_account_state(refresh_unrealized=False)
+    log.info(
+        "PAPER CLOSE: trade=%d | pnl=$%.2f | available=$%.2f equity=$%.2f",
+        trade_id,
+        pnl_usd or 0,
+        account["available_cash"],
+        account["total_equity"],
+    )
     return True
 
 

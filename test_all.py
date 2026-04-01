@@ -92,7 +92,8 @@ def test_db():
     conn.close()
 
     for tbl in ["signals", "trades", "snapshots", "scan_runs",
-                "locked_arb", "weather_signals", "scan_jobs", "schema_migrations"]:
+                "locked_arb", "weather_signals", "scan_jobs", "schema_migrations",
+                "paper_accounts"]:
         check(f"table '{tbl}' exists", tbl in tables)
 
     # get_signal_by_id — non-existent ID returns None
@@ -177,8 +178,10 @@ def test_paper_balance_lifecycle():
     import db
     import execution
 
-    execution._paper_state["balance"] = execution.PAPER_BALANCE_USD
-    execution._paper_state["open_trade_sizes"].clear()
+    db.set_paper_starting_bankroll(execution.PAPER_BALANCE_USD)
+    starting = db.get_paper_account_state(refresh_unrealized=False)
+    check("paper bankroll default persisted", starting["starting_bankroll"] == execution.PAPER_BALANCE_USD)
+    check("paper opening cash matches bankroll", starting["available_cash"] == execution.PAPER_BALANCE_USD)
 
     signal = {
         "event": "Paper Balance Test",
@@ -203,17 +206,24 @@ def test_paper_balance_lifecycle():
 
     result = execution._execute_paper(signal, size_usd=100, price_a=0.40, price_b=0.60)
     check("paper execute succeeds", result["ok"] is True)
-    check("paper balance debited on open",
-          execution._paper_state["balance"] == execution.PAPER_BALANCE_USD - 100)
+    after_open = db.get_paper_account_state(refresh_unrealized=False)
+    check("paper cash debited on open", after_open["available_cash"] == execution.PAPER_BALANCE_USD - 100)
+    check("paper committed capital tracked", after_open["committed_capital"] == 100)
+    check("paper remaining balance echoed", result["remaining_balance"] == after_open["available_cash"])
 
     pnl = db.close_trade(result["trade_id"], exit_price_a=0.50, exit_price_b=0.55)
+    after_close = db.get_paper_account_state(refresh_unrealized=False)
     expected_balance = execution.PAPER_BALANCE_USD + pnl
     check("paper close returns pnl", pnl is not None)
-    check("paper balance restored on close",
-          abs(execution._paper_state["balance"] - expected_balance) < 1e-9,
-          f"balance={execution._paper_state['balance']}, expected={expected_balance}")
-    check("paper trade tracking cleared",
-          result["trade_id"] not in execution._paper_state["open_trade_sizes"])
+    check("paper cash restored on close",
+          abs(after_close["available_cash"] - round(expected_balance, 2)) < 1e-9,
+          f"cash={after_close['available_cash']}, expected={expected_balance}")
+    check("paper realized pnl persisted",
+          abs(after_close["realized_pnl"] - round(pnl, 2)) < 1e-9,
+          f"realized={after_close['realized_pnl']}, pnl={pnl}")
+    check("paper committed capital cleared", after_close["committed_capital"] == 0)
+    blocked = db.can_open_paper_trade(after_close["available_cash"] + 1)
+    check("paper account rejects oversized trade", blocked["ok"] is False)
 
 run("paper_balance", test_paper_balance_lifecycle)
 
