@@ -31,6 +31,24 @@ def _add_column_if_missing(conn, table_name, column_name, column_type):
         conn.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_type}")
 
 
+def _normalize_query_limit(limit, context: str):
+    """Normalize optional LIMIT values before handing them to SQLite.
+
+    SQLite raises `datatype mismatch` when NULL is bound into `LIMIT ?`.
+    Callers use `None` to mean "no limit", so convert that into branch logic
+    before the query runs and fail early with a precise message for bad values.
+    """
+    if limit is None:
+        return None
+    try:
+        normalized = int(limit)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"Invalid limit for {context}: {limit!r}") from exc
+    if normalized < 0:
+        raise ValueError(f"Invalid limit for {context}: {limit!r}")
+    return normalized
+
+
 def _migration_001_base_schema(conn):
     conn.executescript("""
         CREATE TABLE IF NOT EXISTS signals (
@@ -608,11 +626,21 @@ def get_signal_by_id(signal_id):
 
 
 def get_signals(limit=50, status=None):
+    limit = _normalize_query_limit(limit, "get_signals")
     conn = get_conn()
-    if status:
+    if status and limit is None:
+        rows = conn.execute(
+            "SELECT * FROM signals WHERE status=? ORDER BY timestamp DESC",
+            (status,),
+        ).fetchall()
+    elif status:
         rows = conn.execute(
             "SELECT * FROM signals WHERE status=? ORDER BY timestamp DESC LIMIT ?",
             (status, limit),
+        ).fetchall()
+    elif limit is None:
+        rows = conn.execute(
+            "SELECT * FROM signals ORDER BY timestamp DESC"
         ).fetchall()
     else:
         rows = conn.execute(
@@ -1534,11 +1562,18 @@ def save_snapshot(trade_id, price_a, price_b, spread, z_score):
 
 
 def get_snapshots(trade_id, limit=500):
+    limit = _normalize_query_limit(limit, "get_snapshots")
     conn = get_conn()
-    rows = conn.execute(
-        "SELECT * FROM snapshots WHERE trade_id=? ORDER BY timestamp ASC LIMIT ?",
-        (trade_id, limit),
-    ).fetchall()
+    if limit is None:
+        rows = conn.execute(
+            "SELECT * FROM snapshots WHERE trade_id=? ORDER BY timestamp ASC",
+            (trade_id,),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT * FROM snapshots WHERE trade_id=? ORDER BY timestamp ASC LIMIT ?",
+            (trade_id, limit),
+        ).fetchall()
     conn.close()
     return [dict(r) for r in rows]
 
@@ -1641,15 +1676,24 @@ def save_weather_signal(opp):
 
 def get_weather_signals(limit=50, tradeable_only=False):
     """Fetch recent weather-edge opportunities, annotated with open trade id if one exists."""
+    limit = _normalize_query_limit(limit, "get_weather_signals")
     base = """
         SELECT ws.*, t.id AS exact_open_trade_id
         FROM weather_signals ws
         LEFT JOIN trades t ON t.weather_signal_id = ws.id AND t.status = 'open'
     """
     conn = get_conn()
-    if tradeable_only:
+    if tradeable_only and limit is None:
+        rows = conn.execute(
+            base + " WHERE ws.tradeable=1 ORDER BY ws.timestamp DESC"
+        ).fetchall()
+    elif tradeable_only:
         rows = conn.execute(
             base + " WHERE ws.tradeable=1 ORDER BY ws.timestamp DESC LIMIT ?", (limit,)
+        ).fetchall()
+    elif limit is None:
+        rows = conn.execute(
+            base + " ORDER BY ws.timestamp DESC"
         ).fetchall()
     else:
         rows = conn.execute(
@@ -1711,11 +1755,20 @@ def save_locked_arb(opp):
 
 def get_locked_arb(limit=50, tradeable_only=False):
     """Fetch recent locked-arb opportunities."""
+    limit = _normalize_query_limit(limit, "get_locked_arb")
     conn = get_conn()
-    if tradeable_only:
+    if tradeable_only and limit is None:
+        rows = conn.execute(
+            "SELECT * FROM locked_arb WHERE tradeable=1 ORDER BY timestamp DESC"
+        ).fetchall()
+    elif tradeable_only:
         rows = conn.execute(
             "SELECT * FROM locked_arb WHERE tradeable=1 ORDER BY timestamp DESC LIMIT ?",
             (limit,),
+        ).fetchall()
+    elif limit is None:
+        rows = conn.execute(
+            "SELECT * FROM locked_arb ORDER BY timestamp DESC"
         ).fetchall()
     else:
         rows = conn.execute(
@@ -1977,11 +2030,20 @@ def save_longshot_signal(opp):
 
 def get_longshot_signals(limit=50, tradeable_only=False):
     """Fetch recent longshot-bias opportunities."""
+    limit = _normalize_query_limit(limit, "get_longshot_signals")
     conn = get_conn()
-    if tradeable_only:
+    if tradeable_only and limit is None:
+        rows = conn.execute(
+            "SELECT * FROM longshot_signals WHERE tradeable=1 ORDER BY timestamp DESC"
+        ).fetchall()
+    elif tradeable_only:
         rows = conn.execute(
             "SELECT * FROM longshot_signals WHERE tradeable=1 ORDER BY timestamp DESC LIMIT ?",
             (limit,),
+        ).fetchall()
+    elif limit is None:
+        rows = conn.execute(
+            "SELECT * FROM longshot_signals ORDER BY timestamp DESC"
         ).fetchall()
     else:
         rows = conn.execute(
@@ -2022,11 +2084,20 @@ def save_near_certainty_signal(opp):
 
 def get_near_certainty_signals(limit=50, tradeable_only=False):
     """Fetch recent near-certainty edge opportunities."""
+    limit = _normalize_query_limit(limit, "get_near_certainty_signals")
     conn = get_conn()
-    if tradeable_only:
+    if tradeable_only and limit is None:
+        rows = conn.execute(
+            "SELECT * FROM near_certainty_signals WHERE tradeable=1 ORDER BY timestamp DESC"
+        ).fetchall()
+    elif tradeable_only:
         rows = conn.execute(
             "SELECT * FROM near_certainty_signals WHERE tradeable=1 ORDER BY timestamp DESC LIMIT ?",
             (limit,),
+        ).fetchall()
+    elif limit is None:
+        rows = conn.execute(
+            "SELECT * FROM near_certainty_signals ORDER BY timestamp DESC"
         ).fetchall()
     else:
         rows = conn.execute(
@@ -2077,15 +2148,22 @@ def save_whale_alert(alert):
 
 
 def get_whale_alerts(limit=50, min_score=0, undismissed_only=False):
+    limit = _normalize_query_limit(limit, "get_whale_alerts")
     conn = get_conn()
     where = "WHERE suspicion_score >= ?"
     params = [min_score]
     if undismissed_only:
         where += " AND dismissed = 0"
-    rows = conn.execute(
-        f"SELECT * FROM whale_alerts {where} ORDER BY timestamp DESC LIMIT ?",
-        (*params, limit)
-    ).fetchall()
+    if limit is None:
+        rows = conn.execute(
+            f"SELECT * FROM whale_alerts {where} ORDER BY timestamp DESC",
+            tuple(params),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            f"SELECT * FROM whale_alerts {where} ORDER BY timestamp DESC LIMIT ?",
+            (*params, limit)
+        ).fetchall()
     conn.close()
     return [dict(r) for r in rows]
 
@@ -2098,15 +2176,25 @@ def get_whale_alert_by_id(alert_id: int):
 
 
 def get_latest_copy_trades(limit=5):
+    limit = _normalize_query_limit(limit, "get_latest_copy_trades")
     conn = get_conn()
-    rows = conn.execute("""
-        SELECT id, opened_at, status, copy_wallet, copy_label,
-               copy_condition_id, copy_outcome, size_usd
-        FROM trades
-        WHERE trade_type='copy'
-        ORDER BY opened_at DESC
-        LIMIT ?
-    """, (limit,)).fetchall()
+    if limit is None:
+        rows = conn.execute("""
+            SELECT id, opened_at, status, copy_wallet, copy_label,
+                   copy_condition_id, copy_outcome, size_usd
+            FROM trades
+            WHERE trade_type='copy'
+            ORDER BY opened_at DESC
+        """).fetchall()
+    else:
+        rows = conn.execute("""
+            SELECT id, opened_at, status, copy_wallet, copy_label,
+                   copy_condition_id, copy_outcome, size_usd
+            FROM trades
+            WHERE trade_type='copy'
+            ORDER BY opened_at DESC
+            LIMIT ?
+        """, (limit,)).fetchall()
     conn.close()
     return [dict(r) for r in rows]
 
@@ -2143,10 +2231,16 @@ def save_scan_run(pairs_tested, cointegrated, opportunities, duration):
 
 
 def get_scan_runs(limit=20):
+    limit = _normalize_query_limit(limit, "get_scan_runs")
     conn = get_conn()
-    rows = conn.execute(
-        "SELECT * FROM scan_runs ORDER BY timestamp DESC LIMIT ?", (limit,)
-    ).fetchall()
+    if limit is None:
+        rows = conn.execute(
+            "SELECT * FROM scan_runs ORDER BY timestamp DESC"
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT * FROM scan_runs ORDER BY timestamp DESC LIMIT ?", (limit,)
+        ).fetchall()
     conn.close()
     return [dict(r) for r in rows]
 

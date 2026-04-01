@@ -232,599 +232,618 @@ def run_cycle(state):
     """
     level = state["level"]
     config = LEVELS[level]
+    current_stage = "initializing"
 
-    log.info("=== Autonomy cycle: level=%s (%s) ===", level, config["name"])
-
-    # Step 1: Scan for new signals (use fast async scanner, ~5x faster)
-    log.info("Step 1: Scanning for signals (fast mode)...")
-    scan_started = time.time()
     try:
-        scan_result = asyncio.run(async_scanner.scan(
-            z_threshold=1.5,
-            p_threshold=0.10,
-            min_liquidity=5000,
-            interval="1w",
-            verbose=False,
-            include_stats=True,
-        ))
-    except Exception as e:
-        log.error("Fast scan failed, falling back to sync: %s", e)
+        log.info("=== Autonomy cycle: level=%s (%s) ===", level, config["name"])
+
+        # Step 1: Scan for new signals (use fast async scanner, ~5x faster)
+        current_stage = "step 1 scan"
+        log.info("Step 1: Scanning for signals (fast mode)...")
+        scan_started = time.time()
         try:
-            scan_result = scanner.scan(
+            scan_result = asyncio.run(async_scanner.scan(
                 z_threshold=1.5,
                 p_threshold=0.10,
                 min_liquidity=5000,
                 interval="1w",
                 verbose=False,
                 include_stats=True,
+            ))
+        except Exception as e:
+            log.error("Fast scan failed, falling back to sync: %s", e)
+            try:
+                scan_result = scanner.scan(
+                    z_threshold=1.5,
+                    p_threshold=0.10,
+                    min_liquidity=5000,
+                    interval="1w",
+                    verbose=False,
+                    include_stats=True,
+                )
+            except Exception as e2:
+                log.error("Scan failed: %s", e2)
+                journal({"action": "scan_failed", "reason": str(e2), "level": level})
+                return state
+
+        opportunities = scan_result["opportunities"]
+        scan_duration = round(time.time() - scan_started, 1)
+
+        # Save scan run
+        current_stage = "step 1b persist scan run"
+        db.save_scan_run(pairs_tested=scan_result["pairs_tested"], cointegrated=scan_result["pairs_cointegrated"],
+                         opportunities=len(opportunities), duration=scan_duration)
+
+        paper_mode = level == "paper"
+        trial_settings = cointegration_trial.get_trial_settings()
+        admitted_signals = []
+        a_trial_candidates = 0
+        a_trial_eligible = 0
+        a_trial_rejected = 0
+        rejection_counts = {}
+        for opp in opportunities:
+            evaluation = cointegration_trial.annotate_opportunity(
+                opp,
+                mode="paper" if paper_mode else "live",
+                settings=trial_settings,
             )
-        except Exception as e2:
-            log.error("Scan failed: %s", e2)
-            journal({"action": "scan_failed", "reason": str(e2), "level": level})
-            return state
-
-    opportunities = scan_result["opportunities"]
-    scan_duration = round(time.time() - scan_started, 1)
-
-    # Save scan run
-    db.save_scan_run(pairs_tested=scan_result["pairs_tested"], cointegrated=scan_result["pairs_cointegrated"],
-                     opportunities=len(opportunities), duration=scan_duration)
-
-    paper_mode = level == "paper"
-    trial_settings = cointegration_trial.get_trial_settings()
-    admitted_signals = []
-    a_trial_candidates = 0
-    a_trial_eligible = 0
-    a_trial_rejected = 0
-    rejection_counts = {}
-    for opp in opportunities:
-        evaluation = cointegration_trial.annotate_opportunity(
-            opp,
-            mode="paper" if paper_mode else "live",
-            settings=trial_settings,
-        )
-        if opp.get("grade_label") == "A":
-            a_trial_candidates += 1
-            if evaluation["admit_trade"]:
-                a_trial_eligible += 1
-            else:
-                a_trial_rejected += 1
-                code = evaluation["reason_code"]
-                rejection_counts[code] = rejection_counts.get(code, 0) + 1
-        if evaluation["admit_trade"]:
-            admitted_signals.append(opp)
-
-    # Save all signals after admission metadata is attached
-    new_signal_ids = []
-    for opp in opportunities:
-        try:
-            sid = db.save_signal(opp)
-            opp["id"] = sid
-            new_signal_ids.append(sid)
-        except Exception as e:
-            log.warning("Failed to save signal: %s", e)
-
-    tradeable = [o for o in opportunities if o.get("tradeable")]
-    log.info(
-        "Scan found %d signals, %d A+ tradeable, %d admitted for this level",
-        len(opportunities),
-        len(tradeable),
-        len(admitted_signals),
-    )
-    log.info(
-        "Cointegration A-trial status: enabled=%s paper_only=%s candidates=%d eligible=%d rejected=%d",
-        trial_settings["enabled"],
-        trial_settings["paper_only"],
-        a_trial_candidates,
-        a_trial_eligible,
-        a_trial_rejected,
-    )
-
-    journal({
-        "action": "scan_complete",
-        "level": level,
-        "total_signals": len(opportunities),
-        "tradeable": len(tradeable),
-        "admitted_signals": len(admitted_signals),
-        "a_trial_candidates": a_trial_candidates,
-        "a_trial_eligible": a_trial_eligible,
-        "a_trial_rejected": a_trial_rejected,
-        "a_trial_rejection_counts": rejection_counts,
-        "signal_ids": new_signal_ids,
-    })
-
-    # Step 2: Monitor existing positions
-    log.info("Step 2: Monitoring open trades...")
-    try:
-        updates = tracker.refresh_open_trades()
-        if updates:
-            for u in updates:
-                pnl_info = u.get("unrealized_pnl", {})
-                if u.get("trade_type") == "weather":
-                    log.info("  Trade %d [weather]: price=%.4f pnl=$%.2f",
-                             u["trade_id"], u.get("current_price_a", 0),
-                             pnl_info.get("pnl_usd", 0))
+            if opp.get("grade_label") == "A":
+                a_trial_candidates += 1
+                if evaluation["admit_trade"]:
+                    a_trial_eligible += 1
                 else:
-                    log.info("  Trade %d: z=%.2f pnl=$%.2f",
-                             u["trade_id"], u.get("z_score", 0),
-                             pnl_info.get("pnl_usd", 0))
-    except Exception as e:
-        log.warning("Trade monitoring failed: %s", e)
+                    a_trial_rejected += 1
+                    code = evaluation["reason_code"]
+                    rejection_counts[code] = rejection_counts.get(code, 0) + 1
+            if evaluation["admit_trade"]:
+                admitted_signals.append(opp)
 
-    # Step 2b: Manage pending maker orders (check fills, cancel expired)
-    try:
-        order_result = execution.manage_open_orders()
-        if order_result["filled"] or order_result["cancelled"]:
-            log.info("Step 2b: maker orders — %d filled, %d cancelled",
-                     order_result["filled"], order_result["cancelled"])
-    except Exception as e:
-        log.warning("Maker order management failed: %s", e)
-
-    # Step 3: Auto-close reverted trades
-    log.info("Step 3: Checking for auto-closes...")
-    try:
-        closed = tracker.auto_close_trades(z_threshold=0.5)
-        for c in closed:
-            pnl = c["pnl_usd"]
-            state["trades_at_level"] += 1
-            state["pnl_at_level"] += pnl
-            if pnl > 0:
-                state["wins_at_level"] += 1
-            else:
-                state["losses_at_level"] += 1
-            state["returns_at_level"].append(pnl)
-
-            journal({
-                "action": "trade_closed",
-                "level": level,
-                "trade_id": c["trade_id"],
-                "trade_type": c.get("trade_type", "pairs"),
-                "pnl_usd": pnl,
-                "z_score_at_close": c.get("z_score", None),
-                "reason": c.get("reason", "Auto-close"),
-            })
-
-            if c.get("trade_type") == "weather":
-                log.info("  Closed weather trade %d: pnl=$%.2f (%s)",
-                         c["trade_id"], pnl, c.get("reason", ""))
-            else:
-                log.info("  Closed trade %d: pnl=$%.2f (z=%.3f)",
-                         c["trade_id"], pnl, c.get("z_score", 0))
-    except Exception as e:
-        log.warning("Auto-close failed: %s", e)
-
-    # Step 4: Open new trades (if allowed at this level)
-    if not config["can_trade"]:
-        log.info("Step 4: SCOUT mode — not trading")
-        journal({"action": "scout_only", "level": level,
-                 "reason": "Level does not permit trading"})
-        save_state(state)
-        return state
-
-    open_trades = db.get_trades(status="open", limit=None)
-    open_count = len(open_trades)
-    max_open = config["max_open"]
-
-    if max_open is not None and open_count >= max_open:
-        log.info("Step 4: At max positions (%d/%d), skipping new trades",
-                 open_count, max_open)
-        journal({"action": "skip_trade", "level": level,
-                 "reason": f"At max positions ({open_count}/{max_open})"})
-        save_state(state)
-        return state
-
-    # Determine trade size
-    if level == "book":
-        # Kelly-sized from bankroll
-        bankroll = config.get("bankroll", 1000)
-    else:
-        size_usd = config["size_usd"]
-
-    slots = (max_open - open_count) if max_open is not None else len(admitted_signals)
-    traded = 0
-
-    # Build dedup sets from currently open trades — keyed by signal_id and event name
-    open_signal_ids = {t.get("signal_id") for t in open_trades if t.get("signal_id")}
-    open_events = {t.get("event", "") for t in open_trades}
-    # Also track what we open within this cycle so we don't double-open
-    this_cycle_signal_ids = set()
-    this_cycle_events = set()
-
-    for opp in admitted_signals:
-        if traded >= slots:
-            break
-
-        event_name = opp.get("event", "")
-
-        # Get the signal ID for this opportunity
-        signal_id = opp.get("id")
-        if not signal_id:
-            for sid in new_signal_ids:
-                for s in db.get_signals(limit=50):
-                    if s["id"] == sid and s["event"] == event_name:
-                        signal_id = sid
-                        opp["id"] = sid
-                        break
-                if signal_id:
-                    break
-
-        if not signal_id:
-            log.warning("  Could not find signal ID for '%s'", event_name[:40])
-            continue
-
-        # Skip if same signal or same event already open (DB or this cycle)
-        if signal_id in open_signal_ids or signal_id in this_cycle_signal_ids:
-            log.info("  Skip: signal %d already has an open trade", signal_id)
-            journal({"action": "skip_trade", "level": level,
-                     "reason": f"Signal {signal_id} already open"})
-            continue
-
-        if event_name in open_events or event_name in this_cycle_events:
-            log.info("  Skip: already have position in '%s'", event_name[:40])
-            journal({"action": "skip_trade", "level": level,
-                     "reason": f"Already trading event: {event_name[:40]}"})
-            continue
-
-        # Determine size for this trade
-        if level == "book":
-            ev = opp.get("ev", {})
-            # correlated_legs=True: pairs trades expose both legs to the same event;
-            # Kelly assumes independent bets, so halve fraction to compensate.
-            sizing = math_engine.position_size(bankroll, ev, correlated_legs=True) if ev else None
-            trade_size = sizing["recommended_size"] if sizing else 50
-            trade_size = max(5, min(trade_size, bankroll * 0.25))
-        else:
-            trade_size = size_usd
-
-        if paper_mode and opp.get("admission_path") == "paper_a_trial":
-            trial_size = opp.get("trial_recommended_size_usd")
-            if trial_size:
-                trade_size = min(trade_size, trial_size) if trade_size else trial_size
-
-        # Execute
-        mode = "paper" if level in ("paper", "scout") else "live"
-
-        # Step 4.5: Brain validation (if available)
-        # Ask Claude + Perplexity if this signal makes sense in the real world
-        try:
-            import brain
-            should_trade, brain_reasoning = brain.validate_signal(opp)
-            if not should_trade:
-                log.info("  Brain REJECTED trade: %s", brain_reasoning)
-                journal({
-                    "action": "brain_reject",
-                    "level": level,
-                    "event": event_name[:60],
-                    "reason": brain_reasoning,
-                })
-                continue
-            log.info("  Brain VALIDATED trade: %s", brain_reasoning)
-            opp["brain_reasoning"] = brain_reasoning
-        except Exception as e:
-            log.warning("  Brain validation failed (defaulting to math-only): %s", e)
-
-        log.info("  Opening %s trade: %s | $%.2f", mode, event_name[:40], trade_size)
-
-        try:
-            result = execution.execute_trade(opp, size_usd=trade_size, mode=mode)
-            if result["ok"]:
-                traded += 1
-                this_cycle_signal_ids.add(signal_id)
-                this_cycle_events.add(event_name)
-                journal({
-                    "action": "trade_opened",
-                    "level": level,
-                    "mode": mode,
-                    "trade_id": result.get("trade_id"),
-                    "signal_id": signal_id,
-                    "event": event_name[:60],
-                    "size_usd": trade_size,
-                    "z_score": opp.get("z_score", 0),
-                    "grade": opp.get("grade_label", "?"),
-                    "ev_pct": opp.get("ev", {}).get("ev_pct", 0),
-                    "admission_path": opp.get("admission_path"),
-                    "experiment_status": opp.get("experiment_status"),
-                    "reason": opp.get("experiment_reason") or f"Signal admitted, z={opp.get('z_score', 0):+.2f}",
-                })
-            else:
-                journal({
-                    "action": "trade_rejected",
-                    "level": level,
-                    "event": event_name[:60],
-                    "grade": opp.get("grade_label", "?"),
-                    "admission_path": opp.get("admission_path"),
-                    "reason": result.get("error", "unknown"),
-                })
-        except Exception as e:
-            log.error("  Trade execution failed: %s", e)
-            journal({"action": "trade_error", "level": level,
-                     "event": event_name[:60], "reason": str(e)})
-
-    log.info("Step 4: Opened %d new trades", traded)
-
-    for code, count in sorted(rejection_counts.items(), key=lambda item: (-item[1], item[0])):
-        log.info("A-trial rejection summary: %s=%d", code, count)
-
-    # Step 4b: Open weather trades (if slots remain)
-    open_trades = db.get_trades(status="open", limit=None)
-    open_count = len(open_trades)
-    slots_remaining = (max_open - open_count) if max_open is not None else None
-
-    if slots_remaining is None or slots_remaining > 0:
-        try:
-            import weather_scanner
-            weather_opps, _ = weather_scanner.scan(min_edge=0.06, verbose=False)
-            tradeable_weather = [o for o in weather_opps if o.get("tradeable")]
-            weather_traded = 0
-            candidates = tradeable_weather if slots_remaining is None else tradeable_weather[:slots_remaining]
-            for w_opp in candidates:
-                try:
-                    w_id = db.save_weather_signal(w_opp)
-                    trade_size = size_usd if level != "book" else 20
-                    decision = db.inspect_weather_trade_open(
-                        w_id,
-                        size_usd=trade_size,
-                        max_total_open=max_open,
-                    )
-                    if not decision["ok"]:
-                        journal({
-                            "action": "skip_trade",
-                            "level": level,
-                            "trade_type": "weather",
-                            "event": w_opp.get("event", w_opp.get("market", ""))[:60],
-                            "reason": decision["reason"],
-                        })
-                        continue
-                    t_id = db.open_weather_trade(w_id, size_usd=trade_size)
-                    if t_id:
-                        weather_traded += 1
-                        journal({
-                            "action": "trade_opened",
-                            "level": level,
-                            "mode": "paper",
-                            "trade_id": t_id,
-                            "signal_id": w_id,
-                            "trade_type": "weather",
-                            "event": w_opp.get("event", w_opp.get("market", ""))[:60],
-                            "size_usd": trade_size,
-                            "reason": f"Weather edge {w_opp.get('combined_edge_pct', 0):+.1f}%",
-                        })
-                except Exception as e:
-                    log.warning("Weather trade open failed: %s", e)
-            if weather_traded:
-                log.info("Step 4b: Opened %d weather trades", weather_traded)
-        except Exception as e:
-            log.debug("Weather scan skipped: %s", e)
-
-    # Step 4c: Longshot bias scanner (scan for NO maker opportunities on 3–15¢ markets)
-    try:
-        import longshot_scanner
-        import db as _db
-        longshot_opps, ls_stats = longshot_scanner.scan(verbose=False)
-        tradeable_longshots = [o for o in longshot_opps if o.get("tradeable")]
-        for opp in tradeable_longshots:
+        # Save all signals after admission metadata is attached
+        current_stage = "step 1c persist signals"
+        new_signal_ids = []
+        for opp in opportunities:
             try:
-                _db.save_longshot_signal(opp)
-            except Exception:
-                pass
-        if tradeable_longshots:
-            log.info("Step 4c: Longshot scan — %d tradeable (of %d) | top EV=%.2f%%",
-                     len(tradeable_longshots), len(longshot_opps),
-                     tradeable_longshots[0].get("ev_pct", 0))
-            journal({
-                "action": "longshot_scan",
-                "level": level,
-                "tradeable": len(tradeable_longshots),
-                "total": len(longshot_opps),
-                "top_ev_pct": tradeable_longshots[0].get("ev_pct", 0) if tradeable_longshots else 0,
-            })
-        else:
-            log.debug("Step 4c: Longshot scan — %d candidates, none tradeable", len(longshot_opps))
-    except Exception as e:
-        log.debug("Longshot scan step skipped: %s", e)
-
-    # Step 4d: Near-certainty scanner (85–99¢ YES markets with calibration edge)
-    try:
-        import near_certainty_scanner
-        nc_opps, nc_stats = near_certainty_scanner.scan(use_brain=False, verbose=False)
-        tradeable_nc = [o for o in nc_opps if o.get("tradeable")]
-        for opp in tradeable_nc:
-            try:
-                db.save_near_certainty_signal(opp)
-            except Exception:
-                pass
-        if tradeable_nc:
-            log.info("Step 4d: Near-certainty — %d tradeable (of %d) | top EV=%.2f%%",
-                     len(tradeable_nc), len(nc_opps),
-                     tradeable_nc[0].get("ev_pct", 0))
-            journal({
-                "action": "near_certainty_scan",
-                "level": level,
-                "tradeable": len(tradeable_nc),
-                "total": len(nc_opps),
-                "top_ev_pct": tradeable_nc[0].get("ev_pct", 0) if tradeable_nc else 0,
-            })
-        else:
-            log.debug("Step 4d: Near-certainty — %d candidates, none tradeable", len(nc_opps))
-    except Exception as e:
-        log.debug("Near-certainty scan step skipped: %s", e)
-
-    # Step 4e: Auto-mirror copy trader positions
-    try:
-        import copy_scanner
-        copy_trade_settings = db.get_copy_trade_settings()
-        max_copy_wallet_open = copy_trade_settings["per_wallet_cap"] if copy_trade_settings["cap_enabled"] else None
-        max_copy_total_open = copy_trade_settings["total_open_cap"] if copy_trade_settings["cap_enabled"] else None
-        copy_opened = 0
-        copy_closed = 0
-
-        # Build index of currently open copy trades: condition_id → trade
-        open_copy = {
-            t["copy_condition_id"]: t
-            for t in db.get_trades(status="open", limit=None)
-            if t.get("trade_type") == "copy" and t.get("copy_condition_id")
-        }
-        # Track which condition_ids are still held by watched wallets this cycle
-        live_condition_ids = set()
-
-        for address, label in {r["address"]: r["label"] for r in db.get_watched_wallets(active_only=True)}.items():
-            try:
-                positions = copy_scanner.get_positions(address)
+                sid = db.save_signal(opp)
+                opp["id"] = sid
+                new_signal_ids.append(sid)
             except Exception as e:
-                log.warning("Copy: failed to fetch positions for %s: %s", label, e)
-                continue
+                log.warning("Failed to save signal: %s", e)
 
-            # Forward-only: on first scan after adding a wallet, snapshot all
-            # existing positions as baseline and skip them. Only mirror NEW
-            # positions that appear in subsequent cycles.
-            baseline = db.get_wallet_baseline(address)
-            if baseline is None:
-                # First scan — record current positions as baseline, don't mirror
-                baseline_ids = [p.get("conditionId", "") for p in positions if p.get("conditionId")]
-                db.set_wallet_baseline(address, baseline_ids)
-                log.info("Step 4e: Baseline set for %s — %d existing positions (skipped)",
-                         label, len(baseline_ids))
-                # Still track live IDs for close detection on OTHER wallets
-                for pos in positions:
-                    cid = pos.get("conditionId", "")
-                    if cid:
-                        live_condition_ids.add(cid)
-                continue
+        tradeable = [o for o in opportunities if o.get("tradeable")]
+        log.info(
+            "Scan found %d signals, %d A+ tradeable, %d admitted for this level",
+            len(opportunities),
+            len(tradeable),
+            len(admitted_signals),
+        )
+        log.info(
+            "Cointegration A-trial status: enabled=%s paper_only=%s candidates=%d eligible=%d rejected=%d",
+            trial_settings["enabled"],
+            trial_settings["paper_only"],
+            a_trial_candidates,
+            a_trial_eligible,
+            a_trial_rejected,
+        )
 
-            for pos in positions:
-                cid = pos.get("conditionId", "")
-                if not cid:
-                    continue
-                live_condition_ids.add(cid)
-
-                # Skip positions that existed before we started watching
-                if cid in baseline:
-                    continue
-
-                # New position — not yet mirrored
-                if cid not in open_copy:
-                    decision = db.inspect_copy_trade_open(
-                        address,
-                        pos,
-                        size_usd=20,
-                        max_wallet_open=max_copy_wallet_open,
-                        max_total_open=max_copy_total_open,
-                    )
-                    if not decision["ok"]:
-                        journal({
-                            "action": "skip_trade",
-                            "level": level,
-                            "trade_type": "copy",
-                            "event": f"{label}: {pos.get('title','')[:50]}",
-                            "reason": decision["reason"],
-                        })
-                        log.info("Step 4e: Copy skip for %s — %s", label, decision["reason"])
-                        continue
-                    t_id = db.open_copy_trade(
-                        address,
-                        label,
-                        pos,
-                        size_usd=20,
-                        max_wallet_open=max_copy_wallet_open,
-                        max_total_open=max_copy_total_open,
-                    )
-                    if t_id:
-                        copy_opened += 1
-                        journal({
-                            "action": "trade_opened",
-                            "level": level,
-                            "mode": "paper",
-                            "trade_id": t_id,
-                            "trade_type": "copy",
-                            "event": f"{label}: {pos.get('title','')[:50]}",
-                            "size_usd": 20,
-                            "reason": f"Copy {label} — {pos.get('outcome','')} @{pos.get('curPrice',0):.3f}",
-                        })
-                        log.info("Step 4e: Mirrored %s — %s %s @%.3f",
-                                 label, pos.get("outcome"), pos.get("title","")[:40], pos.get("curPrice", 0))
-
-        # Watched wallet has exited a position — close our mirror
-        for cid, trade in open_copy.items():
-            if cid not in live_condition_ids:
-                # Use entry price as exit (neutral P&L) — market may have resolved
-                pnl = db.close_trade(trade["id"], exit_price_a=trade["entry_price_a"],
-                                     notes="auto-close: watched wallet exited position")
-                copy_closed += 1
-                journal({
-                    "action": "trade_closed",
-                    "trade_id": trade["id"],
-                    "trade_type": "copy",
-                    "pnl": pnl,
-                    "reason": f"Watched wallet {trade.get('copy_label','')} exited position",
-                })
-                log.info("Step 4e: Auto-closed copy trade %d (wallet exited) pnl=$%.2f",
-                         trade["id"], pnl or 0)
-
-        if copy_opened or copy_closed:
-            log.info("Step 4e: Copy trader — %d opened, %d closed", copy_opened, copy_closed)
-    except Exception as e:
-        log.debug("Copy trader step skipped: %s", e)
-
-    # Step 4f: Wallet discovery (every 6 hours)
-    try:
-        import wallet_discovery
-        last_discovery = state.get("last_discovery", 0)
-        if time.time() - last_discovery > 6 * 3600:
-            log.info("Step 4f: Running wallet discovery...")
-            result = wallet_discovery.run_discovery(auto_add=True, verbose=False)
-            state["last_discovery"] = time.time()
-            log.info("Step 4f: Discovery — %d candidates, %d auto-added",
-                     result.get("candidates_pending", 0), result.get("auto_added", 0))
-        else:
-            hrs = (time.time() - last_discovery) / 3600
-            log.info("Step 4f: Discovery skipped (ran %.1fh ago, next in %.1fh)",
-                     hrs, 6 - hrs)
-    except Exception as e:
-        log.debug("Wallet discovery step skipped: %s", e)
-
-    # Step 4g: Whale / insider detection
-    try:
-        import whale_detector
-        whale_alerts, whale_stats = whale_detector.scan(min_score=60, verbose=False)
-        new_whale_ids = []
-        for alert in whale_alerts:
-            try:
-                row_id = db.save_whale_alert(alert)
-                if row_id:
-                    new_whale_ids.append(row_id)
-            except Exception:
-                pass
-        if new_whale_ids:
-            log.info("Step 4g: Whale scan — %d alerts (%d new) from %d markets",
-                     len(whale_alerts), len(new_whale_ids), whale_stats["markets_checked"])
-            journal({
-                "action": "whale_scan",
-                "level": level,
-                "alerts": len(whale_alerts),
-                "new_saved": len(new_whale_ids),
-                "markets_checked": whale_stats["markets_checked"],
-            })
-        else:
-            log.debug("Step 4g: Whale scan — %d alerts, none new", len(whale_alerts))
-    except Exception as e:
-        log.debug("Whale scan step skipped: %s", e)
-
-    # Step 5: Check graduation eligibility
-    perf = get_performance(state)
-    can_graduate, report = check_graduation(state)
-    if can_graduate:
-        log.info("GRADUATION ELIGIBLE — %s can advance!", config["name"])
         journal({
-            "action": "graduation_eligible",
+            "action": "scan_complete",
             "level": level,
-            "performance": perf,
-            "report": report,
+            "total_signals": len(opportunities),
+            "tradeable": len(tradeable),
+            "admitted_signals": len(admitted_signals),
+            "a_trial_candidates": a_trial_candidates,
+            "a_trial_eligible": a_trial_eligible,
+            "a_trial_rejected": a_trial_rejected,
+            "a_trial_rejection_counts": rejection_counts,
+            "signal_ids": new_signal_ids,
         })
 
-    save_state(state)
-    log.info("=== Cycle complete: level=%s trades=%d open=%d pnl=$%.2f ===",
-             level, perf["total_trades"], open_count + traded, perf["total_pnl"])
-    return state
+        # Step 2: Monitor existing positions
+        current_stage = "step 2 refresh open trades"
+        log.info("Step 2: Monitoring open trades...")
+        try:
+            updates = tracker.refresh_open_trades()
+            if updates:
+                for u in updates:
+                    pnl_info = u.get("unrealized_pnl", {})
+                    if u.get("trade_type") == "weather":
+                        log.info("  Trade %d [weather]: price=%.4f pnl=$%.2f",
+                                 u["trade_id"], u.get("current_price_a", 0),
+                                 pnl_info.get("pnl_usd", 0))
+                    else:
+                        log.info("  Trade %d: z=%.2f pnl=$%.2f",
+                                 u["trade_id"], u.get("z_score", 0),
+                                 pnl_info.get("pnl_usd", 0))
+        except Exception as e:
+            log.warning("Trade monitoring failed during %s: %s", current_stage, e)
+
+        # Step 2b: Manage pending maker orders (check fills, cancel expired)
+        current_stage = "step 2b manage maker orders"
+        try:
+            order_result = execution.manage_open_orders()
+            if order_result["filled"] or order_result["cancelled"]:
+                log.info("Step 2b: maker orders — %d filled, %d cancelled",
+                         order_result["filled"], order_result["cancelled"])
+        except Exception as e:
+            log.warning("Maker order management failed during %s: %s", current_stage, e)
+
+        # Step 3: Auto-close reverted trades
+        current_stage = "step 3 auto-close"
+        log.info("Step 3: Checking for auto-closes...")
+        try:
+            closed = tracker.auto_close_trades(z_threshold=0.5)
+            for c in closed:
+                pnl = c["pnl_usd"]
+                state["trades_at_level"] += 1
+                state["pnl_at_level"] += pnl
+                if pnl > 0:
+                    state["wins_at_level"] += 1
+                else:
+                    state["losses_at_level"] += 1
+                state["returns_at_level"].append(pnl)
+
+                journal({
+                    "action": "trade_closed",
+                    "level": level,
+                    "trade_id": c["trade_id"],
+                    "trade_type": c.get("trade_type", "pairs"),
+                    "pnl_usd": pnl,
+                    "z_score_at_close": c.get("z_score", None),
+                    "reason": c.get("reason", "Auto-close"),
+                })
+
+                if c.get("trade_type") == "weather":
+                    log.info("  Closed weather trade %d: pnl=$%.2f (%s)",
+                             c["trade_id"], pnl, c.get("reason", ""))
+                else:
+                    log.info("  Closed trade %d: pnl=$%.2f (z=%.3f)",
+                             c["trade_id"], pnl, c.get("z_score", 0))
+        except Exception as e:
+            log.warning("Auto-close failed during %s: %s", current_stage, e)
+
+        # Step 4: Open new trades (if allowed at this level)
+        current_stage = "step 4 open pairs preflight"
+        if not config["can_trade"]:
+            log.info("Step 4: SCOUT mode — not trading")
+            journal({"action": "scout_only", "level": level,
+                     "reason": "Level does not permit trading"})
+            save_state(state)
+            return state
+
+        open_trades = db.get_trades(status="open", limit=None)
+        open_count = len(open_trades)
+        max_open = config["max_open"]
+
+        if max_open is not None and open_count >= max_open:
+            log.info("Step 4: At max positions (%d/%d), skipping new trades",
+                     open_count, max_open)
+            journal({"action": "skip_trade", "level": level,
+                     "reason": f"At max positions ({open_count}/{max_open})"})
+            save_state(state)
+            return state
+
+        # Determine trade size
+        if level == "book":
+            # Kelly-sized from bankroll
+            bankroll = config.get("bankroll", 1000)
+        else:
+            size_usd = config["size_usd"]
+
+        slots = (max_open - open_count) if max_open is not None else len(admitted_signals)
+        traded = 0
+
+        # Build dedup sets from currently open trades — keyed by signal_id and event name
+        open_signal_ids = {t.get("signal_id") for t in open_trades if t.get("signal_id")}
+        open_events = {t.get("event", "") for t in open_trades}
+        # Also track what we open within this cycle so we don't double-open
+        this_cycle_signal_ids = set()
+        this_cycle_events = set()
+
+        for opp in admitted_signals:
+            if traded >= slots:
+                break
+
+            event_name = opp.get("event", "")
+
+            # Get the signal ID for this opportunity
+            signal_id = opp.get("id")
+            if not signal_id:
+                for sid in new_signal_ids:
+                    for s in db.get_signals(limit=50):
+                        if s["id"] == sid and s["event"] == event_name:
+                            signal_id = sid
+                            opp["id"] = sid
+                            break
+                    if signal_id:
+                        break
+
+            if not signal_id:
+                log.warning("  Could not find signal ID for '%s'", event_name[:40])
+                continue
+
+            # Skip if same signal or same event already open (DB or this cycle)
+            if signal_id in open_signal_ids or signal_id in this_cycle_signal_ids:
+                log.info("  Skip: signal %d already has an open trade", signal_id)
+                journal({"action": "skip_trade", "level": level,
+                         "reason": f"Signal {signal_id} already open"})
+                continue
+
+            if event_name in open_events or event_name in this_cycle_events:
+                log.info("  Skip: already have position in '%s'", event_name[:40])
+                journal({"action": "skip_trade", "level": level,
+                         "reason": f"Already trading event: {event_name[:40]}"})
+                continue
+
+            # Determine size for this trade
+            if level == "book":
+                ev = opp.get("ev", {})
+                # correlated_legs=True: pairs trades expose both legs to the same event;
+                # Kelly assumes independent bets, so halve fraction to compensate.
+                sizing = math_engine.position_size(bankroll, ev, correlated_legs=True) if ev else None
+                trade_size = sizing["recommended_size"] if sizing else 50
+                trade_size = max(5, min(trade_size, bankroll * 0.25))
+            else:
+                trade_size = size_usd
+
+            if paper_mode and opp.get("admission_path") == "paper_a_trial":
+                trial_size = opp.get("trial_recommended_size_usd")
+                if trial_size:
+                    trade_size = min(trade_size, trial_size) if trade_size else trial_size
+
+            # Execute
+            mode = "paper" if level in ("paper", "scout") else "live"
+
+            # Step 4.5: Brain validation (if available)
+            # Ask Claude + Perplexity if this signal makes sense in the real world
+            try:
+                import brain
+                should_trade, brain_reasoning = brain.validate_signal(opp)
+                if not should_trade:
+                    log.info("  Brain REJECTED trade: %s", brain_reasoning)
+                    journal({
+                        "action": "brain_reject",
+                        "level": level,
+                        "event": event_name[:60],
+                        "reason": brain_reasoning,
+                    })
+                    continue
+                log.info("  Brain VALIDATED trade: %s", brain_reasoning)
+                opp["brain_reasoning"] = brain_reasoning
+            except Exception as e:
+                log.warning("  Brain validation failed (defaulting to math-only): %s", e)
+
+            log.info("  Opening %s trade: %s | $%.2f", mode, event_name[:40], trade_size)
+
+            try:
+                result = execution.execute_trade(opp, size_usd=trade_size, mode=mode)
+                if result["ok"]:
+                    traded += 1
+                    this_cycle_signal_ids.add(signal_id)
+                    this_cycle_events.add(event_name)
+                    journal({
+                        "action": "trade_opened",
+                        "level": level,
+                        "mode": mode,
+                        "trade_id": result.get("trade_id"),
+                        "signal_id": signal_id,
+                        "event": event_name[:60],
+                        "size_usd": trade_size,
+                        "z_score": opp.get("z_score", 0),
+                        "grade": opp.get("grade_label", "?"),
+                        "ev_pct": opp.get("ev", {}).get("ev_pct", 0),
+                        "admission_path": opp.get("admission_path"),
+                        "experiment_status": opp.get("experiment_status"),
+                        "reason": opp.get("experiment_reason") or f"Signal admitted, z={opp.get('z_score', 0):+.2f}",
+                    })
+                else:
+                    journal({
+                        "action": "trade_rejected",
+                        "level": level,
+                        "event": event_name[:60],
+                        "grade": opp.get("grade_label", "?"),
+                        "admission_path": opp.get("admission_path"),
+                        "reason": result.get("error", "unknown"),
+                    })
+            except Exception as e:
+                log.error("  Trade execution failed: %s", e)
+                journal({"action": "trade_error", "level": level,
+                         "event": event_name[:60], "reason": str(e)})
+
+        log.info("Step 4: Opened %d new trades", traded)
+
+        for code, count in sorted(rejection_counts.items(), key=lambda item: (-item[1], item[0])):
+            log.info("A-trial rejection summary: %s=%d", code, count)
+
+        # Step 4b: Open weather trades (if slots remain)
+        current_stage = "step 4b open weather preflight"
+        open_trades = db.get_trades(status="open", limit=None)
+        open_count = len(open_trades)
+        slots_remaining = (max_open - open_count) if max_open is not None else None
+
+        if slots_remaining is None or slots_remaining > 0:
+            try:
+                import weather_scanner
+                weather_opps, _ = weather_scanner.scan(min_edge=0.06, verbose=False)
+                tradeable_weather = [o for o in weather_opps if o.get("tradeable")]
+                weather_traded = 0
+                candidates = tradeable_weather if slots_remaining is None else tradeable_weather[:slots_remaining]
+                for w_opp in candidates:
+                    try:
+                        w_id = db.save_weather_signal(w_opp)
+                        trade_size = size_usd if level != "book" else 20
+                        decision = db.inspect_weather_trade_open(
+                            w_id,
+                            size_usd=trade_size,
+                            max_total_open=max_open,
+                        )
+                        if not decision["ok"]:
+                            journal({
+                                "action": "skip_trade",
+                                "level": level,
+                                "trade_type": "weather",
+                                "event": w_opp.get("event", w_opp.get("market", ""))[:60],
+                                "reason": decision["reason"],
+                            })
+                            continue
+                        t_id = db.open_weather_trade(w_id, size_usd=trade_size)
+                        if t_id:
+                            weather_traded += 1
+                            journal({
+                                "action": "trade_opened",
+                                "level": level,
+                                "mode": "paper",
+                                "trade_id": t_id,
+                                "signal_id": w_id,
+                                "trade_type": "weather",
+                                "event": w_opp.get("event", w_opp.get("market", ""))[:60],
+                                "size_usd": trade_size,
+                                "reason": f"Weather edge {w_opp.get('combined_edge_pct', 0):+.1f}%",
+                            })
+                    except Exception as e:
+                        log.warning("Weather trade open failed: %s", e)
+                if weather_traded:
+                    log.info("Step 4b: Opened %d weather trades", weather_traded)
+            except Exception as e:
+                log.debug("Weather scan skipped during %s: %s", current_stage, e)
+
+        # Step 4c: Longshot bias scanner (scan for NO maker opportunities on 3–15¢ markets)
+        current_stage = "step 4c longshot scan"
+        try:
+            import longshot_scanner
+            import db as _db
+            longshot_opps, ls_stats = longshot_scanner.scan(verbose=False)
+            tradeable_longshots = [o for o in longshot_opps if o.get("tradeable")]
+            for opp in tradeable_longshots:
+                try:
+                    _db.save_longshot_signal(opp)
+                except Exception:
+                    pass
+            if tradeable_longshots:
+                log.info("Step 4c: Longshot scan — %d tradeable (of %d) | top EV=%.2f%%",
+                         len(tradeable_longshots), len(longshot_opps),
+                         tradeable_longshots[0].get("ev_pct", 0))
+                journal({
+                    "action": "longshot_scan",
+                    "level": level,
+                    "tradeable": len(tradeable_longshots),
+                    "total": len(longshot_opps),
+                    "top_ev_pct": tradeable_longshots[0].get("ev_pct", 0) if tradeable_longshots else 0,
+                })
+            else:
+                log.debug("Step 4c: Longshot scan — %d candidates, none tradeable", len(longshot_opps))
+        except Exception as e:
+            log.debug("Longshot scan step skipped during %s: %s", current_stage, e)
+
+        # Step 4d: Near-certainty scanner (85–99¢ YES markets with calibration edge)
+        current_stage = "step 4d near-certainty scan"
+        try:
+            import near_certainty_scanner
+            nc_opps, nc_stats = near_certainty_scanner.scan(use_brain=False, verbose=False)
+            tradeable_nc = [o for o in nc_opps if o.get("tradeable")]
+            for opp in tradeable_nc:
+                try:
+                    db.save_near_certainty_signal(opp)
+                except Exception:
+                    pass
+            if tradeable_nc:
+                log.info("Step 4d: Near-certainty — %d tradeable (of %d) | top EV=%.2f%%",
+                         len(tradeable_nc), len(nc_opps),
+                         tradeable_nc[0].get("ev_pct", 0))
+                journal({
+                    "action": "near_certainty_scan",
+                    "level": level,
+                    "tradeable": len(tradeable_nc),
+                    "total": len(nc_opps),
+                    "top_ev_pct": tradeable_nc[0].get("ev_pct", 0) if tradeable_nc else 0,
+                })
+            else:
+                log.debug("Step 4d: Near-certainty — %d candidates, none tradeable", len(nc_opps))
+        except Exception as e:
+            log.debug("Near-certainty scan step skipped during %s: %s", current_stage, e)
+
+        # Step 4e: Auto-mirror copy trader positions
+        current_stage = "step 4e copy trader"
+        try:
+            import copy_scanner
+            copy_trade_settings = db.get_copy_trade_settings()
+            max_copy_wallet_open = copy_trade_settings["per_wallet_cap"] if copy_trade_settings["cap_enabled"] else None
+            max_copy_total_open = copy_trade_settings["total_open_cap"] if copy_trade_settings["cap_enabled"] else None
+            copy_opened = 0
+            copy_closed = 0
+
+            # Build index of currently open copy trades: condition_id → trade
+            open_copy = {
+                t["copy_condition_id"]: t
+                for t in db.get_trades(status="open", limit=None)
+                if t.get("trade_type") == "copy" and t.get("copy_condition_id")
+            }
+            # Track which condition_ids are still held by watched wallets this cycle
+            live_condition_ids = set()
+
+            for address, label in {r["address"]: r["label"] for r in db.get_watched_wallets(active_only=True)}.items():
+                try:
+                    positions = copy_scanner.get_positions(address)
+                except Exception as e:
+                    log.warning("Copy: failed to fetch positions for %s: %s", label, e)
+                    continue
+
+                # Forward-only: on first scan after adding a wallet, snapshot all
+                # existing positions as baseline and skip them. Only mirror NEW
+                # positions that appear in subsequent cycles.
+                baseline = db.get_wallet_baseline(address)
+                if baseline is None:
+                    # First scan — record current positions as baseline, don't mirror
+                    baseline_ids = [p.get("conditionId", "") for p in positions if p.get("conditionId")]
+                    db.set_wallet_baseline(address, baseline_ids)
+                    log.info("Step 4e: Baseline set for %s — %d existing positions (skipped)",
+                             label, len(baseline_ids))
+                    # Still track live IDs for close detection on OTHER wallets
+                    for pos in positions:
+                        cid = pos.get("conditionId", "")
+                        if cid:
+                            live_condition_ids.add(cid)
+                    continue
+
+                for pos in positions:
+                    cid = pos.get("conditionId", "")
+                    if not cid:
+                        continue
+                    live_condition_ids.add(cid)
+
+                    # Skip positions that existed before we started watching
+                    if cid in baseline:
+                        continue
+
+                    # New position — not yet mirrored
+                    if cid not in open_copy:
+                        decision = db.inspect_copy_trade_open(
+                            address,
+                            pos,
+                            size_usd=20,
+                            max_wallet_open=max_copy_wallet_open,
+                            max_total_open=max_copy_total_open,
+                        )
+                        if not decision["ok"]:
+                            journal({
+                                "action": "skip_trade",
+                                "level": level,
+                                "trade_type": "copy",
+                                "event": f"{label}: {pos.get('title','')[:50]}",
+                                "reason": decision["reason"],
+                            })
+                            log.info("Step 4e: Copy skip for %s — %s", label, decision["reason"])
+                            continue
+                        t_id = db.open_copy_trade(
+                            address,
+                            label,
+                            pos,
+                            size_usd=20,
+                            max_wallet_open=max_copy_wallet_open,
+                            max_total_open=max_copy_total_open,
+                        )
+                        if t_id:
+                            copy_opened += 1
+                            journal({
+                                "action": "trade_opened",
+                                "level": level,
+                                "mode": "paper",
+                                "trade_id": t_id,
+                                "trade_type": "copy",
+                                "event": f"{label}: {pos.get('title','')[:50]}",
+                                "size_usd": 20,
+                                "reason": f"Copy {label} — {pos.get('outcome','')} @{pos.get('curPrice',0):.3f}",
+                            })
+                            log.info("Step 4e: Mirrored %s — %s %s @%.3f",
+                                     label, pos.get("outcome"), pos.get("title","")[:40], pos.get("curPrice", 0))
+
+            # Watched wallet has exited a position — close our mirror
+            for cid, trade in open_copy.items():
+                if cid not in live_condition_ids:
+                    # Use entry price as exit (neutral P&L) — market may have resolved
+                    pnl = db.close_trade(trade["id"], exit_price_a=trade["entry_price_a"],
+                                         notes="auto-close: watched wallet exited position")
+                    copy_closed += 1
+                    journal({
+                        "action": "trade_closed",
+                        "trade_id": trade["id"],
+                        "trade_type": "copy",
+                        "pnl": pnl,
+                        "reason": f"Watched wallet {trade.get('copy_label','')} exited position",
+                    })
+                    log.info("Step 4e: Auto-closed copy trade %d (wallet exited) pnl=$%.2f",
+                             trade["id"], pnl or 0)
+
+            if copy_opened or copy_closed:
+                log.info("Step 4e: Copy trader — %d opened, %d closed", copy_opened, copy_closed)
+        except Exception as e:
+            log.debug("Copy trader step skipped during %s: %s", current_stage, e)
+
+        # Step 4f: Wallet discovery (every 6 hours)
+        current_stage = "step 4f wallet discovery"
+        try:
+            import wallet_discovery
+            last_discovery = state.get("last_discovery", 0)
+            if time.time() - last_discovery > 6 * 3600:
+                log.info("Step 4f: Running wallet discovery...")
+                result = wallet_discovery.run_discovery(auto_add=True, verbose=False)
+                state["last_discovery"] = time.time()
+                log.info("Step 4f: Discovery — %d candidates, %d auto-added",
+                         result.get("candidates_pending", 0), result.get("auto_added", 0))
+            else:
+                hrs = (time.time() - last_discovery) / 3600
+                log.info("Step 4f: Discovery skipped (ran %.1fh ago, next in %.1fh)",
+                         hrs, 6 - hrs)
+        except Exception as e:
+            log.debug("Wallet discovery step skipped during %s: %s", current_stage, e)
+
+        # Step 4g: Whale / insider detection
+        current_stage = "step 4g whale scan"
+        try:
+            import whale_detector
+            whale_alerts, whale_stats = whale_detector.scan(min_score=60, verbose=False)
+            new_whale_ids = []
+            for alert in whale_alerts:
+                try:
+                    row_id = db.save_whale_alert(alert)
+                    if row_id:
+                        new_whale_ids.append(row_id)
+                except Exception:
+                    pass
+            if new_whale_ids:
+                log.info("Step 4g: Whale scan — %d alerts (%d new) from %d markets",
+                         len(whale_alerts), len(new_whale_ids), whale_stats["markets_checked"])
+                journal({
+                    "action": "whale_scan",
+                    "level": level,
+                    "alerts": len(whale_alerts),
+                    "new_saved": len(new_whale_ids),
+                    "markets_checked": whale_stats["markets_checked"],
+                })
+            else:
+                log.debug("Step 4g: Whale scan — %d alerts, none new", len(whale_alerts))
+        except Exception as e:
+            log.debug("Whale scan step skipped during %s: %s", current_stage, e)
+
+        # Step 5: Check graduation eligibility
+        current_stage = "step 5 graduation and state save"
+        perf = get_performance(state)
+        can_graduate, report = check_graduation(state)
+        if can_graduate:
+            log.info("GRADUATION ELIGIBLE — %s can advance!", config["name"])
+            journal({
+                "action": "graduation_eligible",
+                "level": level,
+                "performance": perf,
+                "report": report,
+            })
+
+        save_state(state)
+        log.info("=== Cycle complete: level=%s trades=%d open=%d pnl=$%.2f ===",
+                 level, perf["total_trades"], open_count + traded, perf["total_pnl"])
+        return state
+    except Exception:
+        log.exception("Autonomy cycle failed during %s", current_stage)
+        raise
 
 
 # --- Status Report ---

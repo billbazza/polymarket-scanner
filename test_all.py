@@ -380,6 +380,125 @@ def test_copy_trader_unwatch_semantics():
 run("copy_trader_unwatch_semantics", test_copy_trader_unwatch_semantics)
 
 
+# ── 2e. Optional-limit DB getters ───────────────────────────────────────────
+
+section("2e. Optional-limit DB getters")
+
+def test_optional_limit_getters():
+    import db
+
+    signal = {
+        "event": "Optional Limit Signal",
+        "market_a": "Limit A",
+        "market_b": "Limit B",
+        "price_a": 0.41,
+        "price_b": 0.59,
+        "z_score": -1.7,
+        "coint_pvalue": 0.03,
+        "beta": 1.0,
+        "half_life": 6.0,
+        "spread_mean": 0.0,
+        "spread_std": 0.1,
+        "current_spread": -0.18,
+        "liquidity": 7000,
+        "volume_24h": 900,
+        "action": "BUY A / SELL B",
+        "token_id_a": "limit-a-token",
+        "token_id_b": "limit-b-token",
+    }
+    signal_id = db.save_signal(signal)
+    trade_id = db.open_trade(signal_id, size_usd=50)
+    db.save_snapshot(trade_id, 0.43, 0.57, -0.14, -1.4)
+    db.save_scan_run(3, 1, 1, 0.8)
+
+    longshot_id = db.save_longshot_signal({
+        "event": "Optional Limit Longshot",
+        "market": "Sell yes?",
+        "market_id": "limit-longshot",
+        "yes_token": "limit-longshot-yes",
+        "no_token": "limit-longshot-no",
+        "yes_price": 0.08,
+        "no_price": 0.92,
+        "calibrated_no_prob": 0.95,
+        "calibration_edge": 0.03,
+        "best_yes_bid": 0.07,
+        "best_yes_ask": 0.09,
+        "spread_pct": 25.0,
+        "limit_price": 0.09,
+        "no_cost": 0.91,
+        "ev_pct": 4.2,
+        "kelly_fraction": 0.05,
+        "fill_prob": 0.4,
+        "liquidity": 1500,
+        "tradeable": True,
+    })
+    near_certainty_id = db.save_near_certainty_signal({
+        "event": "Optional Limit Near Certainty",
+        "market": "Buy yes?",
+        "market_id": "limit-near-certainty",
+        "yes_token": "limit-near-yes",
+        "no_token": "limit-near-no",
+        "yes_price": 0.91,
+        "calibrated_yes": 0.95,
+        "calibration_edge": 0.04,
+        "ev_pct": 3.8,
+        "ev": 0.04,
+        "cost": 0.91,
+        "fee": 0.0,
+        "kelly_fraction": 0.03,
+        "liquidity": 2200,
+        "brain_prob": 0.95,
+        "brain_confirmed": True,
+        "tradeable": True,
+    })
+    whale_id = db.save_whale_alert({
+        "timestamp": time.time(),
+        "event": "Optional Limit Whale",
+        "market": "Whale market",
+        "market_id": "limit-whale",
+        "token_id": "limit-whale-token",
+        "current_price": 0.62,
+        "volume_24h": 25000,
+        "liquidity": 9000,
+        "volume_ratio": 3.2,
+        "biggest_order_usd": 1200,
+        "dominant_side": "BUY",
+        "suspicion_score": 77,
+        "analysis": "test alert",
+    })
+
+    check("get_signals(limit=None) returns seeded signal",
+          any(row["id"] == signal_id for row in db.get_signals(limit=None)))
+    check("get_trades(limit=None) returns seeded trade",
+          any(row["id"] == trade_id for row in db.get_trades(limit=None)))
+    check("get_snapshots(limit=None) returns seeded snapshot",
+          len(db.get_snapshots(trade_id, limit=None)) >= 1)
+    check("get_scan_runs(limit=None) returns seeded run",
+          len(db.get_scan_runs(limit=None)) >= 1)
+    check("get_weather_signals(limit=None) remains callable",
+          isinstance(db.get_weather_signals(limit=None), list))
+    check("get_locked_arb(limit=None) remains callable",
+          isinstance(db.get_locked_arb(limit=None), list))
+    check("get_longshot_signals(limit=None) returns seeded row",
+          any(row["id"] == longshot_id for row in db.get_longshot_signals(limit=None)))
+    check("get_near_certainty_signals(limit=None) returns seeded row",
+          any(row["id"] == near_certainty_id for row in db.get_near_certainty_signals(limit=None)))
+    check("get_whale_alerts(limit=None) returns seeded row",
+          any(row["id"] == whale_id for row in db.get_whale_alerts(limit=None)))
+    check("get_latest_copy_trades(limit=None) remains callable",
+          isinstance(db.get_latest_copy_trades(limit=None), list))
+
+    try:
+        db.get_scan_runs(limit="bad-limit")
+    except ValueError as exc:
+        check("invalid limit fails with contextual ValueError",
+              "get_scan_runs" in str(exc), detail=str(exc))
+    else:
+        check("invalid limit fails with contextual ValueError", False)
+
+run("optional_limit_getters", test_optional_limit_getters)
+
+
 # ── 3. Math Engine ──────────────────────────────────────────────────────────
 
 section("3. Math engine — EV, Kelly, slippage")

@@ -1214,7 +1214,7 @@ def _run_autonomy_background():
         }
         log.info("Autonomy cycle complete in %.1fs", duration)
     except Exception as e:
-        log.error("Autonomy cycle failed: %s", e)
+        log.exception("Autonomy cycle failed in background thread: %s", e)
         _autonomy_status["last_result"] = {"ok": False, "error": str(e)}
     finally:
         _autonomy_status["running"] = False
