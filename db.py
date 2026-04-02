@@ -125,7 +125,8 @@ def _migration_001_base_schema(conn):
             experiment_status TEXT,
             experiment_reason_code TEXT,
             experiment_reason TEXT,
-            experiment_guardrails_json TEXT
+            experiment_guardrails_json TEXT,
+            admission_json TEXT
         );
 
         CREATE TABLE IF NOT EXISTS trades (
@@ -410,6 +411,7 @@ def _migration_002_backfill_columns(conn):
         ("experiment_reason_code", "TEXT"),
         ("experiment_reason", "TEXT"),
         ("experiment_guardrails_json", "TEXT"),
+        ("admission_json", "TEXT"),
     ]:
         _add_column_if_missing(conn, "signals", col, coltype)
     for col, coltype in [
@@ -813,6 +815,10 @@ def _migration_013_paper_sizing_decisions(conn):
     """)
 
 
+def _migration_014_signal_admission_diagnostics(conn):
+    _add_column_if_missing(conn, "signals", "admission_json", "TEXT")
+
+
 _MIGRATIONS = [
     ("001_base_schema", _migration_001_base_schema),
     ("002_backfill_columns", _migration_002_backfill_columns),
@@ -827,6 +833,7 @@ _MIGRATIONS = [
     ("011_trade_monitor_events", _migration_011_trade_monitor_events),
     ("012_trade_state_modes", _migration_012_trade_state_modes),
     ("013_paper_sizing_decisions", _migration_013_paper_sizing_decisions),
+    ("014_signal_admission_diagnostics", _migration_014_signal_admission_diagnostics),
 ]
 
 
@@ -844,6 +851,72 @@ def _repair_schema_gaps(conn):
     work without manual SQLite intervention.
     """
     _ensure_columns_if_table_exists(conn, "watched_wallets", _WATCHED_WALLET_MONITOR_COLUMNS)
+    _ensure_columns_if_table_exists(conn, "signals", [("admission_json", "TEXT")])
+
+
+def _deserialize_signal_row(row):
+    d = dict(row)
+    if d.get("ev_json"):
+        d["ev"] = json.loads(d["ev_json"])
+    else:
+        d["ev"] = None
+    if d.get("sizing_json"):
+        d["sizing"] = json.loads(d["sizing_json"])
+    else:
+        d["sizing"] = None
+    if d.get("filters_json"):
+        d["filters"] = json.loads(d["filters_json"])
+    else:
+        d["filters"] = None
+    if d.get("experiment_guardrails_json"):
+        d["experiment_guardrails"] = json.loads(d["experiment_guardrails_json"])
+    else:
+        d["experiment_guardrails"] = None
+    if d.get("admission_json"):
+        d["admission"] = json.loads(d["admission_json"])
+    else:
+        d["admission"] = None
+    del d["ev_json"]
+    del d["sizing_json"]
+    del d["filters_json"]
+    del d["experiment_guardrails_json"]
+    del d["admission_json"]
+    return _attach_signal_observability(d)
+
+
+def _attach_signal_observability(signal):
+    admission = signal.get("admission") or {}
+    filters = signal.get("filters") or {}
+    failed_filters = admission.get("failed_filters")
+    if failed_filters is None:
+        failed_filters = [name for name, passed in filters.items() if not passed]
+    signal["failed_filters"] = failed_filters
+    signal["accepted_signal"] = bool(admission.get("accepted", signal.get("tradeable")))
+    signal["monitorable_signal"] = bool(
+        admission.get("monitorable_signal")
+        or signal.get("paper_tradeable")
+        or signal.get("tradeable")
+    )
+    signal["admission_status"] = (
+        admission.get("status")
+        or ("tradeable" if signal.get("tradeable") else "monitor" if signal["monitorable_signal"] else "rejected")
+    )
+    signal["admission_reason_code"] = (
+        signal.get("experiment_reason_code")
+        or admission.get("primary_reason_code")
+        or ("accepted" if signal["accepted_signal"] else "rejected")
+    )
+    signal["admission_reason"] = (
+        signal.get("experiment_reason")
+        or admission.get("primary_reason")
+        or ("All admission filters passed." if signal["accepted_signal"] else "Signal rejected by admission filters.")
+    )
+    signal["admission_summary"] = (
+        signal["admission_reason"]
+        if not failed_filters
+        else f"{signal['admission_reason']} Failed: {', '.join(failed_filters)}."
+    )
+    return signal
 
 
 def init_db():
@@ -895,8 +968,8 @@ def save_signal(opp):
             grade_label, tradeable, paper_tradeable, ev_json, sizing_json, filters_json,
             token_id_a, token_id_b, admission_path, experiment_name,
             experiment_status, experiment_reason_code, experiment_reason,
-            experiment_guardrails_json)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            experiment_guardrails_json, admission_json)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (
         time.time(), opp["event"], opp["market_a"], opp["market_b"],
         opp["price_a"], opp["price_b"], opp["z_score"], opp["coint_pvalue"],
@@ -912,6 +985,7 @@ def save_signal(opp):
         opp.get("experiment_status"), opp.get("experiment_reason_code"),
         opp.get("experiment_reason"),
         json.dumps(opp.get("experiment_guardrails")) if opp.get("experiment_guardrails") else None,
+        json.dumps(opp.get("admission")) if opp.get("admission") else None,
     ))
     signal_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
     conn.commit()
@@ -926,18 +1000,10 @@ def get_signal_by_id(signal_id):
     conn.close()
     if not row:
         return None
-    d = dict(row)
-    d["ev"]     = json.loads(d.pop("ev_json"))     if d.get("ev_json")     else None
-    d["sizing"] = json.loads(d.pop("sizing_json")) if d.get("sizing_json") else None
-    d["filters"] = json.loads(d.pop("filters_json")) if d.get("filters_json") else None
-    d["experiment_guardrails"] = (
-        json.loads(d.pop("experiment_guardrails_json"))
-        if d.get("experiment_guardrails_json") else None
-    )
-    return d
+    return _deserialize_signal_row(row)
 
 
-def get_signals(limit=50, status=None):
+def get_signals(limit=50, status=None, include_rejected=True):
     limit = _normalize_query_limit(limit, "get_signals")
     conn = get_conn()
     if status and limit is None:
@@ -961,28 +1027,9 @@ def get_signals(limit=50, status=None):
     conn.close()
     results = []
     for r in rows:
-        d = dict(r)
-        # Deserialize JSON fields
-        if d.get("ev_json"):
-            d["ev"] = json.loads(d["ev_json"])
-        else:
-            d["ev"] = None
-        if d.get("sizing_json"):
-            d["sizing"] = json.loads(d["sizing_json"])
-        else:
-            d["sizing"] = None
-        if d.get("filters_json"):
-            d["filters"] = json.loads(d["filters_json"])
-        else:
-            d["filters"] = None
-        if d.get("experiment_guardrails_json"):
-            d["experiment_guardrails"] = json.loads(d["experiment_guardrails_json"])
-        else:
-            d["experiment_guardrails"] = None
-        del d["ev_json"]
-        del d["sizing_json"]
-        del d["filters_json"]
-        del d["experiment_guardrails_json"]
+        d = _deserialize_signal_row(r)
+        if not include_rejected and not d.get("monitorable_signal"):
+            continue
         results.append(d)
     return results
 

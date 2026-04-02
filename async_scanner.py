@@ -115,6 +115,12 @@ async def scan(z_threshold=1.5, p_threshold=0.10, min_liquidity=5000,
     opportunities = []
     pairs_tested = 0
     pairs_cointegrated = 0
+    raw_diverged_pairs = 0
+    admission_counts = {}
+    skipped_counts = {}
+
+    def bump(counter, key):
+        counter[key] = counter.get(key, 0) + 1
 
     for event in events:
         markets = event["markets"]
@@ -139,6 +145,23 @@ async def scan(z_threshold=1.5, p_threshold=0.10, min_liquidity=5000,
                 if days_a < MIN_DAYS_TO_RESOLUTION or days_b < MIN_DAYS_TO_RESOLUTION:
                     log.debug("Skip near-expiry pair: %s (%.0fd) / %s (%.0fd)",
                               m_a["question"][:30], days_a, m_b["question"][:30], days_b)
+                    bump(skipped_counts, "near_expiry")
+                    continue
+
+                price_a = float(m_a.get("yes_price") or 0)
+                price_b = float(m_b.get("yes_price") or 0)
+                if not (
+                    math_engine.MIN_PRICE_BOUND <= price_a <= math_engine.MAX_PRICE_BOUND
+                    and math_engine.MIN_PRICE_BOUND <= price_b <= math_engine.MAX_PRICE_BOUND
+                ):
+                    log.debug(
+                        "Skip non-operable price band pair: %s @ %.2f / %s @ %.2f",
+                        m_a["question"][:30],
+                        price_a,
+                        m_b["question"][:30],
+                        price_b,
+                    )
+                    bump(skipped_counts, "price_outside_operating_band")
                     continue
 
                 hist_a = histories.get(m_a["yes_token"], [])
@@ -155,6 +178,7 @@ async def scan(z_threshold=1.5, p_threshold=0.10, min_liquidity=5000,
                     pairs_cointegrated += 1
 
                     if abs(result["z_score"]) >= z_threshold:
+                        raw_diverged_pairs += 1
                         if result["z_score"] > 0:
                             action = f"SELL {m_a['question'][:40]} / BUY {m_b['question'][:40]}"
                         else:
@@ -175,7 +199,12 @@ async def scan(z_threshold=1.5, p_threshold=0.10, min_liquidity=5000,
                         }
 
                         try:
-                            scored = math_engine.score_opportunity(opp)
+                            scored = math_engine.score_opportunity(
+                                opp,
+                                correlated_legs=True,
+                                min_z_abs=z_threshold,
+                                max_coint_pvalue=p_threshold,
+                            )
                             opp.update({
                                 "ev": scored["ev"],
                                 "sizing": scored["sizing"],
@@ -183,11 +212,38 @@ async def scan(z_threshold=1.5, p_threshold=0.10, min_liquidity=5000,
                                 "grade": scored["grade"],
                                 "grade_label": scored["grade_label"],
                                 "tradeable": scored["tradeable"],
+                                "admission": scored.get("admission"),
                             })
                         except Exception as e:
                             log.warning("Scoring failed: %s", e)
-                            opp.update({"grade_label": "?", "tradeable": False})
+                            opp.update({
+                                "grade_label": "?",
+                                "tradeable": False,
+                                "admission": {
+                                    "status": "error",
+                                    "accepted": False,
+                                    "monitorable_signal": False,
+                                    "ev_only_near_miss": False,
+                                    "primary_reason_code": "scoring_failed",
+                                    "primary_reason": f"Scoring failed: {e}",
+                                    "failed_filters": [],
+                                    "failed_filter_count": 0,
+                                    "primary_failed_filter": None,
+                                    "thresholds": {
+                                        "min_z_abs": z_threshold,
+                                        "max_coint_pvalue": p_threshold,
+                                    },
+                                    "observed": {},
+                                },
+                            })
 
+                        admission = opp.get("admission") or {}
+                        if admission.get("accepted"):
+                            bump(admission_counts, "accepted")
+                        elif admission.get("monitorable_signal"):
+                            bump(admission_counts, admission.get("primary_reason_code") or "monitor")
+                        else:
+                            bump(admission_counts, admission.get("primary_reason_code") or "rejected")
                         opportunities.append(opp)
 
                         if verbose:
@@ -202,12 +258,19 @@ async def scan(z_threshold=1.5, p_threshold=0.10, min_liquidity=5000,
 
     log.info("Async scan: %d tested, %d cointegrated, %d diverged (fetch=%.1fs)",
              pairs_tested, pairs_cointegrated, len(opportunities), fetch_time)
+    if admission_counts:
+        log.info("Async cointegration admission summary: %s", admission_counts)
+    if skipped_counts:
+        log.info("Async cointegration skip summary: %s", skipped_counts)
 
     if include_stats:
         return {
             "opportunities": opportunities,
             "pairs_tested": pairs_tested,
             "pairs_cointegrated": pairs_cointegrated,
+            "raw_diverged_pairs": raw_diverged_pairs,
+            "admission_counts": admission_counts,
+            "skip_counts": skipped_counts,
         }
 
     return opportunities

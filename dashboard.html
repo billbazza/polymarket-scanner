@@ -1165,8 +1165,8 @@ async function loadSignals() {
       : signals;
     getEl('cntSignals').textContent = filtered.length;
     getEl('signalsInfo').textContent = hideSports
-      ? `${filtered.length} signals shown · ${signals.length - filtered.length} sports rows hidden`
-      : `${signals.length} recent cointegration signals`;
+      ? `${filtered.length} operator-meaningful signals shown · ${signals.length - filtered.length} sports rows hidden`
+      : `${signals.length} recent operator-meaningful cointegration signals`;
     const body = getEl('signalsBody');
     if (!filtered.length) {
       const msg = signals.length
@@ -1180,6 +1180,19 @@ async function loadSignals() {
       const gc = gl.startsWith('A') ? 'grade-a' : gl==='B' ? 'grade-b' : gl==='C' ? 'grade-c' : gl==='D' ? 'grade-d' : 'grade-f';
       const evPct     = s.ev     && s.ev.ev_pct     != null ? s.ev.ev_pct.toFixed(1) + '%' : '-';
       const kellySize = s.sizing && s.sizing.recommended_size != null ? fmtUsd(s.sizing.recommended_size) : '-';
+      const statusLabel = s.tradeable
+        ? 'tradeable'
+        : s.paper_tradeable
+          ? 'paper'
+          : s.monitorable_signal
+            ? 'monitor'
+            : 'rejected';
+      const statusTitle = esc(s.admission_summary || s.admission_reason || '');
+      const blocker = !s.tradeable && (s.admission_reason || s.experiment_reason);
+      const actionCell = s.status==='new'
+        ? `<button class="btn sm" onclick="paperTrade(${s.id})">Trade</button>
+           <button class="btn sm" onclick="brainValidate(${s.id})" title="Ask AI">Brain</button>`
+        : '';
       return `<tr>
         <td>${fmt(s.timestamp)}</td>
         <td class="event-name" title="${esc(s.event)}">${esc(s.event)}</td>
@@ -1191,11 +1204,10 @@ async function loadSignals() {
         <td>${evPct}</td>
         <td>${kellySize}</td>
         <td>${fmtUsd(s.liquidity)}</td>
-        <td><span class="badge ${s.status}">${s.status}</span></td>
-        <td class="actions-col">${s.status==='new'
-          ? `<button class="btn sm" onclick="paperTrade(${s.id})">Trade</button>
-             <button class="btn sm" onclick="brainValidate(${s.id})" title="Ask AI">Brain</button>`
-          : ''}</td>
+        <td><span class="badge ${s.status}" title="${statusTitle}">${statusLabel}</span></td>
+        <td class="actions-col">${actionCell || (blocker
+          ? `<span style="color:var(--amber);font-size:11px" title="${statusTitle}">${esc(blocker)}</span>`
+          : '')}</td>
       </tr>`;
     }).join('');
   } catch(e) { console.error('Signals error:', e); }

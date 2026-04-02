@@ -431,6 +431,9 @@ def _save_pairs_scan_run(scan_result, duration):
         "signals": opportunities,
         "pairs_tested": scan_result["pairs_tested"],
         "cointegrated": scan_result["pairs_cointegrated"],
+        "raw_diverged_pairs": scan_result.get("raw_diverged_pairs", len(opportunities)),
+        "admission_counts": scan_result.get("admission_counts", {}),
+        "skip_counts": scan_result.get("skip_counts", {}),
     }
 
 
@@ -703,8 +706,8 @@ async def complete_report_item(item_id: int):
 # --- Signals ---
 
 @app.get("/api/signals")
-async def list_signals(limit: int = 50, status: str = None):
-    return db.get_signals(limit=limit, status=status)
+async def list_signals(limit: int = 50, status: str = None, include_rejected: bool = False):
+    return db.get_signals(limit=limit, status=status, include_rejected=include_rejected)
 
 
 @app.get("/api/signals/{signal_id}")

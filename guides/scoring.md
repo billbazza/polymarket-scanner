@@ -2,26 +2,29 @@
 
 ## How Scoring Works
 
-Every opportunity from the scanner runs through `math_engine.score_opportunity()` which applies 5 binary filters:
+Every opportunity from the scanner runs through `math_engine.score_opportunity()` which applies 8 binary filters:
 
 | Filter | Pass Condition | What It Checks |
 |--------|---------------|----------------|
-| `ev_pass` | EV% >= 5.0 | Expected value as % of trade size |
+| `ev_pass` | EV% >= hurdle | Expected value as % of trade size (category-adjusted when category is present) |
 | `kelly_pass` | Kelly fraction > 0 | Positive edge exists |
-| `z_pass` | \|z-score\| >= 1.5 | Spread is significantly diverged |
-| `coint_pass` | p-value < 0.10 | Pair is genuinely cointegrated |
+| `z_pass` | \|z-score\| >= active scan threshold | Spread is significantly diverged |
+| `coint_pass` | p-value < active scan threshold | Pair is genuinely cointegrated |
 | `hl_pass` | half-life < 20 | Spread reverts fast enough to profit |
+| `momentum_pass` | spread is retreating | Latest spread move is reverting, not still widening |
+| `price_pass` | both prices in 5%-95% band | Avoid near-resolution or non-operable pairs |
+| `spread_std_pass` | spread std >= 0.02 | Spread moves enough to overcome fees |
 
 ## Grades
 
-- **A+** = 5/5 filters pass, `tradeable = True`
-- **A** = 4/5
-- **B** = 3/5
-- **C** = 2/5
-- **D** = 1/5
-- **F** = 0/5
+- **A+** = 8/8 filters pass, `tradeable = True`
+- **A** = 7/8
+- **B** = 6/8
+- **C** = 5/8
+- **D** = 4/8
+- **F** = 0/8
 
-Only A+ signals have `tradeable = True`. All others are informational.
+Only A+ signals have `tradeable = True`. A-grade rows can still be operator-meaningful when the only miss is `ev_pass`; those are the paper-trial near misses. Lower-quality rows are rejected with structured blocker metadata.
 
 ## EV Calculation
 
@@ -46,7 +49,13 @@ Capped at 0.25 (quarter-Kelly)
 
 Change defaults in `math_engine.score_opportunity()`:
 - `bankroll` (default 1000) — your paper trading bankroll
-- `min_ev_pct` (default 5.0) — minimum edge to pass EV filter
+- `min_ev_pct` (default 2.0) — minimum edge to pass EV filter before any category adjustment
 - `max_slippage_pct` (default 2.0) — maximum acceptable slippage
 
-Or pass them via the scan CLI: `python3 scan.py --z-threshold 2.0 --strict`
+Scanner runtime thresholds matter too:
+- `min_z_abs` is taken from the active scan `z_threshold`
+- `max_coint_pvalue` is taken from the active scan `p_threshold`
+
+Rejection observability:
+- `score_opportunity()` now returns an `admission` dict with failed filters, primary blocker code, human-readable reason, thresholds, and observed values.
+- `/api/signals` defaults to operator-meaningful rows; pass `include_rejected=true` to inspect the lower-quality rejected set.

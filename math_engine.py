@@ -20,6 +20,11 @@ MAKER_FEE_PCT  = 0.00   # maker orders: no fee
 # spread_std is in price units (0-1). 0.02 = a 2-cent swing per std — the
 # minimum for a z=2 signal to generate meaningful dollar EV.
 MIN_SPREAD_STD = 0.02
+MIN_PRICE_BOUND = 0.05
+MAX_PRICE_BOUND = 0.95
+DEFAULT_MIN_Z_ABS = 1.5
+DEFAULT_MAX_COINT_PVALUE = 0.10
+DEFAULT_MAX_HALF_LIFE = 20.0
 
 # ── Category maker-edge table ───────────────────────────────────────────────
 # Empirical maker edge (%) by market category from research/ideas01.md.
@@ -39,6 +44,36 @@ CATEGORY_MAKER_EDGE = {
 }
 # Default hurdle when category is unknown
 DEFAULT_MIN_EV_PCT = 2.0
+
+FILTER_ORDER = (
+    "ev_pass",
+    "kelly_pass",
+    "z_pass",
+    "coint_pass",
+    "hl_pass",
+    "momentum_pass",
+    "price_pass",
+    "spread_std_pass",
+)
+PRIMARY_REJECTION_PRIORITY = (
+    "price_pass",
+    "spread_std_pass",
+    "coint_pass",
+    "z_pass",
+    "hl_pass",
+    "momentum_pass",
+    "ev_pass",
+    "kelly_pass",
+)
+MONITORABLE_FILTERS = (
+    "kelly_pass",
+    "z_pass",
+    "coint_pass",
+    "hl_pass",
+    "momentum_pass",
+    "price_pass",
+    "spread_std_pass",
+)
 
 
 def expected_value(win_prob, win_payout, loss_amount):
@@ -258,9 +293,150 @@ def category_ev_hurdle(category: str, base_min_ev_pct: float = DEFAULT_MIN_EV_PC
     return max(0.5, round(adjusted, 2))
 
 
+def summarize_filters(filters: dict | None) -> dict:
+    """Summarize pass/fail state for downstream admission decisions."""
+    filters = filters or {}
+    failed = [name for name in FILTER_ORDER if name in filters and not filters[name]]
+    failed.extend(
+        name for name, passed in filters.items()
+        if name not in FILTER_ORDER and not passed
+    )
+    failed_set = set(failed)
+    monitorable = all(filters.get(name, False) for name in MONITORABLE_FILTERS)
+    ev_only = failed == ["ev_pass"]
+    return {
+        "failed_filters": failed,
+        "failed_filter_count": len(failed),
+        "monitorable_signal": monitorable,
+        "ev_only_near_miss": monitorable and ev_only,
+        "all_pass": not failed,
+        "primary_failed_filter": next(
+            (name for name in PRIMARY_REJECTION_PRIORITY if name in failed_set),
+            failed[0] if failed else None,
+        ),
+    }
+
+
+def build_admission_diagnostics(
+    opp: dict,
+    filters: dict,
+    *,
+    effective_min_ev_pct: float,
+    min_z_abs: float,
+    max_coint_pvalue: float,
+    max_half_life: float,
+    min_spread_std: float,
+    min_price: float,
+    max_price: float,
+) -> dict:
+    """Return structured operator-facing admission diagnostics."""
+    summary = summarize_filters(filters)
+    primary = summary["primary_failed_filter"]
+    z_abs = abs(float(opp.get("z_score") or 0.0))
+    coint_pvalue = float(opp.get("coint_pvalue") or 0.0)
+    half_life = float(opp.get("half_life") or 0.0)
+    spread_std = float(opp.get("spread_std") or 0.0)
+    price_a = float(opp.get("price_a") or 0.0)
+    price_b = float(opp.get("price_b") or 0.0)
+
+    thresholds = {
+        "min_ev_pct": round(float(effective_min_ev_pct), 4),
+        "min_z_abs": round(float(min_z_abs), 4),
+        "max_coint_pvalue": round(float(max_coint_pvalue), 4),
+        "max_half_life": round(float(max_half_life), 4),
+        "min_spread_std": round(float(min_spread_std), 4),
+        "min_price": round(float(min_price), 4),
+        "max_price": round(float(max_price), 4),
+    }
+
+    observed = {
+        "ev_pct": round(float((opp.get("ev") or {}).get("ev_pct") or 0.0), 4),
+        "kelly_fraction": round(float((opp.get("sizing") or {}).get("kelly_fraction") or 0.0), 4),
+        "z_abs": round(z_abs, 4),
+        "coint_pvalue": round(coint_pvalue, 6),
+        "half_life": round(half_life, 4),
+        "spread_std": round(spread_std, 6),
+        "price_a": round(price_a, 4),
+        "price_b": round(price_b, 4),
+        "spread_retreating": bool(opp.get("spread_retreating", True)),
+    }
+
+    if not primary:
+        status = "tradeable" if summary["all_pass"] else "accepted"
+        reason_code = "accepted"
+        reason = "All admission filters passed."
+    elif primary == "ev_pass":
+        status = "monitor"
+        reason_code = "ev_below_hurdle"
+        reason = (
+            f"EV {observed['ev_pct']:.2f}% is below the hurdle "
+            f"{thresholds['min_ev_pct']:.2f}%."
+        )
+    elif primary == "kelly_pass":
+        status = "rejected"
+        reason_code = "kelly_non_positive"
+        reason = "Kelly fraction is non-positive."
+    elif primary == "z_pass":
+        status = "rejected"
+        reason_code = "z_below_threshold"
+        reason = f"|z| {z_abs:.2f} is below the scan threshold {min_z_abs:.2f}."
+    elif primary == "coint_pass":
+        status = "rejected"
+        reason_code = "cointegration_too_weak"
+        reason = (
+            f"Cointegration p-value {coint_pvalue:.4f} exceeds the scan cap "
+            f"{max_coint_pvalue:.4f}."
+        )
+    elif primary == "hl_pass":
+        status = "rejected"
+        reason_code = "half_life_too_slow"
+        reason = (
+            f"Half-life {half_life:.1f} exceeds the admissible cap "
+            f"{max_half_life:.1f}."
+        )
+    elif primary == "momentum_pass":
+        status = "rejected"
+        reason_code = "spread_still_widening"
+        reason = "Spread is still widening instead of retreating toward mean."
+    elif primary == "price_pass":
+        status = "rejected"
+        reason_code = "price_outside_operating_band"
+        reason = (
+            f"Prices {price_a:.2f}/{price_b:.2f} sit outside the operating band "
+            f"{min_price:.2f}-{max_price:.2f}."
+        )
+    elif primary == "spread_std_pass":
+        status = "rejected"
+        reason_code = "spread_too_tight"
+        reason = (
+            f"Spread std {spread_std:.4f} is below the minimum {min_spread_std:.4f}."
+        )
+    else:
+        status = "rejected"
+        reason_code = "filter_failed"
+        reason = f"Filter {primary} failed."
+
+    return {
+        "status": status,
+        "accepted": summary["all_pass"],
+        "monitorable_signal": summary["monitorable_signal"],
+        "ev_only_near_miss": summary["ev_only_near_miss"],
+        "primary_reason_code": reason_code,
+        "primary_reason": reason,
+        "failed_filters": summary["failed_filters"],
+        "failed_filter_count": summary["failed_filter_count"],
+        "primary_failed_filter": primary,
+        "thresholds": thresholds,
+        "observed": observed,
+    }
+
+
 def score_opportunity(opp, bankroll=1000, min_ev_pct=DEFAULT_MIN_EV_PCT,
                       max_slippage_pct=2.0, fee_pct=TAKER_FEE_PCT,
-                      min_spread_std=MIN_SPREAD_STD, correlated_legs=False):
+                      min_spread_std=MIN_SPREAD_STD, correlated_legs=False,
+                      min_z_abs=DEFAULT_MIN_Z_ABS,
+                      max_coint_pvalue=DEFAULT_MAX_COINT_PVALUE,
+                      max_half_life=DEFAULT_MAX_HALF_LIFE):
     """Score a signal through all Tier 1 filters.
 
     min_ev_pct is NET of fees (2% default). Pass fee_pct=MAKER_FEE_PCT
@@ -293,20 +469,33 @@ def score_opportunity(opp, bankroll=1000, min_ev_pct=DEFAULT_MIN_EV_PCT,
     # Price filter: reject if either market is near resolution (outside 5%–95%)
     price_a = float(opp.get("price_a") or 0)
     price_b = float(opp.get("price_b") or 0)
-    price_ok = (0.05 <= price_a <= 0.95) and (0.05 <= price_b <= 0.95)
+    price_ok = (MIN_PRICE_BOUND <= price_a <= MAX_PRICE_BOUND) and (MIN_PRICE_BOUND <= price_b <= MAX_PRICE_BOUND)
 
     # Filters
     filters = {
         "ev_pass":        bool(ev["ev_pct"] >= effective_min_ev_pct),
         "kelly_pass":     bool(sizing["kelly_fraction"] > 0),
-        "z_pass":         bool(abs(opp["z_score"]) >= 1.5),
-        "coint_pass":     bool(opp["coint_pvalue"] < 0.10),
-        "hl_pass":        bool(opp["half_life"] < 20),
+        "z_pass":         bool(abs(opp["z_score"]) >= min_z_abs),
+        "coint_pass":     bool(opp["coint_pvalue"] < max_coint_pvalue),
+        "hl_pass":        bool(opp["half_life"] < max_half_life),
         "momentum_pass":  bool(opp.get("spread_retreating", True)),
         "price_pass":     bool(price_ok),
         # Spread must have enough volatility to pay off after fees
         "spread_std_pass": bool(spread_std >= min_spread_std),
     }
+    opp["ev"] = ev
+    opp["sizing"] = sizing
+    admission = build_admission_diagnostics(
+        opp,
+        filters,
+        effective_min_ev_pct=effective_min_ev_pct,
+        min_z_abs=min_z_abs,
+        max_coint_pvalue=max_coint_pvalue,
+        max_half_life=max_half_life,
+        min_spread_std=min_spread_std,
+        min_price=MIN_PRICE_BOUND,
+        max_price=MAX_PRICE_BOUND,
+    )
 
     grade = sum(filters.values())
     all_pass = all(filters.values())
@@ -315,9 +504,10 @@ def score_opportunity(opp, bankroll=1000, min_ev_pct=DEFAULT_MIN_EV_PCT,
     label = ["F", "D", "C", "B", "A", "A", "A", "A", "A+"][min(grade, 8)]
     log.info(
         "Scored: %s | grade=%s ev=%.2f%%(net) hurdle=%.1f%% category=%s "
-        "spread_std=%.4f z=%.2f tradeable=%s",
+        "spread_std=%.4f z=%.2f tradeable=%s blocker=%s",
         opp.get("event", "?")[:40], label, ev["ev_pct"], effective_min_ev_pct,
         category or "unknown", spread_std, opp["z_score"], all_pass,
+        admission["primary_reason_code"],
     )
 
     return {
@@ -331,4 +521,5 @@ def score_opportunity(opp, bankroll=1000, min_ev_pct=DEFAULT_MIN_EV_PCT,
         "fee_pct": fee_pct,
         "category": category,
         "effective_min_ev_pct": effective_min_ev_pct,
+        "admission": admission,
     }
