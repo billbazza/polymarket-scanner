@@ -2399,6 +2399,37 @@ def inspect_weather_trade_open(weather_signal_id, size_usd=100, max_total_open=N
                 "entry_token": entry_token,
                 **_paper_position_policy_dict(),
             }
+        closed_token_trade = None
+        if entry_token:
+            closed_token_trade = conn.execute(
+                """
+                SELECT id, weather_signal_id, closed_at, exit_reason
+                FROM trades
+                WHERE trade_type='weather' AND token_id_a=? AND status='closed'
+                ORDER BY closed_at DESC, id DESC
+                LIMIT 1
+                """,
+                (entry_token,),
+            ).fetchone()
+        if closed_token_trade:
+            trade_id = int(closed_token_trade["id"])
+            other_signal_id = closed_token_trade["weather_signal_id"]
+            detail = f" via signal {other_signal_id}" if other_signal_id else ""
+            latest_reason = closed_token_trade["exit_reason"] or "Weather contract already completed."
+            return {
+                "ok": False,
+                "reason_code": "token_already_closed",
+                "reason": (
+                    f"Weather contract already completed as trade #{trade_id}{detail}; "
+                    "do not reopen the same token after exit."
+                ),
+                "existing_trade_id": trade_id,
+                "existing_signal_id": other_signal_id,
+                "latest_trade_status": "closed",
+                "latest_trade_exit_reason": latest_reason,
+                "entry_token": entry_token,
+                **_paper_position_policy_dict(),
+            }
 
         if max_total_open is not None and count_open_trades() >= max_total_open:
             return {

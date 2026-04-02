@@ -9,7 +9,7 @@ import api
 import db
 
 log = logging.getLogger("scanner.tracker")
-WEATHER_STOP_LOSS_PCT = 0.20
+WEATHER_STOP_LOSS_PCT = 0.15
 _WARN_TTL_SECS = 6 * 60 * 60
 _LAST_WARNINGS = {}
 
