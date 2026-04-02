@@ -211,6 +211,107 @@ def execute_trade(signal, size_usd, mode=None):
     return result
 
 
+def execute_weather_trade(signal, size_usd, mode=None):
+    """Execute a paper-first weather trade from a saved weather signal."""
+    mode = mode or _get_mode()
+    signal = dict(signal or {})
+    weather_signal_id = signal.get("id") or signal.get("weather_signal_id")
+    if not weather_signal_id:
+        return {
+            "ok": False,
+            "mode": mode,
+            "reason_code": "signal_not_found",
+            "error": "Weather signal missing id.",
+        }
+
+    if not signal.get("id"):
+        signal = db.get_weather_signal_by_id(weather_signal_id) or {}
+    strategy_name = (
+        signal.get("strategy_name")
+        or signal.get("market_family")
+        or "weather"
+    )
+    log.info(
+        "Executing weather trade: signal=%s strategy=%s size=$%.2f mode=%s",
+        weather_signal_id,
+        strategy_name,
+        size_usd,
+        mode,
+    )
+
+    if mode != "paper":
+        log.warning(
+            "Weather live execution blocked for signal %s strategy=%s",
+            weather_signal_id,
+            strategy_name,
+        )
+        return {
+            "ok": False,
+            "mode": mode,
+            "reason_code": "paper_only_mode",
+            "error": "Weather execution is paper-only unless live rollout is explicitly approved.",
+            "strategy_name": strategy_name,
+            "weather_signal_id": weather_signal_id,
+        }
+
+    bal = check_balance("paper")
+    if not bal["ok"]:
+        return {
+            "ok": False,
+            "mode": "paper",
+            "reason_code": "balance_check_failed",
+            "error": f"Balance check failed: {bal.get('error')}",
+            "weather_signal_id": weather_signal_id,
+        }
+    if bal["balance_usd"] < size_usd:
+        return {
+            "ok": False,
+            "mode": "paper",
+            "reason_code": "insufficient_cash",
+            "error": f"Insufficient balance: ${bal['balance_usd']:.2f} < ${size_usd:.2f}",
+            "paper_account": bal.get("paper_account"),
+            "weather_signal_id": weather_signal_id,
+        }
+
+    decision = db.inspect_weather_trade_open(weather_signal_id, size_usd=size_usd)
+    if not decision["ok"]:
+        return {
+            "ok": False,
+            "mode": "paper",
+            "reason_code": decision.get("reason_code"),
+            "error": decision.get("reason"),
+            "decision": decision,
+            "weather_signal_id": weather_signal_id,
+            "strategy_name": strategy_name,
+        }
+
+    trade_id = db.open_weather_trade(weather_signal_id, size_usd=size_usd)
+    if not trade_id:
+        return {
+            "ok": False,
+            "mode": "paper",
+            "reason_code": "open_failed",
+            "error": "Weather trade could not be opened after preflight passed.",
+            "weather_signal_id": weather_signal_id,
+            "strategy_name": strategy_name,
+        }
+
+    account = db.get_paper_account_state(refresh_unrealized=False)
+    return {
+        "ok": True,
+        "mode": "paper",
+        "trade_id": trade_id,
+        "weather_signal_id": weather_signal_id,
+        "signal_id": weather_signal_id,
+        "strategy_name": strategy_name,
+        "entry_price": decision.get("entry_price"),
+        "action": decision.get("action"),
+        "trade_state_mode": db.TRADE_STATE_PAPER,
+        "reconciliation_mode": db.RECONCILIATION_INTERNAL,
+        "paper_account": account,
+    }
+
+
 def _execute_paper(signal, size_usd, price_a, price_b,
                    side_a="BUY", side_b="SELL", exec_mode="maker"):
     """Simulate order fill.

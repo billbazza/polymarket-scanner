@@ -780,9 +780,10 @@ async def run_weather_scan(
     min_liquidity: float = 200,
     correction_mode: str = "shadow",
     intraday_observations_json: str | None = None,
+    include_exact_temp: bool = False,
 ):
     """Queue the weather scan and return a persisted job id."""
-    import weather_scanner
+    import weather_strategy
 
     if correction_mode not in {"shadow", "blend", "corrected"}:
         raise HTTPException(400, "correction_mode must be one of: shadow, blend, corrected")
@@ -798,6 +799,7 @@ async def run_weather_scan(
         "min_edge": min_edge,
         "min_liquidity": min_liquidity,
         "correction_mode": correction_mode,
+        "include_exact_temp": include_exact_temp,
     }
     log.info(
         "Queued weather scan job: %s observations=%d",
@@ -807,7 +809,7 @@ async def run_weather_scan(
 
     def work():
         t0 = time.time()
-        opportunities, meta = weather_scanner.scan(
+        opportunities, meta = weather_strategy.scan_weather_opportunities(
             verbose=False,
             intraday_observations=intraday_observations,
             **params,
@@ -827,6 +829,8 @@ async def run_weather_scan(
             "duration_secs": round(time.time() - t0, 1),
             "markets_checked": meta.get("markets_checked", 0),
             "weather_found": meta.get("weather_found", 0),
+            "exact_temp_enabled": meta.get("exact_temp_enabled", False),
+            "exact_temp_opportunities": meta.get("exact_temp_opportunities", 0),
             "results": opportunities,
         }
 
@@ -1253,14 +1257,16 @@ async def close_trade(trade_id: int, exit_price_a: float, exit_price_b: float = 
 @app.post("/api/weather/{signal_id}/trade")
 async def open_weather_trade(signal_id: int, size_usd: float = 20):
     """Open a paper trade from a weather signal."""
-    decision = db.inspect_weather_trade_open(signal_id, size_usd=size_usd)
-    if not decision["ok"]:
+    signal = db.get_weather_signal_by_id(signal_id)
+    result = execution.execute_weather_trade(signal or {"id": signal_id}, size_usd=size_usd, mode="paper")
+    if not result["ok"]:
+        decision = result.get("decision") or db.inspect_weather_trade_open(signal_id, size_usd=size_usd)
         _safe_record_paper_trade_attempt(
             source="manual_api",
             strategy="weather",
             outcome="blocked",
-            reason_code=decision["reason_code"],
-            reason=decision["reason"],
+            reason_code=result.get("reason_code") or decision["reason_code"],
+            reason=result.get("error") or decision["reason"],
             event=((decision.get("signal") or {}).get("event")),
             weather_signal_id=signal_id,
             token_id=decision.get("entry_token"),
@@ -1274,9 +1280,9 @@ async def open_weather_trade(signal_id: int, size_usd: float = 20):
             status_code=status_code,
             content={
                 "ok": False,
-                "error": decision["reason"],
-                "reason": decision["reason"],
-                "reason_code": decision["reason_code"],
+                "error": result.get("error") or decision["reason"],
+                "reason": result.get("error") or decision["reason"],
+                "reason_code": result.get("reason_code") or decision["reason_code"],
                 "paper_account": decision.get("account"),
                 "policy": {
                     "position_policy": decision.get("position_policy"),
@@ -1285,44 +1291,26 @@ async def open_weather_trade(signal_id: int, size_usd: float = 20):
                 },
             },
         )
-    trade_id = db.open_weather_trade(signal_id, size_usd=size_usd)
-    if not trade_id:
-        _safe_record_paper_trade_attempt(
-            source="manual_api",
-            strategy="weather",
-            outcome="error",
-            reason_code="open_failed",
-            reason="Weather trade could not be opened after preflight passed.",
-            event=((decision.get("signal") or {}).get("event")),
-            weather_signal_id=signal_id,
-            token_id=decision.get("entry_token"),
-            size_usd=size_usd,
-            details={"path": "/api/weather/{signal_id}/trade"},
-        )
-        return JSONResponse(
-            status_code=409,
-            content={"ok": False, "error": "Weather trade could not be opened.", "reason_code": "open_failed"},
-        )
     _safe_record_paper_trade_attempt(
         source="manual_api",
         strategy="weather",
         outcome="allowed",
         reason_code="opened",
         reason="Paper weather trade opened.",
-        event=((decision.get("signal") or {}).get("event")),
+        event=((signal or {}).get("event")),
         weather_signal_id=signal_id,
-        trade_id=trade_id,
-        token_id=decision.get("entry_token"),
+        trade_id=result["trade_id"],
+        token_id=((signal or {}).get("yes_token")),
         size_usd=size_usd,
         details={"path": "/api/weather/{signal_id}/trade"},
     )
     return {
         "ok": True,
-        "trade_id": trade_id,
+        "trade_id": result["trade_id"],
         "signal_id": signal_id,
         "status": "open",
-        "trade_state_mode": db.TRADE_STATE_PAPER,
-        "reconciliation_mode": db.RECONCILIATION_INTERNAL,
+        "trade_state_mode": result["trade_state_mode"],
+        "reconciliation_mode": result["reconciliation_mode"],
         "paper_account": db.get_paper_account_state(refresh_unrealized=True),
     }
 

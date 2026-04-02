@@ -801,9 +801,22 @@ def run_cycle(state):
 
         if slots_remaining is None or slots_remaining > 0:
             try:
-                import weather_scanner
-                weather_opps, _ = weather_scanner.scan(min_edge=0.06, verbose=False)
+                import weather_exact_temp_scanner
+                import weather_strategy
+
+                include_exact_temp = weather_exact_temp_scanner.exact_temp_enabled()
+                exact_temp_autotrade = weather_exact_temp_scanner.exact_temp_autotrade_enabled()
+                weather_opps, _ = weather_strategy.scan_weather_opportunities(
+                    min_edge=0.06,
+                    verbose=False,
+                    include_exact_temp=include_exact_temp,
+                )
                 tradeable_weather = [o for o in weather_opps if o.get("tradeable")]
+                if include_exact_temp and not exact_temp_autotrade:
+                    tradeable_weather = [
+                        o for o in tradeable_weather
+                        if (o.get("strategy_name") or o.get("market_family")) != "weather_exact_temp"
+                    ]
                 weather_traded = 0
                 candidates = tradeable_weather if slots_remaining is None else tradeable_weather[:slots_remaining]
                 for w_opp in candidates:
@@ -848,8 +861,12 @@ def run_cycle(state):
                                 "reason": decision["reason"],
                             })
                             continue
-                        t_id = db.open_weather_trade(w_id, size_usd=trade_size)
-                        if t_id:
+                        result = execution.execute_weather_trade(
+                            {"id": w_id, **w_opp},
+                            size_usd=trade_size,
+                            mode="paper",
+                        )
+                        if result.get("ok"):
                             record_attempt(
                                 level,
                                 "weather",
@@ -858,7 +875,7 @@ def run_cycle(state):
                                 "Paper weather trade opened.",
                                 event=w_opp.get("event", w_opp.get("market", "")),
                                 weather_signal_id=w_id,
-                                trade_id=t_id,
+                                trade_id=result["trade_id"],
                                 token_id=decision.get("entry_token"),
                                 size_usd=trade_size,
                                 phase=current_stage,
@@ -869,7 +886,7 @@ def run_cycle(state):
                                 "action": "trade_opened",
                                 "level": level,
                                 "mode": "paper",
-                                "trade_id": t_id,
+                                "trade_id": result["trade_id"],
                                 "signal_id": w_id,
                                 "trade_type": "weather",
                                 "event": w_opp.get("event", w_opp.get("market", ""))[:60],
@@ -878,6 +895,20 @@ def run_cycle(state):
                                 "paper_confidence_size_usd": sizing_decision.get("confidence_size_usd"),
                                 "reason": f"Weather edge {w_opp.get('combined_edge_pct', 0):+.1f}%",
                             })
+                        else:
+                            record_attempt(
+                                level,
+                                "weather",
+                                "error",
+                                result.get("reason_code", "trade_open_failed"),
+                                result.get("error", "Weather trade open failed."),
+                                event=w_opp.get("event", w_opp.get("market", "")),
+                                weather_signal_id=w_id,
+                                token_id=decision.get("entry_token"),
+                                size_usd=trade_size,
+                                phase=current_stage,
+                                details={"paper_sizing": sizing_decision},
+                            )
                     except Exception as e:
                         log.warning("Weather trade open failed: %s", e)
                         record_attempt(

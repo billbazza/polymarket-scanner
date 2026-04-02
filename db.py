@@ -199,6 +199,8 @@ def _migration_001_base_schema(conn):
             timestamp REAL NOT NULL,
             event TEXT NOT NULL,
             market TEXT NOT NULL,
+            strategy_name TEXT,
+            market_family TEXT,
             market_id TEXT,
             yes_token TEXT,
             no_token TEXT,
@@ -208,6 +210,13 @@ def _migration_001_base_schema(conn):
             target_date TEXT,
             threshold_f REAL,
             direction TEXT,
+            resolution_source TEXT,
+            station_id TEXT,
+            station_label TEXT,
+            settlement_unit TEXT,
+            settlement_precision REAL,
+            station_timezone TEXT,
+            outcome_label TEXT,
             market_price REAL,
             noaa_forecast_f REAL,
             noaa_prob REAL,
@@ -222,6 +231,7 @@ def _migration_001_base_schema(conn):
             selected_edge_pct REAL,
             correction_mode TEXT,
             correction_json TEXT,
+            source_meta_json TEXT,
             sources_agree INTEGER DEFAULT 0,
             sources_available INTEGER DEFAULT 0,
             hours_ahead INTEGER,
@@ -835,6 +845,22 @@ def _migration_015_weather_intraday_correction(conn):
         _add_column_if_missing(conn, "weather_signals", col, coltype)
 
 
+def _migration_016_weather_exact_temp_metadata(conn):
+    for col, coltype in [
+        ("strategy_name", "TEXT"),
+        ("market_family", "TEXT"),
+        ("resolution_source", "TEXT"),
+        ("station_id", "TEXT"),
+        ("station_label", "TEXT"),
+        ("settlement_unit", "TEXT"),
+        ("settlement_precision", "REAL"),
+        ("station_timezone", "TEXT"),
+        ("outcome_label", "TEXT"),
+        ("source_meta_json", "TEXT"),
+    ]:
+        _add_column_if_missing(conn, "weather_signals", col, coltype)
+
+
 _MIGRATIONS = [
     ("001_base_schema", _migration_001_base_schema),
     ("002_backfill_columns", _migration_002_backfill_columns),
@@ -851,6 +877,7 @@ _MIGRATIONS = [
     ("013_paper_sizing_decisions", _migration_013_paper_sizing_decisions),
     ("014_signal_admission_diagnostics", _migration_014_signal_admission_diagnostics),
     ("015_weather_intraday_correction", _migration_015_weather_intraday_correction),
+    ("016_weather_exact_temp_metadata", _migration_016_weather_exact_temp_metadata),
 ]
 
 
@@ -870,11 +897,21 @@ def _repair_schema_gaps(conn):
     _ensure_columns_if_table_exists(conn, "watched_wallets", _WATCHED_WALLET_MONITOR_COLUMNS)
     _ensure_columns_if_table_exists(conn, "signals", [("admission_json", "TEXT")])
     _ensure_columns_if_table_exists(conn, "weather_signals", [
+        ("strategy_name", "TEXT"),
+        ("market_family", "TEXT"),
+        ("resolution_source", "TEXT"),
+        ("station_id", "TEXT"),
+        ("station_label", "TEXT"),
+        ("settlement_unit", "TEXT"),
+        ("settlement_precision", "REAL"),
+        ("station_timezone", "TEXT"),
+        ("outcome_label", "TEXT"),
         ("selected_prob", "REAL"),
         ("selected_edge", "REAL"),
         ("selected_edge_pct", "REAL"),
         ("correction_mode", "TEXT"),
         ("correction_json", "TEXT"),
+        ("source_meta_json", "TEXT"),
     ])
 
 
@@ -888,6 +925,14 @@ def _deserialize_weather_signal_row(row):
     else:
         item["correction"] = None
     item.pop("correction_json", None)
+    if item.get("source_meta_json"):
+        try:
+            item["source_meta"] = json.loads(item["source_meta_json"])
+        except json.JSONDecodeError:
+            item["source_meta"] = None
+    else:
+        item["source_meta"] = None
+    item.pop("source_meta_json", None)
     return item
 
 
@@ -3016,15 +3061,21 @@ def open_weather_trade(weather_signal_id, size_usd=100):
     action = decision["action"]
     token = decision["entry_token"]
     entry_price = decision["entry_price"]
+    strategy_name = (
+        decision["signal"].get("strategy_name")
+        or decision["signal"].get("market_family")
+        or "weather"
+    )
 
     conn.execute("""
         INSERT INTO trades (signal_id, weather_signal_id, trade_type, opened_at,
             side_a, side_b, entry_price_a, entry_price_b,
             token_id_a, size_usd, status, strategy_name, event, market_a,
             trade_state_mode, reconciliation_mode)
-        VALUES (NULL, ?, 'weather', ?, ?, '', ?, 0, ?, ?, 'open', 'weather', ?, ?, ?, ?)
+        VALUES (NULL, ?, 'weather', ?, ?, '', ?, 0, ?, ?, 'open', ?, ?, ?, ?, ?)
     """, (
         weather_signal_id, time.time(), action, entry_price, token, size_usd,
+        strategy_name,
         decision["signal"].get("event"),
         decision["signal"].get("market"),
         TRADE_STATE_PAPER,
@@ -3268,21 +3319,34 @@ def save_weather_signal(opp):
     conn = get_conn()
     conn.execute("""
         INSERT INTO weather_signals (
-            timestamp, event, market, market_id, yes_token, no_token,
+            timestamp, event, market, strategy_name, market_family, market_id, yes_token, no_token,
             city, lat, lon, target_date, threshold_f, direction,
+            resolution_source, station_id, station_label, settlement_unit,
+            settlement_precision, station_timezone, outcome_label,
             market_price,
             noaa_forecast_f, noaa_prob, noaa_sigma_f,
             om_forecast_f, om_prob,
             combined_prob, combined_edge, combined_edge_pct,
             selected_prob, selected_edge, selected_edge_pct, correction_mode, correction_json,
+            source_meta_json,
             sources_agree, sources_available,
             hours_ahead, ev_pct, kelly_fraction, action, tradeable, liquidity
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (
-        time.time(), opp["event"], opp["market"], opp.get("market_id"),
+        time.time(), opp["event"], opp["market"],
+        opp.get("strategy_name") or opp.get("market_family") or "weather_threshold",
+        opp.get("market_family") or "weather_threshold",
+        opp.get("market_id"),
         opp.get("yes_token"), opp.get("no_token"),
         opp["city"], opp["lat"], opp["lon"],
         opp["target_date"], opp["threshold_f"], opp["direction"],
+        opp.get("resolution_source"),
+        opp.get("station_id"),
+        opp.get("station_label"),
+        opp.get("settlement_unit"),
+        opp.get("settlement_precision"),
+        opp.get("station_timezone"),
+        opp.get("outcome_label"),
         opp["market_price"],
         opp.get("noaa_forecast_f"), opp.get("noaa_prob"), opp.get("noaa_sigma_f"),
         opp.get("om_forecast_f"), opp.get("om_prob"),
@@ -3292,6 +3356,7 @@ def save_weather_signal(opp):
         opp.get("selected_edge_pct", opp.get("combined_edge_pct")),
         opp.get("correction_mode"),
         json.dumps(opp.get("correction")) if opp.get("correction") else None,
+        json.dumps(opp.get("source_meta")) if opp.get("source_meta") else None,
         1 if opp.get("sources_agree") else 0,
         opp.get("sources_available", 0),
         opp.get("hours_ahead"), opp.get("ev_pct"), opp.get("kelly_fraction"),
