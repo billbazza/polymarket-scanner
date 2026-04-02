@@ -161,6 +161,7 @@ class StrategyPerformanceTests(unittest.TestCase):
         self.assertEqual(summary["starting_bankroll"], 500.0)
         self.assertEqual(summary["total_committed_capital"], 100.0)
         self.assertAlmostEqual(summary["total_realized_pnl"], pnls["coin_pnl"] + pnls["copy_pnl"], places=2)
+        self.assertFalse(summary["data_quality"]["has_gaps"])
 
         coin = strategies["cointegration"]
         self.assertEqual(coin["closed_trades"], 1)
@@ -173,6 +174,7 @@ class StrategyPerformanceTests(unittest.TestCase):
 
         weather = strategies["weather"]
         self.assertEqual(weather["open_trades"], 1)
+        self.assertEqual(weather["paper_open_trades"], 1)
         self.assertEqual(weather["closed_trades"], 0)
         self.assertAlmostEqual(weather["unrealized_pnl"], 13.66, places=2)
         self.assertEqual(weather["committed_capital"], 40.0)
@@ -180,6 +182,7 @@ class StrategyPerformanceTests(unittest.TestCase):
 
         whale = strategies["whale"]
         self.assertEqual(whale["open_trades"], 1)
+        self.assertEqual(whale["paper_open_trades"], 1)
         self.assertAlmostEqual(whale["unrealized_pnl"], -7.5, places=2)
         self.assertEqual(whale["committed_capital"], 60.0)
         self.assertEqual(whale["bankroll_utilization_pct"], 12.0)
@@ -191,6 +194,48 @@ class StrategyPerformanceTests(unittest.TestCase):
         self.assertAlmostEqual(copy["realized_pnl"], pnls["copy_pnl"], places=2)
         self.assertEqual(copy["win_rate"], 0.0)
         self.assertEqual(copy["committed_capital"], 0.0)
+
+    def test_paper_account_excludes_wallet_attached_copy_from_utilization_but_keeps_strategy_visibility(self):
+        self.db.set_paper_starting_bankroll(500)
+
+        weather_signal_id = self.db.save_weather_signal(_weather_opp())
+        weather_trade_id = self.db.open_weather_trade(weather_signal_id, size_usd=40)
+        self.assertIsNotNone(weather_trade_id)
+        self.db.save_snapshot(weather_trade_id, 0.55, None, None, None)
+
+        copy_trade_id = self.db.open_copy_trade(
+            "0xabc1230000000000000000000000000000000001",
+            "Wallet Alpha",
+            {
+                "conditionId": "cond-open-copy",
+                "outcome": "YES",
+                "title": "Shared market",
+                "curPrice": 0.61,
+                "asset": "copy-asset-open",
+            },
+            size_usd=50,
+        )
+        self.assertIsNotNone(copy_trade_id)
+        self.db.save_snapshot(copy_trade_id, 0.66, None, None, None)
+
+        account = self.db.get_paper_account_state(refresh_unrealized=False)
+        self.assertEqual(account["committed_capital"], 40.0)
+        self.assertEqual(account["open_trades"], 1)
+        self.assertEqual(account["excluded_open_trades"], 1)
+        self.assertAlmostEqual(account["excluded_unrealized_pnl"], 4.1, places=2)
+
+        summary = self.db.get_strategy_performance(refresh_unrealized=False)
+        self.assertTrue(summary["data_quality"]["has_gaps"])
+        self.assertEqual(summary["data_quality"]["external_open_trades_excluded_from_paper_utilization"], 1)
+
+        strategies = {row["strategy"]: row for row in summary["strategies"]}
+        copy = strategies["copy"]
+        self.assertEqual(copy["open_trades"], 1)
+        self.assertEqual(copy["paper_open_trades"], 0)
+        self.assertEqual(copy["external_open_trades"], 1)
+        self.assertEqual(copy["wallet_open_trades"], 1)
+        self.assertEqual(copy["committed_capital"], 0.0)
+        self.assertAlmostEqual(copy["unrealized_pnl"], 4.1, places=2)
 
     def test_stats_api_exposes_strategy_breakdown_for_dashboard(self):
         signal_id = self.db.save_signal(_base_signal())
@@ -207,6 +252,7 @@ class StrategyPerformanceTests(unittest.TestCase):
         strategies = {row["strategy"]: row for row in body["strategy_breakdown"]["strategies"]}
         self.assertIn("cointegration", strategies)
         self.assertEqual(strategies["cointegration"]["closed_trades"], 1)
+        self.assertEqual(body["paper_account"]["reporting_scope"], "paper_research_only")
 
         paper_account_response = self.client.get("/api/paper-account")
         self.assertEqual(paper_account_response.status_code, 200)

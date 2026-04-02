@@ -465,11 +465,11 @@
         <table>
           <thead>
             <tr>
-              <th>Strategy</th><th>Realized</th><th>Open MTM</th><th>Win Rate</th><th>Trades</th><th>Capital In Use</th>
+              <th>Strategy</th><th>Realized</th><th>Open MTM</th><th>Net</th><th>Trades / State</th><th>Paper Capital In Use</th><th>Coverage</th>
             </tr>
           </thead>
           <tbody id="strategyBreakdownBody">
-            <tr><td colspan="6" class="empty"><div class="icon">◻</div>Loading strategy contribution metrics…</td></tr>
+            <tr><td colspan="7" class="empty"><div class="icon">◻</div>Loading strategy contribution metrics…</td></tr>
           </tbody>
         </table>
       </div>
@@ -956,14 +956,21 @@ async function loadStats() {
     document.getElementById('statUnrealizedMeta').textContent = `Current mark-to-market on open trades.`;
     document.getElementById('statLossesUsd').textContent = fmtUsd(account.cumulative_losses);
     document.getElementById('statUtilization').textContent = (account.bankroll_used_pct || 0).toFixed(1) + '%';
-    document.getElementById('statUtilizationMeta').textContent = `${fmtUsd(account.committed_capital || 0)} of ${fmtUsd(account.starting_bankroll || 0)} bankroll currently committed.`;
+    document.getElementById('statUtilizationMeta').textContent =
+      `${fmtUsd(account.committed_capital || 0)} of ${fmtUsd(account.starting_bankroll || 0)} paper bankroll currently committed.` +
+      ((account.excluded_open_trades || 0)
+        ? ` ${account.excluded_open_trades} wallet/live trade${(account.excluded_open_trades || 0) === 1 ? '' : 's'} excluded from utilization.`
+        : '');
     document.getElementById('accountSummaryText').textContent =
       `Equity ${fmtUsd(account.total_equity)} = cash ${fmtUsd(account.available_cash)} + marked open positions ${fmtUsd(account.open_position_value)}.`;
     document.getElementById('accountExplainer').innerHTML =
       `<strong>Accounting rule:</strong> ${esc(account.cash_after_open_explanation || 'Opening a paper trade deducts its size from available cash immediately.')} ` +
       `${esc(account.position_policy_detail || 'Paper trading is uncapped by position count and limited by available cash.')} ` +
       `Available cash is computed as starting bankroll ${fmtUsd(account.starting_bankroll)} + realized P&amp;L ${fmtUsd(account.realized_pnl)} - committed capital ${fmtUsd(account.committed_capital)}. ` +
-      `Marked open-position value is committed capital ${fmtUsd(account.committed_capital)} + unrealized P&amp;L ${fmtUsd(account.unrealized_pnl)}.`;
+      `Marked open-position value is committed capital ${fmtUsd(account.committed_capital)} + unrealized P&amp;L ${fmtUsd(account.unrealized_pnl)}. ` +
+      ((account.excluded_open_trades || 0)
+        ? `Wallet-attached/live trades are tracked separately and do not consume this paper bankroll view.`
+        : '');
 
     document.getElementById('statWinRate').textContent = s.win_rate + '%';
     document.getElementById('statOpen').textContent = s.open_trades;
@@ -975,25 +982,34 @@ async function loadStats() {
     const body = document.getElementById('strategyBreakdownBody');
     const meta = document.getElementById('strategyBreakdownMeta');
     if (!strategies.length) {
-      body.innerHTML = '<tr><td colspan="6" class="empty"><div class="icon">◻</div>No strategy-level trade history yet.</td></tr>';
+      body.innerHTML = '<tr><td colspan="7" class="empty"><div class="icon">◻</div>No strategy-level trade history yet.</td></tr>';
       meta.textContent = 'No strategy contribution data recorded yet.';
     } else {
-      const topRealized = [...strategies].sort((a, b) => (b.realized_pnl || 0) - (a.realized_pnl || 0))[0];
+      const topNet = [...strategies].sort((a, b) => (b.net_pnl || 0) - (a.net_pnl || 0))[0];
       const topUtil = [...strategies].sort((a, b) => (b.committed_capital || 0) - (a.committed_capital || 0))[0];
-      meta.textContent = `Top realized: ${topRealized?.label || '—'} ${fmtUsd(topRealized?.realized_pnl || 0)}. Most capital in use: ${topUtil?.label || '—'} ${fmtUsd(topUtil?.committed_capital || 0)}.`;
+      const dq = strategyBreakdown.data_quality || {};
+      meta.textContent =
+        `Top net contributor: ${topNet?.label || '—'} ${fmtUsd(topNet?.net_pnl || 0)}. ` +
+        `Most paper capital in use: ${topUtil?.label || '—'} ${fmtUsd(topUtil?.committed_capital || 0)}.` +
+        (dq.has_gaps
+          ? ` ${dq.external_open_trades_excluded_from_paper_utilization || 0} external open trade(s) excluded from paper utilization; ${dq.open_trades_missing_marks || 0} open trade(s) missing marks.`
+          : '');
       body.innerHTML = strategies.map(row => {
         const tradeLabel = `${row.trade_count || 0} total`;
         const tradeSub = `${row.open_trades || 0} open / ${row.closed_trades || 0} closed`;
-        const capitalSub = `${(row.bankroll_utilization_pct || 0).toFixed(1)}% of bankroll`;
-        const winRate = row.closed_trades ? `${(row.win_rate || 0).toFixed(1)}%` : '—';
-        const winSub = row.closed_trades ? `${row.wins || 0}W / ${row.losses || 0}L` : 'No closed trades';
+        const stateSub = `${row.paper_open_trades || 0} paper open · ${row.external_open_trades || 0} external open`;
+        const capitalSub = `${(row.bankroll_utilization_pct || 0).toFixed(1)}% of paper bankroll`;
+        const coverage = row.data_quality_status === 'ok'
+          ? 'Clean'
+          : `${row.open_trades_missing_marks || 0} missing mark${(row.open_trades_missing_marks || 0) === 1 ? '' : 's'}${row.trade_state_inferred_trades ? ` · ${row.trade_state_inferred_trades} inferred state` : ''}`;
         return `<tr>
           <td>${esc(row.label || row.strategy || '')}</td>
           <td>${formatSignedCell(row.realized_pnl || 0)}</td>
           <td>${formatSignedCell(row.unrealized_pnl || 0)}</td>
-          <td><div class="metric-stack"><span>${winRate}</span><span class="sub">${esc(winSub)}</span></div></td>
-          <td><div class="metric-stack"><span>${esc(tradeLabel)}</span><span class="sub">${esc(tradeSub)}</span></div></td>
+          <td>${formatSignedCell(row.net_pnl || 0)}</td>
+          <td><div class="metric-stack"><span>${esc(tradeLabel)}</span><span class="sub">${esc(tradeSub)}</span><span class="sub">${esc(stateSub)}</span></div></td>
           <td><div class="metric-stack"><span>${fmtUsd(row.committed_capital || 0)}</span><span class="sub">${esc(capitalSub)}</span></div></td>
+          <td><div class="metric-stack"><span>${esc(coverage)}</span><span class="sub">${row.closed_trades ? `${(row.win_rate || 0).toFixed(1)}% win · ${row.wins || 0}W/${row.losses || 0}L` : 'No closed trades'}</span></div></td>
         </tr>`;
       }).join('');
     }

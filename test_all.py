@@ -263,9 +263,14 @@ def test_single_leg_buy_no_mark_to_market():
               f"got {update['unrealized_pnl']['pnl_usd']}, expected {expected:.2f}")
 
     account = db.get_paper_account_state(refresh_unrealized=False)
-    check("paper account unrealized remains economically plausible for BUY_NO",
-          abs((account["unrealized_pnl"] - before["unrealized_pnl"]) - round(expected, 2)) < 0.01,
-          f"got delta {account['unrealized_pnl'] - before['unrealized_pnl']}, expected {expected:.2f}")
+    check("wallet-attached copy trade excluded from paper account unrealized",
+          abs(account["unrealized_pnl"] - before["unrealized_pnl"]) < 0.01,
+          f"got delta {account['unrealized_pnl'] - before['unrealized_pnl']}")
+    strategy = db.get_strategy_performance(refresh_unrealized=False)
+    copy_bucket = next((row for row in strategy["strategies"] if row["strategy"] == "copy"), {})
+    check("strategy view still reports copy unrealized pnl",
+          abs(copy_bucket.get("unrealized_pnl", 0) - round(expected, 2)) < 0.01,
+          f"got {copy_bucket.get('unrealized_pnl')}, expected {expected:.2f}")
     db.close_trade(trade_id, exit_price_a=0.99, notes="test cleanup")
 
 

@@ -1162,9 +1162,6 @@ def find_open_copy_trade(
         if external_position_id:
             matchers.append("external_position_id = ?")
             params.append(external_position_id)
-        if condition_id:
-            matchers.append("copy_condition_id = ?")
-            params.append(condition_id)
         if not matchers:
             return None
         row = conn.execute(
@@ -1296,6 +1293,84 @@ def _paper_unrealized_map_from_updates(updates):
     return unrealized
 
 
+def _infer_reporting_trade_state_mode(trade) -> tuple[str, bool, str | None]:
+    raw_mode = (trade.get("trade_state_mode") or "").strip()
+    if raw_mode in {TRADE_STATE_PAPER, TRADE_STATE_WALLET, TRADE_STATE_LIVE}:
+        return raw_mode, False, None
+
+    trade_type = (trade.get("trade_type") or "pairs").strip().lower()
+    reconciliation_mode = (trade.get("reconciliation_mode") or "").strip().lower()
+    strategy_name = (trade.get("strategy_name") or "").strip().lower()
+
+    if trade_type == "copy" or reconciliation_mode == RECONCILIATION_WALLET:
+        return TRADE_STATE_WALLET, True, "missing_or_invalid_trade_state_mode"
+    if (
+        reconciliation_mode == RECONCILIATION_ORDERS
+        or strategy_name.endswith("_live")
+        or trade.get("external_order_id_a")
+        or trade.get("external_order_id_b")
+    ):
+        return TRADE_STATE_LIVE, True, "missing_or_invalid_trade_state_mode"
+    return TRADE_STATE_PAPER, True, "missing_or_invalid_trade_state_mode"
+
+
+def _resolve_reporting_trade_state(trade) -> dict:
+    mode, inferred, reason = _infer_reporting_trade_state_mode(trade)
+    return {
+        "mode": mode,
+        "inferred": inferred,
+        "reason_code": reason,
+        "is_paper": mode == TRADE_STATE_PAPER,
+        "is_external": mode in {TRADE_STATE_WALLET, TRADE_STATE_LIVE},
+    }
+
+
+def _latest_open_trade_valuation_rows(conn):
+    return conn.execute("""
+        SELECT t.id, t.trade_type, t.side_a, t.size_usd, t.entry_price_a, t.entry_price_b,
+               s.price_a, s.price_b, s.timestamp AS snapshot_timestamp
+        FROM trades t
+        LEFT JOIN snapshots s ON s.id = (
+            SELECT s2.id
+            FROM snapshots s2
+            WHERE s2.trade_id = t.id
+            ORDER BY s2.timestamp DESC, s2.id DESC
+            LIMIT 1
+        )
+        WHERE t.status='open'
+    """).fetchall()
+
+
+def _open_trade_valuation_map_from_snapshots(conn):
+    valuations = {}
+    for row in _latest_open_trade_valuation_rows(conn):
+        trade_type = row["trade_type"] or "pairs"
+        if trade_type in {"weather", "copy", "whale"}:
+            valuation = calculate_single_leg_mark_to_market(
+                row["size_usd"],
+                row["entry_price_a"],
+                row["price_a"],
+            )
+        else:
+            valuation = calculate_pairs_mark_to_market(
+                row["size_usd"],
+                row["entry_price_a"],
+                row["price_a"],
+                row["entry_price_b"],
+                row["price_b"],
+                row["side_a"],
+            )
+
+        valuations[int(row["id"])] = {
+            "ok": bool(valuation["ok"]),
+            "pnl_usd": float(valuation["pnl_usd"]) if valuation["ok"] else 0.0,
+            "current_value": float(valuation.get("current_value") or 0.0) if valuation["ok"] else 0.0,
+            "snapshot_timestamp": row["snapshot_timestamp"],
+            "mark_missing": not bool(valuation["ok"]),
+        }
+    return valuations
+
+
 def _paper_unrealized_from_snapshots(conn):
     rows = conn.execute("""
         SELECT t.id, t.trade_type, t.side_a, t.size_usd, t.entry_price_a, t.entry_price_b,
@@ -1335,40 +1410,10 @@ def _paper_unrealized_from_snapshots(conn):
 
 
 def _paper_unrealized_map_from_snapshots(conn):
-    rows = conn.execute("""
-        SELECT t.id, t.trade_type, t.side_a, t.size_usd, t.entry_price_a, t.entry_price_b,
-               s.price_a, s.price_b
-        FROM trades t
-        LEFT JOIN snapshots s ON s.id = (
-            SELECT s2.id
-            FROM snapshots s2
-            WHERE s2.trade_id = t.id
-            ORDER BY s2.timestamp DESC, s2.id DESC
-            LIMIT 1
-        )
-        WHERE t.status='open'
-    """).fetchall()
-
     unrealized = {}
-    for row in rows:
-        trade_type = row["trade_type"] or "pairs"
-        if trade_type in {"weather", "copy", "whale"}:
-            valuation = calculate_single_leg_mark_to_market(
-                row["size_usd"],
-                row["entry_price_a"],
-                row["price_a"],
-            )
-        else:
-            valuation = calculate_pairs_mark_to_market(
-                row["size_usd"],
-                row["entry_price_a"],
-                row["price_a"],
-                row["entry_price_b"],
-                row["price_b"],
-                row["side_a"],
-            )
+    for trade_id, valuation in _open_trade_valuation_map_from_snapshots(conn).items():
         if valuation["ok"]:
-            unrealized[int(row["id"])] = float(valuation["pnl_usd"])
+            unrealized[int(trade_id)] = float(valuation["pnl_usd"])
     return unrealized
 
 
@@ -1392,50 +1437,63 @@ def _empty_strategy_bucket(strategy: str) -> dict:
         "trade_count": 0,
         "open_trades": 0,
         "closed_trades": 0,
+        "paper_open_trades": 0,
+        "paper_closed_trades": 0,
+        "wallet_open_trades": 0,
+        "live_open_trades": 0,
+        "external_open_trades": 0,
         "wins": 0,
         "losses": 0,
         "win_rate": 0.0,
         "realized_pnl": 0.0,
         "unrealized_pnl": 0.0,
+        "net_pnl": 0.0,
+        "paper_realized_pnl": 0.0,
+        "paper_unrealized_pnl": 0.0,
+        "paper_net_pnl": 0.0,
         "committed_capital": 0.0,
+        "external_capital": 0.0,
         "capital_deployed": 0.0,
         "avg_trade_size": 0.0,
         "bankroll_utilization_pct": 0.0,
+        "trade_state_inferred_trades": 0,
+        "open_trades_missing_marks": 0,
+        "data_quality_status": "ok",
     }
 
 
 def get_strategy_performance(refresh_unrealized: bool = False) -> dict:
-    conn = get_conn()
-    account = _paper_account_row(conn)
-    starting_bankroll = float(account["starting_bankroll"] or 0.0)
-    rows = conn.execute("""
-        SELECT id, trade_type, strategy_name, status, pnl, size_usd, notes
-        FROM trades
-        ORDER BY opened_at ASC, id ASC
-    """).fetchall()
-
     if refresh_unrealized:
-        conn.close()
         try:
             import tracker
-            unrealized_map = _paper_unrealized_map_from_updates(tracker.refresh_open_trades())
+            tracker.refresh_open_trades()
         except Exception as e:
             log.warning("Failed to refresh open paper trades for strategy summary: %s", e)
-            conn = get_conn()
-            try:
-                unrealized_map = _paper_unrealized_map_from_snapshots(conn)
-            finally:
-                conn.close()
-    else:
-        try:
-            unrealized_map = _paper_unrealized_map_from_snapshots(conn)
-        finally:
-            conn.close()
+
+    conn = get_conn()
+    try:
+        account = _paper_account_row(conn)
+        starting_bankroll = float(account["starting_bankroll"] or 0.0)
+        rows = conn.execute("""
+            SELECT id, trade_type, strategy_name, status, pnl, size_usd, notes,
+                   trade_state_mode, reconciliation_mode,
+                   external_order_id_a, external_order_id_b
+            FROM trades
+            ORDER BY opened_at ASC, id ASC
+        """).fetchall()
+        valuation_map = _open_trade_valuation_map_from_snapshots(conn)
+    finally:
+        conn.close()
 
     buckets = {strategy: _empty_strategy_bucket(strategy) for strategy in STRATEGY_ORDER}
     total_committed_capital = 0.0
     total_realized_pnl = 0.0
     total_unrealized_pnl = 0.0
+    total_paper_realized_pnl = 0.0
+    total_paper_unrealized_pnl = 0.0
+    total_external_open_trades = 0
+    total_open_trades_missing_marks = 0
+    total_inferred_trade_states = 0
 
     for row in rows:
         trade = dict(row)
@@ -1443,19 +1501,43 @@ def get_strategy_performance(refresh_unrealized: bool = False) -> dict:
             continue
         strategy = _trade_strategy_key(trade)
         bucket = buckets.setdefault(strategy, _empty_strategy_bucket(strategy))
+        state = _resolve_reporting_trade_state(trade)
+        valuation = valuation_map.get(int(trade["id"]), {"ok": False, "pnl_usd": 0.0, "mark_missing": False})
         size_usd = float(trade.get("size_usd") or 0.0)
         pnl = float(trade.get("pnl") or 0.0)
 
         bucket["trade_count"] += 1
         bucket["capital_deployed"] += size_usd
+        if state["inferred"]:
+            bucket["trade_state_inferred_trades"] += 1
+            total_inferred_trade_states += 1
 
         if trade.get("status") == "open":
             bucket["open_trades"] += 1
-            bucket["committed_capital"] += size_usd
-            bucket["unrealized_pnl"] += float(unrealized_map.get(int(trade["id"]), 0.0))
+            if valuation["ok"]:
+                bucket["unrealized_pnl"] += float(valuation["pnl_usd"])
+            else:
+                bucket["open_trades_missing_marks"] += 1
+                total_open_trades_missing_marks += 1
+            if state["is_paper"]:
+                bucket["paper_open_trades"] += 1
+                bucket["committed_capital"] += size_usd
+                if valuation["ok"]:
+                    bucket["paper_unrealized_pnl"] += float(valuation["pnl_usd"])
+            else:
+                bucket["external_open_trades"] += 1
+                bucket["external_capital"] += size_usd
+                total_external_open_trades += 1
+                if state["mode"] == TRADE_STATE_WALLET:
+                    bucket["wallet_open_trades"] += 1
+                elif state["mode"] == TRADE_STATE_LIVE:
+                    bucket["live_open_trades"] += 1
         elif trade.get("status") == "closed":
             bucket["closed_trades"] += 1
             bucket["realized_pnl"] += pnl
+            if state["is_paper"]:
+                bucket["paper_closed_trades"] += 1
+                bucket["paper_realized_pnl"] += pnl
             if pnl > 0:
                 bucket["wins"] += 1
             else:
@@ -1468,16 +1550,27 @@ def get_strategy_performance(refresh_unrealized: bool = False) -> dict:
         bucket["win_rate"] = round((bucket["wins"] / closed_trades * 100) if closed_trades else 0.0, 1)
         bucket["realized_pnl"] = round(bucket["realized_pnl"], 2)
         bucket["unrealized_pnl"] = round(bucket["unrealized_pnl"], 2)
+        bucket["net_pnl"] = round(bucket["realized_pnl"] + bucket["unrealized_pnl"], 2)
+        bucket["paper_realized_pnl"] = round(bucket["paper_realized_pnl"], 2)
+        bucket["paper_unrealized_pnl"] = round(bucket["paper_unrealized_pnl"], 2)
+        bucket["paper_net_pnl"] = round(bucket["paper_realized_pnl"] + bucket["paper_unrealized_pnl"], 2)
         bucket["committed_capital"] = round(bucket["committed_capital"], 2)
+        bucket["paper_committed_capital"] = bucket["committed_capital"]
+        bucket["external_capital"] = round(bucket["external_capital"], 2)
         bucket["capital_deployed"] = round(bucket["capital_deployed"], 2)
         bucket["avg_trade_size"] = round((bucket["capital_deployed"] / bucket["trade_count"]) if bucket["trade_count"] else 0.0, 2)
         bucket["bankroll_utilization_pct"] = round(
             (bucket["committed_capital"] / starting_bankroll * 100) if starting_bankroll > 0 else 0.0,
             1,
         )
+        bucket["data_quality_status"] = "warning" if (
+            bucket["trade_state_inferred_trades"] or bucket["open_trades_missing_marks"]
+        ) else "ok"
         total_committed_capital += bucket["committed_capital"]
         total_realized_pnl += bucket["realized_pnl"]
         total_unrealized_pnl += bucket["unrealized_pnl"]
+        total_paper_realized_pnl += bucket["paper_realized_pnl"]
+        total_paper_unrealized_pnl += bucket["paper_unrealized_pnl"]
         if bucket["trade_count"] or strategy in {"cointegration", "weather", "whale", "copy"}:
             strategies.append(bucket)
 
@@ -1486,45 +1579,86 @@ def get_strategy_performance(refresh_unrealized: bool = False) -> dict:
         "total_committed_capital": round(total_committed_capital, 2),
         "total_realized_pnl": round(total_realized_pnl, 2),
         "total_unrealized_pnl": round(total_unrealized_pnl, 2),
+        "total_paper_realized_pnl": round(total_paper_realized_pnl, 2),
+        "total_paper_unrealized_pnl": round(total_paper_unrealized_pnl, 2),
+        "reporting_scope": "strategy_pnl_all_states__utilization_paper_only",
+        "data_quality": {
+            "trade_state_inferred_trades": total_inferred_trade_states,
+            "open_trades_missing_marks": total_open_trades_missing_marks,
+            "external_open_trades_excluded_from_paper_utilization": total_external_open_trades,
+            "has_gaps": bool(
+                total_inferred_trade_states
+                or total_open_trades_missing_marks
+                or total_external_open_trades
+            ),
+        },
         "strategies": strategies,
     }
 
 
 def get_paper_account_state(refresh_unrealized: bool = False) -> dict:
-    conn = get_conn()
-    account = _paper_account_row(conn)
-    starting_bankroll = float(account["starting_bankroll"] or 0.0)
-    committed_capital = float(conn.execute(
-        "SELECT COALESCE(SUM(size_usd), 0) FROM trades WHERE status='open'"
-    ).fetchone()[0] or 0.0)
-    realized_pnl = float(conn.execute(
-        "SELECT COALESCE(SUM(pnl), 0) FROM trades WHERE status='closed'"
-    ).fetchone()[0] or 0.0)
-    cumulative_losses = abs(float(conn.execute(
-        "SELECT COALESCE(SUM(CASE WHEN pnl < 0 THEN pnl ELSE 0 END), 0) FROM trades WHERE status='closed'"
-    ).fetchone()[0] or 0.0))
-    realized_gains = float(conn.execute(
-        "SELECT COALESCE(SUM(CASE WHEN pnl > 0 THEN pnl ELSE 0 END), 0) FROM trades WHERE status='closed'"
-    ).fetchone()[0] or 0.0)
-    open_trades = int(conn.execute(
-        "SELECT COUNT(*) FROM trades WHERE status='open'"
-    ).fetchone()[0] or 0)
-
-    if refresh_unrealized and open_trades:
-        conn.close()
+    if refresh_unrealized:
         try:
             import tracker
-            unrealized_pnl = _paper_unrealized_from_updates(tracker.refresh_open_trades())
+            tracker.refresh_open_trades()
         except Exception as e:
             log.warning("Failed to refresh open paper trades for account summary: %s", e)
-            conn = get_conn()
-            try:
-                unrealized_pnl = _paper_unrealized_from_snapshots(conn)
-            finally:
-                conn.close()
-    else:
-        unrealized_pnl = _paper_unrealized_from_snapshots(conn) if open_trades else 0.0
+
+    conn = get_conn()
+    try:
+        account = _paper_account_row(conn)
+        starting_bankroll = float(account["starting_bankroll"] or 0.0)
+        rows = conn.execute("""
+            SELECT id, trade_type, strategy_name, status, pnl, size_usd,
+                   trade_state_mode, reconciliation_mode,
+                   external_order_id_a, external_order_id_b
+            FROM trades
+        """).fetchall()
+        valuation_map = _open_trade_valuation_map_from_snapshots(conn)
+    finally:
         conn.close()
+
+    committed_capital = 0.0
+    realized_pnl = 0.0
+    cumulative_losses = 0.0
+    realized_gains = 0.0
+    open_trades = 0
+    unrealized_pnl = 0.0
+    excluded_open_trades = 0
+    excluded_unrealized_pnl = 0.0
+    excluded_realized_pnl = 0.0
+    inferred_trade_states = 0
+    open_paper_trades_missing_marks = 0
+
+    for row in rows:
+        trade = dict(row)
+        state = _resolve_reporting_trade_state(trade)
+        if state["inferred"]:
+            inferred_trade_states += 1
+        size_usd = float(trade.get("size_usd") or 0.0)
+        pnl = float(trade.get("pnl") or 0.0)
+        if trade.get("status") == "open":
+            valuation = valuation_map.get(int(trade["id"]), {"ok": False, "pnl_usd": 0.0})
+            if state["is_paper"]:
+                open_trades += 1
+                committed_capital += size_usd
+                if valuation["ok"]:
+                    unrealized_pnl += float(valuation["pnl_usd"])
+                else:
+                    open_paper_trades_missing_marks += 1
+            else:
+                excluded_open_trades += 1
+                if valuation["ok"]:
+                    excluded_unrealized_pnl += float(valuation["pnl_usd"])
+        elif trade.get("status") == "closed":
+            if state["is_paper"]:
+                realized_pnl += pnl
+                if pnl < 0:
+                    cumulative_losses += abs(pnl)
+                elif pnl > 0:
+                    realized_gains += pnl
+            else:
+                excluded_realized_pnl += pnl
 
     available_cash = starting_bankroll + realized_pnl - committed_capital
     open_position_value = committed_capital + unrealized_pnl
@@ -1542,6 +1676,20 @@ def get_paper_account_state(refresh_unrealized: bool = False) -> dict:
         "total_equity": round(total_equity, 2),
         "open_trades": open_trades,
         "bankroll_used_pct": round(bankroll_used_pct, 1),
+        "excluded_open_trades": excluded_open_trades,
+        "excluded_realized_pnl": round(excluded_realized_pnl, 2),
+        "excluded_unrealized_pnl": round(excluded_unrealized_pnl, 2),
+        "reporting_scope": "paper_research_only",
+        "data_quality": {
+            "trade_state_inferred_trades": inferred_trade_states,
+            "open_paper_trades_missing_marks": open_paper_trades_missing_marks,
+            "excluded_external_open_trades": excluded_open_trades,
+            "has_gaps": bool(
+                inferred_trade_states
+                or open_paper_trades_missing_marks
+                or excluded_open_trades
+            ),
+        },
         "cash_after_open_explanation": "Opening a paper trade deducts its full size from available cash immediately and moves that amount into committed capital until the trade closes.",
         **_paper_position_policy_dict(),
     }
@@ -2719,12 +2867,12 @@ def open_copy_trade(
         """
         INSERT INTO trades (
             trade_type, opened_at, side_a, side_b,
-            entry_price_a, entry_price_b, token_id_a, size_usd, status,
+            entry_price_a, entry_price_b, token_id_a, size_usd, status, strategy_name,
             copy_wallet, copy_label, copy_condition_id, copy_outcome,
             event, market_a, trade_state_mode, reconciliation_mode,
             canonical_ref, external_position_id, external_source
         )
-        SELECT 'copy', ?, ?, '', ?, 0, ?, ?, 'open', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+        SELECT 'copy', ?, ?, '', ?, 0, ?, ?, 'open', 'copy', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
         WHERE NOT EXISTS (
             SELECT 1
             FROM trades
@@ -2735,7 +2883,6 @@ def open_copy_trade(
                     canonical_ref=?
                  OR (copy_condition_id=? AND LOWER(COALESCE(copy_outcome, ''))=?)
                  OR external_position_id=?
-                 OR copy_condition_id=?
               )
         )
         """,
@@ -2755,7 +2902,6 @@ def open_copy_trade(
             condition_id,
             outcome_norm,
             decision.get("external_position_id") or identifiers["external_position_id"],
-            condition_id,
         ),
     )
     if cursor.rowcount <= 0:
@@ -2790,9 +2936,9 @@ def open_weather_trade(weather_signal_id, size_usd=100):
     conn.execute("""
         INSERT INTO trades (signal_id, weather_signal_id, trade_type, opened_at,
             side_a, side_b, entry_price_a, entry_price_b,
-            token_id_a, size_usd, status, event, market_a,
+            token_id_a, size_usd, status, strategy_name, event, market_a,
             trade_state_mode, reconciliation_mode)
-        VALUES (NULL, ?, 'weather', ?, ?, '', ?, 0, ?, ?, 'open', ?, ?, ?, ?)
+        VALUES (NULL, ?, 'weather', ?, ?, '', ?, 0, ?, ?, 'open', 'weather', ?, ?, ?, ?)
     """, (
         weather_signal_id, time.time(), action, entry_price, token, size_usd,
         decision["signal"].get("event"),
@@ -4177,8 +4323,9 @@ def open_whale_trade(trade_data):
         conn.execute("""
             INSERT INTO trades (trade_type, opened_at, side_a, side_b,
                 entry_price_a, entry_price_b, token_id_a, size_usd, status,
-                whale_alert_id, event, market_a, notes)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                strategy_name, whale_alert_id, event, market_a, notes,
+                trade_state_mode, reconciliation_mode)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             trade_data['trade_type'],
             trade_data['opened_at'],
@@ -4189,10 +4336,13 @@ def open_whale_trade(trade_data):
             trade_data['token_id_a'],
             trade_data['size_usd'],
             trade_data['status'],
+            trade_data.get('strategy_name', 'whale'),
             trade_data.get('whale_alert_id'),
             trade_data['event'],
             trade_data['market_a'],
-            trade_data.get('notes') or f"Suspicion: {trade_data.get('suspicion_score', 0)}/100"
+            trade_data.get('notes') or f"Suspicion: {trade_data.get('suspicion_score', 0)}/100",
+            trade_data.get('trade_state_mode', TRADE_STATE_PAPER),
+            trade_data.get('reconciliation_mode', RECONCILIATION_INTERNAL),
         ))
         trade_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
         conn.commit()

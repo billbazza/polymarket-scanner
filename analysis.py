@@ -123,6 +123,18 @@ def scan_performance(limit=50):
     return result
 
 
+def strategy_performance():
+    """Strategy-level attribution and paper-utilization audit."""
+    result = db.get_strategy_performance(refresh_unrealized=False)
+    log.debug(
+        "Strategy performance: %d strategies, paper committed=$%.2f, net=$%.2f",
+        len(result.get("strategies", [])),
+        result.get("total_committed_capital", 0.0),
+        result.get("total_realized_pnl", 0.0) + result.get("total_unrealized_pnl", 0.0),
+    )
+    return result
+
+
 def print_report():
     """Print a formatted analysis report."""
     print()
@@ -171,6 +183,33 @@ def print_report():
         print(f"\n  Recent scans:")
         for r in perf["recent"][:5]:
             print(f"    {r['time']}  opps={r['opportunities']}  dur={r['duration']}s")
+
+    strategy = strategy_performance()
+    print(f"\n--- Strategy Performance ---")
+    print(f"  Scope:              {strategy.get('reporting_scope', 'unknown')}")
+    print(f"  Paper capital used: ${strategy.get('total_committed_capital', 0):.2f}")
+    print(f"  Realized P&L:       ${strategy.get('total_realized_pnl', 0):.2f}")
+    print(f"  Unrealized P&L:     ${strategy.get('total_unrealized_pnl', 0):.2f}")
+    dq = strategy.get("data_quality", {})
+    print(
+        "  Data quality:       "
+        f"inferred states={dq.get('trade_state_inferred_trades', 0)}  "
+        f"missing marks={dq.get('open_trades_missing_marks', 0)}  "
+        f"external open excluded from paper util={dq.get('external_open_trades_excluded_from_paper_utilization', 0)}"
+    )
+    rows = strategy.get("strategies", [])
+    if rows:
+        print(f"\n  {'Strategy':<16}{'Net':>10}{'Paper Util':>14}{'Open':>8}{'Coverage':>14}")
+        print(f"  {'-' * 62}")
+        for row in rows:
+            coverage = "clean" if row.get("data_quality_status") == "ok" else "warning"
+            print(
+                f"  {row.get('label', row.get('strategy', '?')):<16}"
+                f"{row.get('net_pnl', 0):>10.2f}"
+                f"{(str(row.get('bankroll_utilization_pct', 0)) + '%'):>14}"
+                f"{row.get('open_trades', 0):>8}"
+                f"{coverage:>14}"
+            )
 
     print()
     print("=" * 60)
