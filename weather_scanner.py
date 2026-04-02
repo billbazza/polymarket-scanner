@@ -1,11 +1,12 @@
-"""Weather edge scanner — dual-stream NOAA + Open-Meteo vs Polymarket temperature markets.
+"""Weather edge scanner — threshold weather strategy over shared provider sources.
 
 Strategy:
   Two independent forecast sources give us a probability for each temperature
   bucket market. Retail users price these on phone apps or vibes.
 
-  NOAA NWS  — US government model, hyper-accurate 24-48h, hourly resolution.
-  Open-Meteo — Open-source aggregator that blends NOAA, ECMWF, GFS and more.
+  The default provider layer still uses:
+    NOAA NWS  — US government model, hyper-accurate 24-48h, hourly resolution.
+    Open-Meteo — Open-source aggregator that blends NOAA, ECMWF, GFS and more.
                Returns daily high/low directly. Free, no key required.
 
   For each market we compute:
@@ -35,21 +36,13 @@ import re
 import time
 from datetime import date, timedelta
 
-import requests
 from scipy.stats import norm
 
 import api
 import math_engine
+import weather_sources
 
 log = logging.getLogger("scanner.weather")
-
-# --- API constants ---
-NWS_BASE = "https://api.weather.gov"
-NWS_HEADERS = {
-    "User-Agent": "PolymarketWeatherScanner/1.0 (statistical-research)",
-    "Accept": "application/geo+json",
-}
-OPENMETEO_BASE = "https://api.open-meteo.com/v1/forecast"
 
 # Forecast σ (°F) by hours ahead — calibrated to NWS verification statistics
 _SIGMA_BY_HOURS = [(24, 2.5), (48, 3.5), (72, 5.0), (999, 6.5)]
@@ -142,18 +135,6 @@ CITIES = {
     "lucknow":       (26.8467,   80.9462),
 }
 
-# Cities covered by NOAA NWS (US only — all entries before the International block)
-_US_CITY_KEYS = frozenset([
-    "new york city", "new york", "nyc", "los angeles", "chicago", "houston",
-    "phoenix", "philadelphia", "san antonio", "san diego", "dallas",
-    "san francisco", "seattle", "denver", "boston", "miami", "atlanta",
-    "minneapolis", "washington dc", "washington", "las vegas", "portland",
-    "nashville", "memphis", "baltimore", "milwaukee", "albuquerque",
-    "sacramento", "kansas city", "raleigh", "tampa", "new orleans",
-    "cleveland", "pittsburgh", "detroit", "indianapolis", "jacksonville",
-    "charlotte", "austin", "orlando", "cincinnati", "st. louis", "st louis",
-])
-
 _MONTH_NUMS = {
     "january": 1, "jan": 1, "february": 2, "feb": 2,
     "march": 3, "mar": 3, "april": 4, "apr": 4, "may": 5,
@@ -162,12 +143,6 @@ _MONTH_NUMS = {
     "october": 10, "oct": 10, "november": 11, "nov": 11,
     "december": 12, "dec": 12,
 }
-
-# In-memory caches (per scan run — cleared on process restart)
-_nws_gridpoint_cache = {}    # (lat, lon) → forecastHourly URL
-_nws_periods_cache = {}      # hourly_url → list of periods
-_openmeteo_cache = {}        # (lat, lon) → {date_iso: {"high": float, "low": float}}
-
 
 # ---------------------------------------------------------------------------
 # Market question parser
@@ -313,128 +288,6 @@ def _calc_probability(forecast_val, threshold_f, direction, hours_ahead):
 
 
 # ---------------------------------------------------------------------------
-# NOAA NWS API
-# ---------------------------------------------------------------------------
-
-def _nws_get(url, retries=2):
-    for attempt in range(retries + 1):
-        try:
-            resp = requests.get(url, headers=NWS_HEADERS, timeout=15)
-            resp.raise_for_status()
-            return resp.json()
-        except (requests.ConnectionError, requests.Timeout) as e:
-            if attempt < retries:
-                time.sleep(1.0 * (attempt + 1))
-            else:
-                raise
-        except requests.HTTPError as e:
-            log.warning("NWS HTTP %s: %s", url[:60], e)
-            raise
-
-
-def _nws_hourly_url(lat, lon):
-    """Resolve lat/lon to NWS forecastHourly URL. Cached."""
-    key = (round(lat, 3), round(lon, 3))
-    if key in _nws_gridpoint_cache:
-        return _nws_gridpoint_cache[key]
-    try:
-        data = _nws_get(f"{NWS_BASE}/points/{lat},{lon}")
-        url = data["properties"]["forecastHourly"]
-        _nws_gridpoint_cache[key] = url
-        return url
-    except Exception as e:
-        log.warning("NWS gridpoint failed (%.3f,%.3f): %s", lat, lon, e)
-        return None
-
-
-def _nws_daily_high(lat, lon, target_date_iso):
-    """Return NOAA forecast daily high (°F) for target date, or None."""
-    hourly_url = _nws_hourly_url(lat, lon)
-    if hourly_url is None:
-        return None
-
-    if hourly_url not in _nws_periods_cache:
-        try:
-            data = _nws_get(hourly_url)
-            _nws_periods_cache[hourly_url] = data["properties"]["periods"]
-        except Exception as e:
-            log.warning("NWS hourly fetch failed: %s", e)
-            return None
-
-    periods = _nws_periods_cache[hourly_url]
-    temps = []
-    for period in periods:
-        if not period.get("startTime", "").startswith(target_date_iso):
-            continue
-        temp = period.get("temperature")
-        if temp is None:
-            continue
-        temp = float(temp)
-        if period.get("temperatureUnit", "F") == "C":
-            temp = temp * 9 / 5 + 32
-        temps.append(temp)
-
-    return round(max(temps), 1) if temps else None
-
-
-# ---------------------------------------------------------------------------
-# Open-Meteo API
-# ---------------------------------------------------------------------------
-
-def _openmeteo_forecasts(lat, lon):
-    """Fetch Open-Meteo daily high/low for all available dates. Cached per location.
-
-    Returns dict of {date_iso: {"high": float, "low": float}} or {}.
-    """
-    key = (round(lat, 3), round(lon, 3))
-    if key in _openmeteo_cache:
-        return _openmeteo_cache[key]
-
-    try:
-        resp = requests.get(
-            OPENMETEO_BASE,
-            params={
-                "latitude": lat,
-                "longitude": lon,
-                "daily": "temperature_2m_max,temperature_2m_min",
-                "temperature_unit": "fahrenheit",
-                "timezone": "auto",
-                "forecast_days": 8,
-            },
-            timeout=10,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-    except Exception as e:
-        log.warning("Open-Meteo fetch failed (%.3f,%.3f): %s", lat, lon, e)
-        _openmeteo_cache[key] = {}
-        return {}
-
-    daily = data.get("daily", {})
-    times = daily.get("time", [])
-    highs = daily.get("temperature_2m_max", [])
-    lows = daily.get("temperature_2m_min", [])
-
-    result = {}
-    for i, d in enumerate(times):
-        result[d] = {
-            "high": round(float(highs[i]), 1) if i < len(highs) and highs[i] is not None else None,
-            "low":  round(float(lows[i]),  1) if i < len(lows)  and lows[i]  is not None else None,
-        }
-
-    _openmeteo_cache[key] = result
-    log.debug("Open-Meteo: %.3f,%.3f → %d days cached", lat, lon, len(result))
-    return result
-
-
-def _om_daily_high(lat, lon, target_date_iso):
-    """Return Open-Meteo forecast daily high (°F) for target date, or None."""
-    forecasts = _openmeteo_forecasts(lat, lon)
-    entry = forecasts.get(target_date_iso)
-    return entry["high"] if entry else None
-
-
-# ---------------------------------------------------------------------------
 # Main scanner
 # ---------------------------------------------------------------------------
 
@@ -518,19 +371,26 @@ def scan(min_edge=MIN_EDGE, min_liquidity=MIN_LIQUIDITY, verbose=True):
             direction = parsed["direction"]
             hours_ahead = parsed["days_ahead"] * 24
 
-            # --- NOAA forecast (US only — NWS API rejects non-US coordinates) ---
-            _us_city = parsed.get("city_key", "") in _US_CITY_KEYS
-            noaa_high = _nws_daily_high(lat, lon, target_date) if _us_city else None
-            if noaa_high is None and _us_city:
+            source_results = weather_sources.fetch_threshold_forecasts(
+                lat,
+                lon,
+                target_date,
+                city_key=parsed.get("city_key"),
+            )
+            source_map = {result["source_id"]: result for result in source_results}
+
+            noaa_result = source_map.get("noaa", {})
+            noaa_high = noaa_result.get("value_f")
+            if noaa_result.get("attempted") and noaa_high is None:
                 fetch_errors["noaa"] += 1
             noaa_prob, noaa_sigma = (
                 _calc_probability(noaa_high, threshold_f, direction, hours_ahead)
                 if noaa_high is not None else (None, None)
             )
 
-            # --- Open-Meteo forecast ---
-            om_high = _om_daily_high(lat, lon, target_date)
-            if om_high is None:
+            om_result = source_map.get("open-meteo", {})
+            om_high = om_result.get("value_f")
+            if om_result.get("attempted") and om_high is None:
                 fetch_errors["om"] += 1
             om_prob, _ = (
                 _calc_probability(om_high, threshold_f, direction, hours_ahead)
@@ -604,6 +464,7 @@ def scan(min_edge=MIN_EDGE, min_liquidity=MIN_LIQUIDITY, verbose=True):
                 "combined_edge_pct": round(combined_edge * 100, 2),
                 "sources_agree": sources_agree,
                 "sources_available": len(available),
+                "source_details": source_results,
                 # Scoring
                 "hours_ahead": hours_ahead,
                 "ev_pct": ev_pct,
