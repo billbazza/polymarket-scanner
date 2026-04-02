@@ -773,6 +773,46 @@ def _migration_012_trade_state_modes(conn):
     )
 
 
+def _migration_013_paper_sizing_decisions(conn):
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS paper_sizing_decisions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp REAL NOT NULL,
+            source TEXT NOT NULL,
+            strategy TEXT NOT NULL,
+            mode TEXT NOT NULL,
+            rollout_state TEXT,
+            active_policy TEXT,
+            selected_policy TEXT,
+            applied INTEGER DEFAULT 0,
+            signal_id INTEGER,
+            weather_signal_id INTEGER,
+            trade_id INTEGER,
+            event TEXT,
+            baseline_size_usd REAL,
+            confidence_size_usd REAL,
+            selected_size_usd REAL,
+            confidence_score REAL,
+            available_cash REAL,
+            committed_capital REAL,
+            total_equity REAL,
+            current_total_utilization_pct REAL,
+            projected_total_utilization_pct REAL,
+            current_strategy_utilization_pct REAL,
+            projected_strategy_utilization_pct REAL,
+            constraints_json TEXT,
+            details_json TEXT
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_paper_sizing_decisions_ts
+            ON paper_sizing_decisions(timestamp DESC);
+        CREATE INDEX IF NOT EXISTS idx_paper_sizing_decisions_strategy_ts
+            ON paper_sizing_decisions(strategy, timestamp DESC);
+        CREATE INDEX IF NOT EXISTS idx_paper_sizing_decisions_rollout_ts
+            ON paper_sizing_decisions(rollout_state, timestamp DESC);
+    """)
+
+
 _MIGRATIONS = [
     ("001_base_schema", _migration_001_base_schema),
     ("002_backfill_columns", _migration_002_backfill_columns),
@@ -786,6 +826,7 @@ _MIGRATIONS = [
     ("010_wallet_monitor_events", _migration_010_wallet_monitor_events),
     ("011_trade_monitor_events", _migration_011_trade_monitor_events),
     ("012_trade_state_modes", _migration_012_trade_state_modes),
+    ("013_paper_sizing_decisions", _migration_013_paper_sizing_decisions),
 ]
 
 
@@ -1986,6 +2027,174 @@ def get_paper_trade_attempt_summary(limit: int = 50) -> dict:
         "blocked": blocked,
         "errors": errors,
         "top_blockers": top_blockers,
+    }
+
+
+def record_paper_sizing_decision(
+    *,
+    source: str,
+    strategy: str,
+    mode: str,
+    rollout_state: str | None = None,
+    active_policy: str | None = None,
+    selected_policy: str | None = None,
+    applied: bool = False,
+    signal_id: int | None = None,
+    weather_signal_id: int | None = None,
+    trade_id: int | None = None,
+    event: str | None = None,
+    baseline_size_usd: float | None = None,
+    confidence_size_usd: float | None = None,
+    selected_size_usd: float | None = None,
+    confidence_score: float | None = None,
+    available_cash: float | None = None,
+    committed_capital: float | None = None,
+    total_equity: float | None = None,
+    current_total_utilization_pct: float | None = None,
+    projected_total_utilization_pct: float | None = None,
+    current_strategy_utilization_pct: float | None = None,
+    projected_strategy_utilization_pct: float | None = None,
+    constraints: dict | list | None = None,
+    details: dict | None = None,
+) -> int:
+    conn = get_conn()
+    try:
+        if not _table_exists(conn, "paper_sizing_decisions"):
+            log.warning("paper_sizing_decisions table unavailable; skipping sizing decision write")
+            return 0
+        conn.execute(
+            """
+            INSERT INTO paper_sizing_decisions (
+                timestamp, source, strategy, mode, rollout_state, active_policy,
+                selected_policy, applied, signal_id, weather_signal_id, trade_id, event,
+                baseline_size_usd, confidence_size_usd, selected_size_usd, confidence_score,
+                available_cash, committed_capital, total_equity,
+                current_total_utilization_pct, projected_total_utilization_pct,
+                current_strategy_utilization_pct, projected_strategy_utilization_pct,
+                constraints_json, details_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                time.time(),
+                source,
+                strategy,
+                mode,
+                rollout_state,
+                active_policy,
+                selected_policy,
+                1 if applied else 0,
+                signal_id,
+                weather_signal_id,
+                trade_id,
+                event,
+                round(float(baseline_size_usd), 2) if baseline_size_usd is not None else None,
+                round(float(confidence_size_usd), 2) if confidence_size_usd is not None else None,
+                round(float(selected_size_usd), 2) if selected_size_usd is not None else None,
+                round(float(confidence_score), 4) if confidence_score is not None else None,
+                round(float(available_cash), 2) if available_cash is not None else None,
+                round(float(committed_capital), 2) if committed_capital is not None else None,
+                round(float(total_equity), 2) if total_equity is not None else None,
+                round(float(current_total_utilization_pct), 2) if current_total_utilization_pct is not None else None,
+                round(float(projected_total_utilization_pct), 2) if projected_total_utilization_pct is not None else None,
+                round(float(current_strategy_utilization_pct), 2) if current_strategy_utilization_pct is not None else None,
+                round(float(projected_strategy_utilization_pct), 2) if projected_strategy_utilization_pct is not None else None,
+                json.dumps(constraints) if constraints is not None else None,
+                json.dumps(details) if details else None,
+            ),
+        )
+        row_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+        conn.commit()
+        return int(row_id)
+    except sqlite3.Error as exc:
+        log.warning("Failed to record paper sizing decision: %s", exc)
+        return 0
+    finally:
+        conn.close()
+
+
+def get_paper_sizing_decisions(limit: int = 50) -> list[dict]:
+    limit = _normalize_query_limit(limit, "get_paper_sizing_decisions")
+    conn = get_conn()
+    try:
+        if not _table_exists(conn, "paper_sizing_decisions"):
+            return []
+        query = """
+            SELECT *
+            FROM paper_sizing_decisions
+            ORDER BY timestamp DESC, id DESC
+        """
+        if limit is None:
+            rows = conn.execute(query).fetchall()
+        else:
+            rows = conn.execute(query + " LIMIT ?", (limit,)).fetchall()
+    except sqlite3.Error as exc:
+        log.warning("Failed to query paper sizing decisions: %s", exc)
+        return []
+    finally:
+        conn.close()
+
+    decisions = []
+    for row in rows:
+        item = dict(row)
+        try:
+            item["constraints"] = json.loads(item["constraints_json"]) if item.get("constraints_json") else []
+        except Exception:
+            item["constraints"] = []
+        try:
+            item["details"] = json.loads(item["details_json"]) if item.get("details_json") else None
+        except Exception:
+            item["details"] = None
+        item.pop("constraints_json", None)
+        item.pop("details_json", None)
+        item["applied"] = bool(item.get("applied"))
+        decisions.append(item)
+    return decisions
+
+
+def get_paper_sizing_summary(limit: int = 200) -> dict:
+    decisions = get_paper_sizing_decisions(limit=limit)
+    by_strategy = {}
+    applied_count = 0
+    shadow_count = 0
+
+    for item in decisions:
+        strategy = item.get("strategy") or "unknown"
+        bucket = by_strategy.setdefault(strategy, {
+            "strategy": strategy,
+            "decisions": 0,
+            "applied": 0,
+            "shadow": 0,
+            "avg_baseline_size_usd": 0.0,
+            "avg_confidence_size_usd": 0.0,
+            "avg_selected_size_usd": 0.0,
+            "avg_confidence_score": 0.0,
+        })
+        bucket["decisions"] += 1
+        bucket["applied"] += 1 if item.get("applied") else 0
+        bucket["shadow"] += 1 if (item.get("rollout_state") or "shadow") == "shadow" else 0
+        bucket["avg_baseline_size_usd"] += float(item.get("baseline_size_usd") or 0.0)
+        bucket["avg_confidence_size_usd"] += float(item.get("confidence_size_usd") or 0.0)
+        bucket["avg_selected_size_usd"] += float(item.get("selected_size_usd") or 0.0)
+        bucket["avg_confidence_score"] += float(item.get("confidence_score") or 0.0)
+        applied_count += 1 if item.get("applied") else 0
+        shadow_count += 1 if (item.get("rollout_state") or "shadow") == "shadow" else 0
+
+    strategies = []
+    for strategy in sorted(by_strategy):
+        bucket = by_strategy[strategy]
+        count = bucket["decisions"] or 1
+        bucket["avg_baseline_size_usd"] = round(bucket["avg_baseline_size_usd"] / count, 2)
+        bucket["avg_confidence_size_usd"] = round(bucket["avg_confidence_size_usd"] / count, 2)
+        bucket["avg_selected_size_usd"] = round(bucket["avg_selected_size_usd"] / count, 2)
+        bucket["avg_confidence_score"] = round(bucket["avg_confidence_score"] / count, 3)
+        strategies.append(bucket)
+
+    return {
+        "available": True,
+        "recent_count": len(decisions),
+        "shadow_decisions": shadow_count,
+        "applied_decisions": applied_count,
+        "strategies": strategies,
     }
 
 
@@ -3502,6 +3711,7 @@ def get_stats():
     win_rate = (wins / closed_trades * 100) if closed_trades > 0 else 0
     paper_account = get_paper_account_overview(refresh_unrealized=True)
     strategy_breakdown = paper_account["strategy_breakdown"]
+    paper_sizing = get_paper_sizing_summary(limit=200)
 
     # Build cumulative series: each point is the running total after that trade closes
     cumulative = 0.0
@@ -3525,6 +3735,7 @@ def get_stats():
         "pnl_series": pnl_series,
         "paper_account": paper_account,
         "strategy_breakdown": strategy_breakdown,
+        "paper_sizing": paper_sizing,
         "cointegration_trial": get_cointegration_trial_summary(),
     }
 

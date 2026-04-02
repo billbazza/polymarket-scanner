@@ -485,6 +485,17 @@ async def paper_account():
     return db.get_paper_account_overview(refresh_unrealized=True)
 
 
+@app.get("/api/paper-sizing")
+async def paper_sizing(limit: int = 50):
+    import paper_sizing as paper_sizing_module
+
+    return {
+        "settings": paper_sizing_module.get_sizing_settings(),
+        "decisions": db.get_paper_sizing_decisions(limit=limit),
+        "summary": db.get_paper_sizing_summary(limit=max(limit, 200)),
+    }
+
+
 @app.get("/api/paper-trade-attempts")
 async def paper_trade_attempts(limit: int = 50):
     return _paper_trade_attempt_feed(limit=limit)

@@ -46,6 +46,7 @@ import tracker
 import execution
 import math_engine
 import cointegration_trial
+import paper_sizing
 import trade_monitor
 
 # --- Configuration ---
@@ -686,6 +687,21 @@ def run_cycle(state):
             except Exception as e:
                 log.warning("  Brain validation failed (defaulting to math-only): %s", e)
 
+            sizing_decision = None
+            if mode == "paper":
+                sizing_decision = paper_sizing.build_paper_sizing_decision(
+                    "cointegration",
+                    opp,
+                    baseline_size_usd=trade_size,
+                    account_overview=db.get_paper_account_overview(refresh_unrealized=False),
+                    mode=mode,
+                    source="autonomy",
+                    signal_id=signal_id,
+                )
+                paper_sizing.record_sizing_decision(sizing_decision)
+                trade_size = sizing_decision["selected_size_usd"]
+                opp["paper_sizing"] = sizing_decision
+
             log.info("  Opening %s trade: %s | $%.2f", mode, event_name[:40], trade_size)
 
             try:
@@ -710,6 +726,7 @@ def run_cycle(state):
                                 "grade": opp.get("grade_label"),
                                 "admission_path": opp.get("admission_path"),
                                 "experiment_status": opp.get("experiment_status"),
+                                "paper_sizing": sizing_decision,
                             },
                         )
                     journal({
@@ -723,6 +740,8 @@ def run_cycle(state):
                         "z_score": opp.get("z_score", 0),
                         "grade": opp.get("grade_label", "?"),
                         "ev_pct": opp.get("ev", {}).get("ev_pct", 0),
+                        "paper_sizing_policy": (sizing_decision or {}).get("selected_policy"),
+                        "paper_confidence_size_usd": (sizing_decision or {}).get("confidence_size_usd"),
                         "admission_path": opp.get("admission_path"),
                         "experiment_status": opp.get("experiment_status"),
                         "reason": opp.get("experiment_reason") or f"Signal admitted, z={opp.get('z_score', 0):+.2f}",
@@ -739,7 +758,10 @@ def run_cycle(state):
                             signal_id=signal_id,
                             size_usd=trade_size,
                             phase=current_stage,
-                            details={"grade": opp.get("grade_label")},
+                            details={
+                                "grade": opp.get("grade_label"),
+                                "paper_sizing": sizing_decision,
+                            },
                         )
                     journal({
                         "action": "trade_rejected",
@@ -788,6 +810,17 @@ def run_cycle(state):
                     try:
                         w_id = db.save_weather_signal(w_opp)
                         trade_size = size_usd if level != "book" else 20
+                        sizing_decision = paper_sizing.build_paper_sizing_decision(
+                            "weather",
+                            w_opp,
+                            baseline_size_usd=trade_size,
+                            account_overview=db.get_paper_account_overview(refresh_unrealized=False),
+                            mode="paper",
+                            source="autonomy",
+                            weather_signal_id=w_id,
+                        )
+                        paper_sizing.record_sizing_decision(sizing_decision)
+                        trade_size = sizing_decision["selected_size_usd"]
                         decision = db.inspect_weather_trade_open(
                             w_id,
                             size_usd=trade_size,
@@ -805,6 +838,7 @@ def run_cycle(state):
                                 token_id=decision.get("entry_token"),
                                 size_usd=trade_size,
                                 phase=current_stage,
+                                details={"paper_sizing": sizing_decision},
                             )
                             journal({
                                 "action": "skip_trade",
@@ -828,6 +862,7 @@ def run_cycle(state):
                                 token_id=decision.get("entry_token"),
                                 size_usd=trade_size,
                                 phase=current_stage,
+                                details={"paper_sizing": sizing_decision},
                             )
                             weather_traded += 1
                             journal({
@@ -839,6 +874,8 @@ def run_cycle(state):
                                 "trade_type": "weather",
                                 "event": w_opp.get("event", w_opp.get("market", ""))[:60],
                                 "size_usd": trade_size,
+                                "paper_sizing_policy": sizing_decision.get("selected_policy"),
+                                "paper_confidence_size_usd": sizing_decision.get("confidence_size_usd"),
                                 "reason": f"Weather edge {w_opp.get('combined_edge_pct', 0):+.1f}%",
                             })
                     except Exception as e:
