@@ -104,6 +104,9 @@ class PaperSizingTests(unittest.TestCase):
         self.assertEqual(decision["selected_size_usd"], 20.0)
         self.assertGreater(decision["confidence_size_usd"], 20.0)
         self.assertEqual(decision["review_note_path"], "reviews/2026-04-02-paper-sizing-rollout-review.md")
+        self.assertIn("shadow_rollout", decision["activation_status"]["blocker_codes"])
+        self.assertIn("signal_admission_not_acknowledged", decision["activation_status"]["blocker_codes"])
+        self.assertIn("trade_state_not_acknowledged", decision["activation_status"]["blocker_codes"])
 
         row_id = self.paper_sizing.record_sizing_decision(decision)
         self.assertGreater(row_id, 0)
@@ -115,7 +118,7 @@ class PaperSizingTests(unittest.TestCase):
         self.assertEqual(summary["strategies"][0]["strategy"], "cointegration")
         self.assertEqual(summary["strategies"][0]["avg_selected_size_usd"], 20.0)
 
-    def test_live_mode_rolls_back_to_fixed_and_api_exposes_recent_sizing(self):
+    def test_confidence_policy_stays_blocked_until_review_and_readiness_are_acknowledged(self):
         self.db.set_paper_starting_bankroll(500)
         self.paper_sizing.set_sizing_settings({
             "rollout_state": "active",
@@ -132,7 +135,29 @@ class PaperSizingTests(unittest.TestCase):
         )
         self.assertEqual(live_decision["selected_policy"], "fixed")
         self.assertFalse(live_decision["applied"])
+        self.assertIn("paper_only_mode", live_decision["activation_status"]["blocker_codes"])
 
+        paper_decision = self.paper_sizing.build_paper_sizing_decision(
+            "weather",
+            _weather_signal(),
+            baseline_size_usd=20,
+            mode="paper",
+            source="autonomy",
+            weather_signal_id=21,
+        )
+        self.assertEqual(paper_decision["selected_policy"], "fixed")
+        self.assertFalse(paper_decision["applied"])
+        self.assertIn("signal_admission_not_acknowledged", paper_decision["activation_status"]["blocker_codes"])
+        self.assertIn("trade_state_not_acknowledged", paper_decision["activation_status"]["blocker_codes"])
+
+        self.paper_sizing.set_sizing_settings({
+            "activation_requirements": {
+                "readiness": {
+                    "signal_admission_stable": True,
+                    "trade_state_accounting_stable": True,
+                },
+            },
+        })
         paper_decision = self.paper_sizing.build_paper_sizing_decision(
             "weather",
             _weather_signal(),
@@ -150,9 +175,37 @@ class PaperSizingTests(unittest.TestCase):
         body = response.json()
 
         self.assertEqual(body["settings"]["active_policy"], "confidence_aware")
+        self.assertTrue(body["settings"]["paper_gate"]["can_apply_confidence"])
         self.assertEqual(body["summary"]["recent_count"], 1)
         self.assertEqual(body["summary"]["applied_decisions"], 1)
         self.assertEqual(body["decisions"][0]["strategy"], "weather")
+
+    def test_missing_review_note_blocks_confidence_rollout_even_when_readiness_is_acknowledged(self):
+        self.db.set_paper_starting_bankroll(1000)
+        self.paper_sizing.set_sizing_settings({
+            "rollout_state": "active",
+            "active_policy": "confidence_aware",
+            "review_note_path": "reviews/does-not-exist.md",
+            "activation_requirements": {
+                "readiness": {
+                    "signal_admission_stable": True,
+                    "trade_state_accounting_stable": True,
+                },
+            },
+        })
+
+        decision = self.paper_sizing.build_paper_sizing_decision(
+            "cointegration",
+            _cointegration_signal(),
+            baseline_size_usd=20,
+            mode="paper",
+            source="autonomy",
+            signal_id=11,
+        )
+
+        self.assertEqual(decision["selected_policy"], "fixed")
+        self.assertFalse(decision["applied"])
+        self.assertIn("review_note_missing", decision["activation_status"]["blocker_codes"])
 
 
 if __name__ == "__main__":

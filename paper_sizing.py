@@ -16,6 +16,14 @@ DEFAULT_SETTINGS = {
     "rollout_state": "shadow",
     "active_policy": "fixed",
     "review_note_path": DEFAULT_REVIEW_NOTE,
+    "activation_requirements": {
+        "require_review_note": True,
+        "require_operator_readiness_ack": True,
+        "readiness": {
+            "signal_admission_stable": False,
+            "trade_state_accounting_stable": False,
+        },
+    },
     "rollback": {
         "default_policy": "fixed",
         "disable_confidence_policy": True,
@@ -100,7 +108,7 @@ def _normalize_strategy_settings(name: str, settings: dict) -> dict:
     return strategy
 
 
-def get_sizing_settings() -> dict:
+def get_sizing_settings(*, include_gate_status: bool = True) -> dict:
     raw = db.get_setting(SETTING_KEY, default=None) or {}
     settings = _deep_merge(DEFAULT_SETTINGS, raw)
     settings["enabled"] = bool(settings.get("enabled", True))
@@ -108,6 +116,14 @@ def get_sizing_settings() -> dict:
     settings["rollout_state"] = str(settings.get("rollout_state", "shadow") or "shadow")
     settings["active_policy"] = str(settings.get("active_policy", "fixed") or "fixed")
     settings["review_note_path"] = str(settings.get("review_note_path", DEFAULT_REVIEW_NOTE) or DEFAULT_REVIEW_NOTE)
+    activation = settings["activation_requirements"]
+    activation["require_review_note"] = bool(activation.get("require_review_note", True))
+    activation["require_operator_readiness_ack"] = bool(activation.get("require_operator_readiness_ack", True))
+    readiness = activation.get("readiness") or {}
+    activation["readiness"] = {
+        "signal_admission_stable": bool(readiness.get("signal_admission_stable", False)),
+        "trade_state_accounting_stable": bool(readiness.get("trade_state_accounting_stable", False)),
+    }
     settings["constraints"]["max_total_bankroll_utilization_pct"] = max(
         1.0,
         float(settings["constraints"].get("max_total_bankroll_utilization_pct", 35.0) or 35.0),
@@ -119,6 +135,9 @@ def get_sizing_settings() -> dict:
     for name in list(settings.get("strategies", {})):
         _normalize_strategy_settings(name, settings)
     settings["review_note_exists"] = Path(settings["review_note_path"]).exists()
+    if include_gate_status:
+        settings["paper_gate"] = get_activation_status(settings=settings, mode="paper")
+        settings["live_gate"] = get_activation_status(settings=settings, mode="live")
     settings["setting_key"] = SETTING_KEY
     return settings
 
@@ -126,6 +145,8 @@ def get_sizing_settings() -> dict:
 def set_sizing_settings(updates: dict | None) -> dict:
     merged = _deep_merge(get_sizing_settings(), updates or {})
     merged.pop("review_note_exists", None)
+    merged.pop("paper_gate", None)
+    merged.pop("live_gate", None)
     merged.pop("setting_key", None)
     db.set_setting(SETTING_KEY, merged)
     return get_sizing_settings()
@@ -205,6 +226,59 @@ def _score_strategy(strategy: str, opportunity: dict, strategy_settings: dict) -
     return _cointegration_score(opportunity, strategy_settings)
 
 
+def get_activation_status(*, settings: dict | None = None, mode: str = "paper") -> dict:
+    settings = settings or get_sizing_settings(include_gate_status=False)
+    blockers = []
+    activation = settings.get("activation_requirements") or {}
+    readiness = activation.get("readiness") or {}
+    default_policy = settings["rollback"]["default_policy"]
+    requested_policy = settings.get("active_policy") or default_policy
+
+    if not settings.get("enabled", True):
+        blockers.append({
+            "code": "framework_disabled",
+            "reason": "Paper sizing framework is disabled.",
+        })
+    if settings.get("paper_only") and mode != "paper":
+        blockers.append({
+            "code": "paper_only_mode",
+            "reason": f"Confidence-aware sizing is blocked outside paper mode ({mode}).",
+        })
+    if settings.get("rollout_state") == "shadow":
+        blockers.append({
+            "code": "shadow_rollout",
+            "reason": "Rollout remains in shadow mode, so execution stays on fixed sizing.",
+        })
+    if activation.get("require_review_note", True) and not settings.get("review_note_exists"):
+        blockers.append({
+            "code": "review_note_missing",
+            "reason": f"Review note missing at {settings.get('review_note_path')}.",
+        })
+    if activation.get("require_operator_readiness_ack", True) and not readiness.get("signal_admission_stable"):
+        blockers.append({
+            "code": "signal_admission_not_acknowledged",
+            "reason": "Signal-admission stability has not been explicitly acknowledged.",
+        })
+    if activation.get("require_operator_readiness_ack", True) and not readiness.get("trade_state_accounting_stable"):
+        blockers.append({
+            "code": "trade_state_not_acknowledged",
+            "reason": "Trade-state/accounting stability has not been explicitly acknowledged.",
+        })
+
+    confidence_requested = requested_policy == "confidence_aware"
+    can_apply_confidence = confidence_requested and not blockers
+    selected_policy = requested_policy if can_apply_confidence else default_policy
+    return {
+        "mode": mode,
+        "requested_policy": requested_policy,
+        "selected_policy": selected_policy,
+        "can_apply_confidence": can_apply_confidence,
+        "ready_for_confidence": not blockers,
+        "blockers": blockers,
+        "blocker_codes": [item["code"] for item in blockers],
+    }
+
+
 def build_paper_sizing_decision(
     strategy: str,
     opportunity: dict,
@@ -277,13 +351,8 @@ def build_paper_sizing_decision(
         ],
     }
 
-    selected_policy = settings["active_policy"]
-    if mode != "paper" and settings["paper_only"]:
-        selected_policy = settings["rollback"]["default_policy"]
-    if not settings["enabled"]:
-        selected_policy = settings["rollback"]["default_policy"]
-    if settings["rollout_state"] == "shadow":
-        selected_policy = "fixed"
+    activation_status = get_activation_status(settings=settings, mode=mode)
+    selected_policy = activation_status["selected_policy"]
 
     selected_size = baseline_size if selected_policy == "fixed" else capped_confidence_size
     projected_total_util = (
@@ -330,7 +399,8 @@ def build_paper_sizing_decision(
         "review_note_path": settings["review_note_path"],
         "review_note_exists": bool(settings.get("review_note_exists")),
         "rollback_policy": settings["rollback"]["default_policy"],
-        "compare_only": settings["rollout_state"] == "shadow",
+        "compare_only": bool(settings["rollout_state"] == "shadow" or not activation_status["can_apply_confidence"]),
+        "activation_status": activation_status,
     }
 
 
@@ -368,6 +438,7 @@ def record_sizing_decision(decision: dict) -> int:
                 "review_note_path": decision.get("review_note_path"),
                 "compare_only": decision.get("compare_only"),
                 "rollback_policy": decision.get("rollback_policy"),
+                "activation_status": decision.get("activation_status"),
             },
         )
     except Exception as exc:
