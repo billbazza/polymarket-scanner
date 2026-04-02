@@ -122,6 +122,9 @@ curl http://localhost:8899/api/signals?limit=5
 # Brain-validate a signal
 curl -X POST http://localhost:8899/api/brain/validate/42
 
+# Check staged brain-provider runtime / cutover readiness
+curl http://localhost:8899/api/brain/runtime
+
 # Open paper trade (pairs)
 curl -X POST "http://localhost:8899/api/trades?signal_id=42&size_usd=100"
 
@@ -150,6 +153,7 @@ All in `.env` (see `.env.example`):
 - `BRAIN_PROVIDER` — `auto` prefers Anthropic while credits remain, then falls forward to OpenAI; `anthropic` or `openai` pins the provider
 - `ANTHROPIC_API_KEY` — enables Anthropic as the current/default brain provider
 - `OPENAI_API_KEY` — enables OpenAI/Codex as warm standby or cutover provider for brain.py
+- `OPENAI_BASE_URL` — optional OpenAI-compatible base URL override for Codex/OpenAI testing or cutover
 - `BRAIN_ANTHROPIC_MODEL` / `BRAIN_ANTHROPIC_COMPLEX_MODEL` — optional Anthropic model overrides for `brain.py`
 - `BRAIN_OPENAI_MODEL` / `BRAIN_OPENAI_COMPLEX_MODEL` — optional OpenAI model overrides for `brain.py`
 - `TELEGRAM_BOT_TOKEN` + `TELEGRAM_CHAT_ID` — enables Telegram alerts

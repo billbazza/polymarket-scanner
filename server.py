@@ -1069,6 +1069,16 @@ async def brain_validate(signal_id: int):
     raise HTTPException(404, "Signal not found")
 
 
+@app.get("/api/brain/runtime")
+async def brain_runtime():
+    """Return current brain-provider runtime status for safe migration checks."""
+    try:
+        return brain.get_runtime_status()
+    except Exception as e:
+        log.error("Failed to fetch brain runtime status: %s", e)
+        return JSONResponse(status_code=500, content={"ok": False, "error": str(e)})
+
+
 @app.post("/api/brain/whale/{alert_id}")
 async def brain_validate_whale(alert_id: int):
     """Ask the configured AI provider to analyze a whale alert for trading opportunities."""

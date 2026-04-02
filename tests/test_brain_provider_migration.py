@@ -10,6 +10,8 @@ class BrainProviderMigrationTests(unittest.TestCase):
             "ANTHROPIC_API_KEY": os.environ.get("ANTHROPIC_API_KEY"),
             "OPENAI_API_KEY": os.environ.get("OPENAI_API_KEY"),
             "BRAIN_PROVIDER": os.environ.get("BRAIN_PROVIDER"),
+            "BRAIN_OPENAI_MODEL": os.environ.get("BRAIN_OPENAI_MODEL"),
+            "OPENAI_BASE_URL": os.environ.get("OPENAI_BASE_URL"),
         }
 
         import brain
@@ -87,6 +89,56 @@ class BrainProviderMigrationTests(unittest.TestCase):
 
         self.assertEqual(response["provider"], brain.PROVIDER_OPENAI)
         self.assertEqual(response["model"], "gpt-5-mini")
+
+    def test_model_aliases_are_resolved_from_runtime_env(self):
+        os.environ["OPENAI_API_KEY"] = "openai-test"
+        os.environ["BRAIN_PROVIDER"] = "openai"
+        os.environ["BRAIN_OPENAI_MODEL"] = "gpt-5-custom-cutover"
+
+        brain = importlib.reload(self.brain)
+
+        self.assertEqual(
+            brain._resolve_model_candidates(brain.PROVIDER_OPENAI, brain.DEFAULT_MODEL),
+            ["gpt-5-custom-cutover"],
+        )
+
+    def test_runtime_status_reports_cutover_readiness(self):
+        os.environ["ANTHROPIC_API_KEY"] = "ant-test"
+        os.environ["OPENAI_API_KEY"] = "openai-test"
+        os.environ["BRAIN_PROVIDER"] = "auto"
+        os.environ["OPENAI_BASE_URL"] = "https://api.openai.com/v1"
+
+        brain = importlib.reload(self.brain)
+
+        with mock.patch.object(brain, "_get_provider_client", side_effect=lambda provider: object()):
+            status = brain.get_runtime_status()
+
+        self.assertEqual(status["mode"], brain.PROVIDER_AUTO)
+        self.assertEqual(
+            status["configured_order"],
+            [brain.PROVIDER_ANTHROPIC, brain.PROVIDER_OPENAI],
+        )
+        self.assertEqual(
+            status["client_ready_order"],
+            [brain.PROVIDER_ANTHROPIC, brain.PROVIDER_OPENAI],
+        )
+        self.assertTrue(status["fallback_enabled"])
+        self.assertEqual(
+            status["providers"][brain.PROVIDER_OPENAI]["base_url"],
+            "https://api.openai.com/v1",
+        )
+
+    def test_pinned_provider_with_missing_key_keeps_graceful_degradation(self):
+        os.environ.pop("OPENAI_API_KEY", None)
+        os.environ["ANTHROPIC_API_KEY"] = "ant-test"
+        os.environ["BRAIN_PROVIDER"] = "openai"
+
+        brain = importlib.reload(self.brain)
+
+        self.assertEqual(brain._available_provider_order(), [])
+        should_trade, reasoning = brain.validate_signal({"event": "Pinned provider missing"})
+        self.assertTrue(should_trade)
+        self.assertIn("defaulting to statistical signal", reasoning)
 
 
 if __name__ == "__main__":

@@ -7,7 +7,9 @@
 ## Behavior Changes
 - Added `BRAIN_PROVIDER=auto|anthropic|openai`.
 - Added OpenAI standby/cutover support via `OPENAI_API_KEY`.
+- Added optional `OPENAI_BASE_URL` override plus a read-only `/api/brain/runtime` endpoint so operators can confirm cutover readiness without changing trading behavior.
 - Added provider-specific model override env vars for default and complex brain tasks.
+- Changed `brain.py` model alias resolution to read env config at call time, so provider/model cutover settings are reversible after deploy instead of being frozen at import.
 - Updated operator-facing docs and UI copy from Claude-specific wording to provider-neutral brain wording.
 
 ## Safety Notes
@@ -17,3 +19,4 @@
 
 ## Verification
 - Added regression tests covering provider ordering, no-provider graceful degradation, and Anthropic-to-OpenAI fallback on credit/quota-style errors.
+- Added regression tests for runtime model override selection, runtime-status reporting, and pinned-provider graceful degradation when the selected provider is not configured.

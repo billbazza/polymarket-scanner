@@ -22,16 +22,47 @@ PROVIDER_AUTO = "auto"
 DEFAULT_MODEL = "default"
 OPUS_MODEL = "complex"
 
-MODEL_ALIASES = {
+DEFAULT_MODEL_ALIASES = {
     DEFAULT_MODEL: {
-        PROVIDER_ANTHROPIC: os.environ.get("BRAIN_ANTHROPIC_MODEL", "claude-haiku-4-5-20251001"),
-        PROVIDER_OPENAI: os.environ.get("BRAIN_OPENAI_MODEL", "gpt-5-mini"),
+        PROVIDER_ANTHROPIC: "claude-haiku-4-5-20251001",
+        PROVIDER_OPENAI: "gpt-5-mini",
     },
     OPUS_MODEL: {
-        PROVIDER_ANTHROPIC: os.environ.get("BRAIN_ANTHROPIC_COMPLEX_MODEL", "claude-opus-4-1-20250805"),
-        PROVIDER_OPENAI: os.environ.get("BRAIN_OPENAI_COMPLEX_MODEL", "gpt-5"),
+        PROVIDER_ANTHROPIC: "claude-opus-4-1-20250805",
+        PROVIDER_OPENAI: "gpt-5",
     },
 }
+
+
+def _env_value(name: str) -> str:
+    """Read an env var once and normalize surrounding whitespace."""
+    return (os.environ.get(name) or "").strip()
+
+
+def _model_aliases() -> dict[str, dict[str, str]]:
+    """Resolve model aliases at call time so cutover config is reversible."""
+    return {
+        DEFAULT_MODEL: {
+            PROVIDER_ANTHROPIC: _env_value("BRAIN_ANTHROPIC_MODEL") or DEFAULT_MODEL_ALIASES[DEFAULT_MODEL][PROVIDER_ANTHROPIC],
+            PROVIDER_OPENAI: _env_value("BRAIN_OPENAI_MODEL") or DEFAULT_MODEL_ALIASES[DEFAULT_MODEL][PROVIDER_OPENAI],
+        },
+        OPUS_MODEL: {
+            PROVIDER_ANTHROPIC: _env_value("BRAIN_ANTHROPIC_COMPLEX_MODEL") or DEFAULT_MODEL_ALIASES[OPUS_MODEL][PROVIDER_ANTHROPIC],
+            PROVIDER_OPENAI: _env_value("BRAIN_OPENAI_COMPLEX_MODEL") or DEFAULT_MODEL_ALIASES[OPUS_MODEL][PROVIDER_OPENAI],
+        },
+    }
+
+
+def _provider_api_key_name(provider: str) -> str:
+    if provider == PROVIDER_ANTHROPIC:
+        return "ANTHROPIC_API_KEY"
+    if provider == PROVIDER_OPENAI:
+        return "OPENAI_API_KEY"
+    raise ValueError(f"Unknown provider {provider}")
+
+
+def _provider_is_configured(provider: str) -> bool:
+    return bool(_env_value(_provider_api_key_name(provider)))
 
 
 def _load_prompt():
@@ -51,7 +82,7 @@ def _build_prompt(question, price, context=""):
 
 def _brain_provider():
     """Configured provider preference."""
-    provider = (os.environ.get("BRAIN_PROVIDER") or PROVIDER_AUTO).strip().lower()
+    provider = (_env_value("BRAIN_PROVIDER") or PROVIDER_AUTO).lower()
     if provider not in {PROVIDER_AUTO, PROVIDER_ANTHROPIC, PROVIDER_OPENAI}:
         log.warning("Unknown BRAIN_PROVIDER=%s — falling back to auto", provider)
         return PROVIDER_AUTO
@@ -61,8 +92,8 @@ def _brain_provider():
 def _available_provider_order():
     """Provider order honoring staged migration and configured keys."""
     provider = _brain_provider()
-    has_anthropic = bool(os.environ.get("ANTHROPIC_API_KEY"))
-    has_openai = bool(os.environ.get("OPENAI_API_KEY"))
+    has_anthropic = _provider_is_configured(PROVIDER_ANTHROPIC)
+    has_openai = _provider_is_configured(PROVIDER_OPENAI)
 
     if provider == PROVIDER_ANTHROPIC:
         return [PROVIDER_ANTHROPIC] if has_anthropic else []
@@ -79,7 +110,7 @@ def _available_provider_order():
 
 def _get_anthropic_client():
     """Get Anthropic client. Returns None if unavailable."""
-    api_key = os.environ.get("ANTHROPIC_API_KEY")
+    api_key = _env_value("ANTHROPIC_API_KEY")
     if not api_key:
         return None
     try:
@@ -92,12 +123,12 @@ def _get_anthropic_client():
 
 def _get_openai_client():
     """Get OpenAI client. Returns None if unavailable."""
-    api_key = os.environ.get("OPENAI_API_KEY")
+    api_key = _env_value("OPENAI_API_KEY")
     if not api_key:
         return None
     try:
         from openai import OpenAI
-        base_url = os.environ.get("OPENAI_BASE_URL")
+        base_url = _env_value("OPENAI_BASE_URL")
         kwargs = {"api_key": api_key}
         if base_url:
             kwargs["base_url"] = base_url
@@ -107,18 +138,63 @@ def _get_openai_client():
         return None
 
 
+def _get_provider_client(provider: str):
+    """Get client for a single provider."""
+    if provider == PROVIDER_ANTHROPIC:
+        return _get_anthropic_client()
+    if provider == PROVIDER_OPENAI:
+        return _get_openai_client()
+    raise ValueError(f"Unknown provider {provider}")
+
+
+def get_runtime_status() -> dict:
+    """Return provider/runtime status for reversible operator cutover."""
+    aliases = _model_aliases()
+    configured_order = _available_provider_order()
+    client_ready_order = []
+    for provider in configured_order:
+        if _get_provider_client(provider):
+            client_ready_order.append(provider)
+
+    status = {
+        "mode": _brain_provider(),
+        "configured_order": configured_order,
+        "client_ready_order": client_ready_order,
+        "fallback_enabled": _brain_provider() == PROVIDER_AUTO and len(configured_order) > 1,
+        "brain_enabled": bool(client_ready_order),
+        "providers": {
+            PROVIDER_ANTHROPIC: {
+                "configured": _provider_is_configured(PROVIDER_ANTHROPIC),
+                "default_model": aliases[DEFAULT_MODEL][PROVIDER_ANTHROPIC],
+                "complex_model": aliases[OPUS_MODEL][PROVIDER_ANTHROPIC],
+            },
+            PROVIDER_OPENAI: {
+                "configured": _provider_is_configured(PROVIDER_OPENAI),
+                "default_model": aliases[DEFAULT_MODEL][PROVIDER_OPENAI],
+                "complex_model": aliases[OPUS_MODEL][PROVIDER_OPENAI],
+                "base_url": _env_value("OPENAI_BASE_URL") or None,
+            },
+        },
+    }
+    return status
+
+
 def _get_client_candidates():
     """Get configured brain clients in preference order."""
     clients = []
     for provider in _available_provider_order():
-        if provider == PROVIDER_ANTHROPIC:
-            client = _get_anthropic_client()
-        else:
-            client = _get_openai_client()
+        client = _get_provider_client(provider)
         if client:
             clients.append({"provider": provider, "client": client})
     if not clients:
-        log.warning("No brain provider configured — brain disabled")
+        status = get_runtime_status()
+        if status["mode"] != PROVIDER_AUTO and not status["providers"][status["mode"]]["configured"]:
+            log.warning("Brain provider %s selected but API key is missing — brain disabled", status["mode"])
+        elif status["configured_order"]:
+            log.warning("Brain provider clients unavailable for configured providers %s — brain disabled",
+                        ",".join(status["configured_order"]))
+        else:
+            log.warning("No brain provider configured — brain disabled")
     return clients
 
 
@@ -136,7 +212,7 @@ def _normalise_text_response(text: str) -> str:
 
 def _resolve_model_candidates(provider: str, requested_model: str | None) -> list[str]:
     """Resolve provider-specific models for an alias or explicit name."""
-    aliases = MODEL_ALIASES
+    aliases = _model_aliases()
     default_model = aliases[DEFAULT_MODEL][provider]
     if not requested_model:
         requested_model = DEFAULT_MODEL
