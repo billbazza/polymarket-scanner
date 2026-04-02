@@ -6,8 +6,8 @@ Strategy:
   3. Collect wallets with human names and meaningful trade sizes.
   4. Skip already-watched wallets.
   5. Score each candidate (wallet_monitor.score_wallet).
-  6. Ask Claude for a recommendation (brain.recommend_wallet).
-  7. Auto-add wallets that score ≥ AUTO_ADD_SCORE and Claude says "copy".
+  6. Ask the brain for a recommendation (`brain.recommend_wallet`).
+  7. Auto-add wallets that score ≥ AUTO_ADD_SCORE and the brain says "copy".
   8. Save others as pending candidates for manual review.
 
 Can be triggered via API, called from the autonomy loop, or run standalone.
@@ -33,7 +33,7 @@ DATA_API     = "https://data-api.polymarket.com"
 TRADES_PER_MKT  = 500    # trades to fetch per market
 MIN_TRADE_SIZE  = 200    # USD — ignore small trades when sampling
 MIN_MKTS_SEEN   = 1      # wallet must appear in ≥ N markets to be considered
-AUTO_ADD_SCORE  = 65     # auto-add if score ≥ this AND Claude says "copy"
+AUTO_ADD_SCORE  = 65     # auto-add if score ≥ this AND the brain says "copy"
 MAX_CANDIDATES  = 40     # max wallets to score per run
 
 # Hard noise patterns — any match = skip market
@@ -187,7 +187,7 @@ def run_discovery(
     """
     Run a full discovery cycle. Returns summary dict.
 
-    auto_add=True: wallets scoring >= AUTO_ADD_SCORE with Claude verdict 'copy'
+    auto_add=True: wallets scoring >= AUTO_ADD_SCORE with brain verdict 'copy'
                    are automatically added to the watch list.
     """
     t0 = time.time()
@@ -245,7 +245,7 @@ def run_discovery(
              len(candidates_raw), MIN_MKTS_SEEN)
 
     # ── Step 2b: pre-filter by portfolio value — skip wallets with < $1K ──────
-    # This eliminates small traders without burning Claude tokens on full scoring.
+    # This eliminates small traders without burning provider tokens on full scoring.
     PORTFOLIO_MIN = 1000
     qualified = []
     for addr, d in candidates_raw[:MAX_CANDIDATES * 2]:
@@ -281,7 +281,7 @@ def run_discovery(
         score = score_result.get("score", 0)
         cls   = score_result.get("classification", "unknown")
 
-        # Skip clear failures early — don't burn Claude tokens
+        # Skip clear failures early — don't burn provider tokens
         if cls in ("bot", "insufficient_data", "no_data") or score < 35:
             log.info("Discovery: skip %s — %s score=%.0f", label, cls, score)
             dismissed += 1
@@ -320,7 +320,7 @@ def run_discovery(
             "source_markets": d["market_titles"][:5],
         }
 
-        # Auto-add high scorers with Claude's blessing
+        # Auto-add high scorers with AI confirmation
         verdict = (ai_result or {}).get("verdict")
         if auto_add and score >= AUTO_ADD_SCORE and verdict == "copy":
             row_id = db.add_watched_wallet(addr, label, added_by="auto_discovery")

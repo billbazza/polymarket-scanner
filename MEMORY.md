@@ -10,7 +10,7 @@
 
 - **Max 15 markets per event** — Events with 100+ markets (sports, elections) create O(n^2) pair explosion. Cap at 15 to keep scan times reasonable.
 
-- **Claude Haiku for brain, not Sonnet** — Cost efficiency. At ~$0.001 per question, a full scan batch costs ~$0.02. Sonnet would be 10x more for marginal accuracy gain on probability estimation.
+- **Brain defaults should stay cost-aware** — the lightweight/default brain model should remain the cheap path for routine probability estimation, with the complex model reserved for heavier analysis like daily reports.
 
 - **Single-page dashboard** — All HTML/CSS/JS in one file. No build step, no npm, no React. Serves directly from FastAPI. Trade-off: harder to maintain at scale, but zero deployment complexity.
 

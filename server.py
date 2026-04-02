@@ -870,7 +870,7 @@ async def run_near_certainty_scan(
     """Scan for near-certain YES markets (85–99¢) with calibration edge.
 
     Calibrated data shows YES at 90¢ wins 91.5% (not 90%), giving a structural
-    1.5pp edge. Brain validation via Claude filters out cases where doubt is
+    1.5pp edge. Brain validation via the configured AI provider filters out cases where doubt is
     legitimate. Net EV is positive even after 2% taker fee.
     """
     import near_certainty_scanner
@@ -1042,11 +1042,11 @@ async def dismiss_whale(alert_id: int):
     return {"ok": True, "id": alert_id}
 
 
-# --- Brain (Claude AI) ---
+# --- Brain (AI provider) ---
 
 @app.post("/api/brain/validate/{signal_id}")
 async def brain_validate(signal_id: int):
-    """Ask Claude to validate a signal before trading."""
+    """Ask the configured AI provider to validate a signal before trading."""
     for s in db.get_signals(limit=500):
         if s["id"] == signal_id:
             should_trade, reasoning = brain.validate_signal(s)
@@ -1060,7 +1060,7 @@ async def brain_validate(signal_id: int):
 
 @app.post("/api/brain/whale/{alert_id}")
 async def brain_validate_whale(alert_id: int):
-    """Ask Claude to analyze a whale alert for trading opportunities."""
+    """Ask the configured AI provider to analyze a whale alert for trading opportunities."""
     alert = db.get_whale_alert_by_id(alert_id)
     if not alert:
         raise HTTPException(404, "Whale alert not found")
@@ -1657,7 +1657,7 @@ async def get_watchlist():
 
 @app.post("/api/copy/score")
 async def score_wallet_endpoint(address: str, label: str = ""):
-    """Score a wallet address and get Claude's recommendation."""
+    """Score a wallet address and get the brain recommendation."""
     import wallet_monitor
     import brain
     label = label or address[:16] + "..."

@@ -1,7 +1,10 @@
-"""Claude AI brain — probability estimation for market signals.
+"""AI brain — probability estimation and optional validation for market signals.
 
-Uses Haiku for cost efficiency (~$0.003 per signal batch).
-Processes signals in batches to minimize API calls.
+Supports staged provider migration:
+- Anthropic remains the preferred backend while `ANTHROPIC_API_KEY` works.
+- OpenAI can be configured as a warm standby via `OPENAI_API_KEY`.
+- `BRAIN_PROVIDER=auto` falls forward to OpenAI when Anthropic is unavailable
+  or exhausted, preserving operational continuity.
 """
 import json
 import logging
@@ -12,9 +15,23 @@ log = logging.getLogger("scanner.brain")
 
 PROMPTS_DIR = Path(__file__).parent / "prompts"
 PROMPT_VERSION = "v1"
-DEFAULT_MODEL = "claude-haiku-4-5-20251001"
-OPUS_MODEL = "claude-opus-4-1-20250805"
-MODEL_FALLBACKS = (DEFAULT_MODEL,)
+PROVIDER_ANTHROPIC = "anthropic"
+PROVIDER_OPENAI = "openai"
+PROVIDER_AUTO = "auto"
+
+DEFAULT_MODEL = "default"
+OPUS_MODEL = "complex"
+
+MODEL_ALIASES = {
+    DEFAULT_MODEL: {
+        PROVIDER_ANTHROPIC: os.environ.get("BRAIN_ANTHROPIC_MODEL", "claude-haiku-4-5-20251001"),
+        PROVIDER_OPENAI: os.environ.get("BRAIN_OPENAI_MODEL", "gpt-5-mini"),
+    },
+    OPUS_MODEL: {
+        PROVIDER_ANTHROPIC: os.environ.get("BRAIN_ANTHROPIC_COMPLEX_MODEL", "claude-opus-4-1-20250805"),
+        PROVIDER_OPENAI: os.environ.get("BRAIN_OPENAI_COMPLEX_MODEL", "gpt-5"),
+    },
+}
 
 
 def _load_prompt():
@@ -32,18 +49,77 @@ def _build_prompt(question, price, context=""):
             .replace("{{context}}", context or "No additional context"))
 
 
-def _get_client():
-    """Get Anthropic client. Returns None if no API key."""
+def _brain_provider():
+    """Configured provider preference."""
+    provider = (os.environ.get("BRAIN_PROVIDER") or PROVIDER_AUTO).strip().lower()
+    if provider not in {PROVIDER_AUTO, PROVIDER_ANTHROPIC, PROVIDER_OPENAI}:
+        log.warning("Unknown BRAIN_PROVIDER=%s — falling back to auto", provider)
+        return PROVIDER_AUTO
+    return provider
+
+
+def _available_provider_order():
+    """Provider order honoring staged migration and configured keys."""
+    provider = _brain_provider()
+    has_anthropic = bool(os.environ.get("ANTHROPIC_API_KEY"))
+    has_openai = bool(os.environ.get("OPENAI_API_KEY"))
+
+    if provider == PROVIDER_ANTHROPIC:
+        return [PROVIDER_ANTHROPIC] if has_anthropic else []
+    if provider == PROVIDER_OPENAI:
+        return [PROVIDER_OPENAI] if has_openai else []
+
+    order = []
+    if has_anthropic:
+        order.append(PROVIDER_ANTHROPIC)
+    if has_openai:
+        order.append(PROVIDER_OPENAI)
+    return order
+
+
+def _get_anthropic_client():
+    """Get Anthropic client. Returns None if unavailable."""
     api_key = os.environ.get("ANTHROPIC_API_KEY")
     if not api_key:
-        log.warning("No ANTHROPIC_API_KEY set — brain disabled")
         return None
     try:
         import anthropic
         return anthropic.Anthropic(api_key=api_key)
     except ImportError:
-        log.warning("anthropic package not installed — run: pip install anthropic")
+        log.warning("anthropic package not installed — Anthropic brain disabled")
         return None
+
+
+def _get_openai_client():
+    """Get OpenAI client. Returns None if unavailable."""
+    api_key = os.environ.get("OPENAI_API_KEY")
+    if not api_key:
+        return None
+    try:
+        from openai import OpenAI
+        base_url = os.environ.get("OPENAI_BASE_URL")
+        kwargs = {"api_key": api_key}
+        if base_url:
+            kwargs["base_url"] = base_url
+        return OpenAI(**kwargs)
+    except ImportError:
+        log.warning("openai package not installed — OpenAI brain disabled")
+        return None
+
+
+def _get_client_candidates():
+    """Get configured brain clients in preference order."""
+    clients = []
+    for provider in _available_provider_order():
+        if provider == PROVIDER_ANTHROPIC:
+            client = _get_anthropic_client()
+        else:
+            client = _get_openai_client()
+        if client:
+            clients.append({"provider": provider, "client": client})
+    if not clients:
+        log.warning("No brain provider configured — brain disabled")
+    return clients
 
 
 def _normalise_text_response(text: str) -> str:
@@ -58,10 +134,85 @@ def _normalise_text_response(text: str) -> str:
     return text.strip()
 
 
-def _message_text(client, prompt: str, model: str, max_tokens: int) -> str:
-    """Call Anthropic and retry with a known-good fallback model if needed."""
+def _resolve_model_candidates(provider: str, requested_model: str | None) -> list[str]:
+    """Resolve provider-specific models for an alias or explicit name."""
+    aliases = MODEL_ALIASES
+    default_model = aliases[DEFAULT_MODEL][provider]
+    if not requested_model:
+        requested_model = DEFAULT_MODEL
+
+    if requested_model in aliases:
+        model = aliases[requested_model][provider]
+        return [model]
+
+    if requested_model == default_model:
+        return [requested_model]
+
+    return [requested_model, default_model]
+
+
+def _anthropic_should_fallback(exc: Exception) -> bool:
+    message = str(exc).lower()
+    fallback_markers = (
+        "credit",
+        "quota",
+        "billing",
+        "not_found_error",
+        "rate limit",
+        "429",
+        "401",
+        "authentication",
+        "model:",
+    )
+    return any(marker in message for marker in fallback_markers)
+
+
+def _openai_should_fallback(exc: Exception) -> bool:
+    message = str(exc).lower()
+    fallback_markers = (
+        "credit",
+        "quota",
+        "billing",
+        "rate limit",
+        "429",
+        "401",
+        "authentication",
+        "model",
+    )
+    return any(marker in message for marker in fallback_markers)
+
+
+def _extract_openai_text(response) -> str:
+    """Normalize OpenAI response text across client variants."""
+    output_text = getattr(response, "output_text", None)
+    if output_text:
+        return _normalise_text_response(output_text)
+
+    choices = getattr(response, "choices", None) or []
+    if not choices:
+        return ""
+
+    message = getattr(choices[0], "message", None)
+    content = getattr(message, "content", "")
+    if isinstance(content, str):
+        return _normalise_text_response(content)
+    if isinstance(content, list):
+        parts = []
+        for item in content:
+            if isinstance(item, dict) and item.get("type") == "text":
+                parts.append(item.get("text", ""))
+            else:
+                text = getattr(item, "text", None)
+                if text:
+                    parts.append(text)
+        return _normalise_text_response("\n".join(parts))
+    return _normalise_text_response(str(content))
+
+
+def _anthropic_message_text(client, prompt: str, model: str, max_tokens: int) -> tuple[str, str]:
+    """Call Anthropic and retry with a known-good provider-local fallback model if needed."""
     tried = []
-    for candidate in (model, *MODEL_FALLBACKS):
+    for candidate in _resolve_model_candidates(PROVIDER_ANTHROPIC, model):
         if candidate in tried:
             continue
         tried.append(candidate)
@@ -73,40 +224,111 @@ def _message_text(client, prompt: str, model: str, max_tokens: int) -> str:
             )
             if candidate != model:
                 log.warning("Brain model fallback: %s -> %s", model, candidate)
-            return _normalise_text_response(response.content[0].text)
+            return _normalise_text_response(response.content[0].text), candidate
         except Exception as e:
-            message = str(e)
-            if "not_found_error" in message or "model:" in message:
-                log.warning("Brain model unavailable: %s (%s)", candidate, message)
+            if _anthropic_should_fallback(e):
+                log.warning("Brain model unavailable: %s (%s)", candidate, e)
                 continue
             raise
     raise RuntimeError(f"No available brain model for requested model {model}")
 
 
+def _openai_message_text(client, prompt: str, model: str, max_tokens: int) -> tuple[str, str]:
+    """Call OpenAI using the installed client surface."""
+    tried = []
+    for candidate in _resolve_model_candidates(PROVIDER_OPENAI, model):
+        if candidate in tried:
+            continue
+        tried.append(candidate)
+        try:
+            if hasattr(client, "responses"):
+                response = client.responses.create(
+                    model=candidate,
+                    input=prompt,
+                    max_output_tokens=max_tokens,
+                )
+            else:
+                try:
+                    response = client.chat.completions.create(
+                        model=candidate,
+                        messages=[{"role": "user", "content": prompt}],
+                        max_completion_tokens=max_tokens,
+                    )
+                except TypeError:
+                    response = client.chat.completions.create(
+                        model=candidate,
+                        messages=[{"role": "user", "content": prompt}],
+                        max_tokens=max_tokens,
+                    )
+            if candidate != model:
+                log.warning("Brain model fallback: %s -> %s", model, candidate)
+            return _extract_openai_text(response), candidate
+        except Exception as e:
+            if _openai_should_fallback(e):
+                log.warning("Brain model unavailable: %s (%s)", candidate, e)
+                continue
+            raise
+    raise RuntimeError(f"No available brain model for requested model {model}")
+
+
+def _brain_request(prompt: str, model: str, max_tokens: int) -> dict | None:
+    """Execute a brain request across configured providers."""
+    candidates = _get_client_candidates()
+    if not candidates:
+        return None
+
+    last_error = None
+    for candidate in candidates:
+        provider = candidate["provider"]
+        client = candidate["client"]
+        try:
+            if provider == PROVIDER_ANTHROPIC:
+                text, used_model = _anthropic_message_text(client, prompt, model=model, max_tokens=max_tokens)
+            else:
+                text, used_model = _openai_message_text(client, prompt, model=model, max_tokens=max_tokens)
+            return {
+                "provider": provider,
+                "model": used_model,
+                "text": text,
+            }
+        except Exception as e:
+            last_error = e
+            should_fallback = (
+                _anthropic_should_fallback(e) if provider == PROVIDER_ANTHROPIC
+                else _openai_should_fallback(e)
+            )
+            if should_fallback:
+                log.warning("Brain provider fallback: %s failed (%s)", provider, e)
+                continue
+            raise
+
+    if last_error:
+        raise last_error
+    return None
+
+
 def estimate_probability(question, price, context="", model=DEFAULT_MODEL):
-    """Ask Claude to estimate probability for a single market.
+    """Ask the configured AI provider to estimate probability for a single market.
 
     Returns dict with probability, confidence, reasoning, or None if brain is unavailable.
     """
-    client = _get_client()
-    if not client:
-        return None
-
     prompt = _build_prompt(question, price, context)
 
     try:
-        text = _message_text(client, prompt, model=model, max_tokens=300)
+        result = _brain_request(prompt, model=model, max_tokens=300)
+        if not result:
+            return None
 
-        # Parse JSON response
-        result = json.loads(text)
-        result["model"] = model
-        result["prompt_version"] = PROMPT_VERSION
+        payload = json.loads(result["text"])
+        payload["model"] = result["model"]
+        payload["provider"] = result["provider"]
+        payload["prompt_version"] = PROMPT_VERSION
 
-        log.info("Brain estimate: %s → %.1f%% (confidence=%s, edge=%+.1f%%)",
-                 question[:40], result["probability"] * 100,
-                 result["confidence"], result.get("edge_vs_market", 0) * 100)
+        log.info("Brain estimate (%s): %s → %.1f%% (confidence=%s, edge=%+.1f%%)",
+                 result["provider"], question[:40], payload["probability"] * 100,
+                 payload["confidence"], payload.get("edge_vs_market", 0) * 100)
 
-        return result
+        return payload
 
     except json.JSONDecodeError as e:
         log.warning("Brain returned invalid JSON: %s", e)
@@ -119,14 +341,12 @@ def estimate_probability(question, price, context="", model=DEFAULT_MODEL):
 def estimate_batch(signals, model=DEFAULT_MODEL):
     """Estimate probabilities for a batch of signals.
 
-    Processes each signal's market_a and market_b through Claude.
+    Processes each signal's market_a and market_b through the configured AI provider.
     Returns list of signals enriched with brain estimates.
 
-    Cost: ~$0.001 per market question (Haiku pricing).
-    A batch of 10 signals = 20 questions ≈ $0.02.
+    Cost depends on the active provider/model configuration.
     """
-    client = _get_client()
-    if not client:
+    if not _get_client_candidates():
         log.info("Brain unavailable — returning signals without AI estimates")
         return signals
 
@@ -158,7 +378,7 @@ def estimate_batch(signals, model=DEFAULT_MODEL):
             "has_edge": False,
         }
 
-        # Check if Claude sees edge on either side
+        # Check if the AI provider sees edge on either side
         if est_a and est_b:
             edge_a = abs(est_a.get("edge_vs_market", 0))
             edge_b = abs(est_b.get("edge_vs_market", 0))
@@ -177,12 +397,11 @@ def validate_signal(signal, model=DEFAULT_MODEL):
     """Quick validation — should we trade this signal?
 
     Fetches real-time Perplexity research context first (if available),
-    then asks Claude to validate with current news in hand.
+    then asks the configured AI provider to validate with current news in hand.
 
     Returns True/False with reasoning. Used as final gate before paper trading.
     """
-    client = _get_client()
-    if not client:
+    if not _get_client_candidates():
         return True, "Brain unavailable — defaulting to statistical signal"
 
     # Fetch real-time context from Perplexity if available
@@ -218,11 +437,16 @@ Respond with ONLY valid JSON:
 {{"trade": true/false, "reasoning": "1-2 sentences", "risk_flags": ["list of concerns"]}}"""
 
     try:
-        text = _message_text(client, prompt, model=model, max_tokens=300)
-        result = json.loads(text)
+        response = _brain_request(prompt, model=model, max_tokens=300)
+        if not response:
+            return True, "Brain unavailable — defaulting to statistical signal"
+        result = json.loads(response["text"])
+        result["provider"] = response["provider"]
+        result["model"] = response["model"]
         should_trade = result.get("trade", False)
 
-        log.info("Brain validation: %s → %s (%s)",
+        log.info("Brain validation (%s): %s → %s (%s)",
+                 result["provider"],
                  signal.get("event", "?")[:40],
                  "TRADE" if should_trade else "SKIP",
                  result.get("reasoning", "")[:60])
@@ -235,12 +459,11 @@ Respond with ONLY valid JSON:
 
 
 def recommend_wallet(address: str, label: str, score_result: dict, model=DEFAULT_MODEL) -> dict | None:
-    """Ask Claude whether this wallet is worth copy-trading.
+    """Ask the configured AI provider whether this wallet is worth copy-trading.
 
     Returns dict with verdict/reasoning/risk_flags, or None if brain unavailable.
     """
-    client = _get_client()
-    if not client:
+    if not _get_client_candidates():
         return None
 
     b = score_result.get("breakdown") or {}
@@ -267,10 +490,14 @@ Respond with ONLY valid JSON:
 {{"verdict": "copy"|"caution"|"skip", "reasoning": "1-2 sentences", "risk_flags": ["list of concerns"], "confidence": "high"|"medium"|"low"}}"""
 
     try:
-        text = _message_text(client, prompt, model=model, max_tokens=250)
-        result = json.loads(text)
-        result["model"] = model
-        log.info("Brain wallet rec: %s → %s (%s)", label, result.get("verdict"), result.get("reasoning", "")[:60])
+        response = _brain_request(prompt, model=model, max_tokens=250)
+        if not response:
+            return None
+        result = json.loads(response["text"])
+        result["model"] = response["model"]
+        result["provider"] = response["provider"]
+        log.info("Brain wallet rec (%s): %s → %s (%s)",
+                 result["provider"], label, result.get("verdict"), result.get("reasoning", "")[:60])
         return result
     except json.JSONDecodeError as e:
         log.warning("Brain wallet rec returned invalid JSON: %s", e)
@@ -281,29 +508,28 @@ Respond with ONLY valid JSON:
 
 
 def ask(prompt, model=DEFAULT_MODEL):
-    """Ask Claude a generic question and return the text response.
+    """Ask the configured AI provider a generic question and return the text response.
 
     Useful for free-form analysis (like whale alerts) where we don't
     necessarily need structured JSON for everything.
     """
-    client = _get_client()
-    if not client:
+    if not _get_client_candidates():
         return "Brain unavailable"
 
     try:
-        return _message_text(client, prompt, model=model, max_tokens=500)
+        response = _brain_request(prompt, model=model, max_tokens=500)
+        return response["text"] if response else "Brain unavailable"
     except Exception as e:
         log.error("Brain ask error: %s", e)
         return f"Brain error: {e}"
 
 
 def validate_whale(alert, model=DEFAULT_MODEL):
-    """Ask Claude to analyze a whale/insider alert.
+    """Ask the configured AI provider to analyze a whale/insider alert.
 
     Returns dict with verdict, reasoning, and risk factors.
     """
-    client = _get_client()
-    if not client:
+    if not _get_client_candidates():
         return None
 
     # Try to get real-time context if possible
@@ -350,10 +576,14 @@ Respond with ONLY valid JSON:
 {{"verdict": "suspicious"|"normal"|"manipulation", "reasoning": "1-2 sentences", "risk_flags": ["list of concerns"], "confidence": "high"|"medium"|"low"}}"""
 
     try:
-        text = _message_text(client, prompt, model=model, max_tokens=300)
-        result = json.loads(text)
-        result["model"] = model
-        log.info("Brain whale validation: %s → %s", alert.get("market", "")[:40], result.get("verdict"))
+        response = _brain_request(prompt, model=model, max_tokens=300)
+        if not response:
+            return None
+        result = json.loads(response["text"])
+        result["model"] = response["model"]
+        result["provider"] = response["provider"]
+        log.info("Brain whale validation (%s): %s → %s",
+                 result["provider"], alert.get("market", "")[:40], result.get("verdict"))
         return result
     except Exception as e:
         log.error("Brain whale validation error: %s", e)
@@ -362,8 +592,7 @@ Respond with ONLY valid JSON:
 
 def generate_daily_report(context: dict, model=OPUS_MODEL) -> dict | None:
     """Generate a structured daily report for the dashboard."""
-    client = _get_client()
-    if not client:
+    if not _get_client_candidates():
         return None
 
     prompt = f"""You are reviewing a Polymarket scanner/trading system.
@@ -383,10 +612,14 @@ Respond with ONLY valid JSON in this shape:
 }}"""
 
     try:
-        text = _message_text(client, prompt, model=model, max_tokens=800)
-        result = json.loads(text)
-        result["model"] = model
-        log.info("Brain daily report generated (confidence=%s)", result.get("confidence"))
+        response = _brain_request(prompt, model=model, max_tokens=800)
+        if not response:
+            return None
+        result = json.loads(response["text"])
+        result["model"] = response["model"]
+        result["provider"] = response["provider"]
+        log.info("Brain daily report generated via %s (confidence=%s)",
+                 result["provider"], result.get("confidence"))
         return result
     except Exception as e:
         log.error("Brain daily report error: %s", e)

@@ -6,7 +6,7 @@ Multi-strategy scanner for Polymarket prediction markets. Three live strategies:
 2. **Weather edge** — compares NOAA + Open-Meteo forecasts vs market prices on temperature bucket markets (seasonal — markets appear in summer/autumn)
 3. **Locked arb** — flags markets where YES+NO < $1 (alerting only; needs near-atomic fills to exploit)
 
-Scores opportunities through math filters (EV, Kelly, slippage), optionally validates with Claude AI, and supports paper + live trading.
+Scores opportunities through math filters (EV, Kelly, slippage), optionally validates with the AI brain layer, and supports paper + live trading.
 
 ## Scope Of This File
 This file is a repo-level guidance document for coding agents and humans working in this project.
@@ -24,7 +24,7 @@ Scanners:      scanner.py / async_scanner.py (cointegration pairs)
                     |
 Math:          math_engine.py (EV, Kelly, slippage, scoring)
                     |
-AI:            brain.py (Claude probability estimation) → bayes.py (updating)
+AI:            brain.py (provider-backed probability estimation/validation) → bayes.py (updating)
                     |
 Execution:     execution.py (paper/live trading) → blockchain.py (web3/Polygon)
                     |
@@ -53,7 +53,7 @@ Every module follows: docstring → imports → `log = logging.getLogger("scanne
 - Both have identical function signatures. Both retry on connection errors.
 
 ### Scoring Pipeline
-Every opportunity flows: scanner finds pair → `math_engine.score_opportunity()` grades A+ to F → optionally `brain.validate_signal()` for Claude check → `execution.execute_trade()` if tradeable.
+Every opportunity flows: scanner finds pair → `math_engine.score_opportunity()` grades A+ to F → optionally `brain.validate_signal()` for AI validation → `execution.execute_trade()` if tradeable.
 
 ### Trading Modes
 - **Paper** (default): simulates against current prices, tracks in SQLite. There are no limits on numbers of trades while in paper mode.
@@ -83,7 +83,7 @@ SQLite at `scanner.db`. Schema auto-migrates on import via `db.init_db()`. New c
 - Check slippage before any trade. Skip if >2%.
 - Check balance before any live trade.
 - Return structured dicts from functions (not bare values).
-- Degrade gracefully when optional services are unavailable (Claude API, web3, Telegram).
+- Degrade gracefully when optional services are unavailable (AI providers, web3, Telegram).
 
 ### Testing Changes
 ```bash
@@ -142,7 +142,11 @@ launchctl load ~/Library/LaunchAgents/com.polymarket.scanner.plist
 
 ## Environment Variables
 All in `.env` (see `.env.example`):
-- `ANTHROPIC_API_KEY` — enables brain.py (Claude probability estimation)
+- `BRAIN_PROVIDER` — `auto` prefers Anthropic while credits remain, then falls forward to OpenAI; `anthropic` or `openai` pins the provider
+- `ANTHROPIC_API_KEY` — enables Anthropic as the current/default brain provider
+- `OPENAI_API_KEY` — enables OpenAI/Codex as warm standby or cutover provider for brain.py
+- `BRAIN_ANTHROPIC_MODEL` / `BRAIN_ANTHROPIC_COMPLEX_MODEL` — optional Anthropic model overrides for `brain.py`
+- `BRAIN_OPENAI_MODEL` / `BRAIN_OPENAI_COMPLEX_MODEL` — optional OpenAI model overrides for `brain.py`
 - `TELEGRAM_BOT_TOKEN` + `TELEGRAM_CHAT_ID` — enables Telegram alerts
 - `ALCHEMY_API_KEY` — enables blockchain.py (Polygon RPC)
 - `POLYMARKET_PRIVATE_KEY` — enables live trading (Tier 3)

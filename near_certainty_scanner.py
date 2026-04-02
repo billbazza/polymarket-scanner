@@ -21,7 +21,7 @@ Strategy:
 
 Two-layer filter:
   1. Calibration check: calibrated_yes_prob > yes_price + MIN_CALIBRATION_EDGE
-  2. Brain check (optional, requires ANTHROPIC_API_KEY): Claude estimates true
+  2. Brain check (optional, requires a configured brain provider): AI estimates true
      probability. Only proceed if brain_estimate ≥ MIN_BRAIN_CONFIDENCE.
 
   Layer 1 catches structural mispricing.
@@ -57,7 +57,7 @@ MIN_CALIBRATION_EDGE = 0.005  # at least 0.5pp above market price (calibration)
 MIN_EV_PCT           = 0.50   # min EV% (maker, no fee) to be tradeable
 MIN_BRAIN_CONFIDENCE = 0.90   # brain must give ≥90% to confirm near-certainty
 
-# Use brain validation (requires ANTHROPIC_API_KEY). Skip if unavailable.
+# Use brain validation when a provider is configured. Skip if unavailable.
 USE_BRAIN = True
 
 # Maker fee = 0%. No taker execution — taker fee (2%) wipes the calibration edge.

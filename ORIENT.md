@@ -10,7 +10,7 @@ The system runs locally on your Mac with a LaunchAgent scanning every 30 minutes
 ```
 Markets → Pairs → Cointegration Test → Z-Score → Score (A+ to F) → Trade?
                                                         ↓
-                                              Claude Brain (optional)
+                                              AI Brain (optional)
                                               validates fundamentals
 ```
 
@@ -20,7 +20,7 @@ The scanner is the **quantitative layer** (pure math, no opinions). The brain is
 
 **Data flow**: API clients (`api.py`, `async_api.py`) → Scanner (`scanner.py`, `async_scanner.py`) → Math engine (`math_engine.py`) → Database (`db.py`)
 
-**AI layer**: `brain.py` calls Claude Haiku for probability estimates. `bayes.py` updates reversion probabilities based on Claude's assessment. Prompts live in `/prompts/` with version tracking.
+**AI layer**: `brain.py` calls the configured provider for probability estimates and validation. `bayes.py` updates reversion probabilities based on the brain assessment. Prompts live in `/prompts/` with version tracking.
 
 **Execution**: `execution.py` handles paper and live trading. `blockchain.py` wraps web3/Polygon interactions. `tracker.py` monitors open positions.
 
@@ -56,7 +56,7 @@ launchctl load ~/Library/LaunchAgents/com.polymarket.scanner.plist
 
 - **Scanner.db grows over time** with signals from every scan. Old signals aren't auto-cleaned. If it gets big, you can safely delete signals older than 30 days.
 
-- **The brain module returns None** if `ANTHROPIC_API_KEY` isn't set. All downstream code handles this gracefully — it just skips the AI validation step.
+- **The brain module returns None** if no configured provider is available. All downstream code handles this gracefully — it just skips the AI validation step.
 
 - **Grades are relative to the scoring filters**, not absolute quality. A grade "A+" means all 5 filters passed (EV, Kelly, z-score, cointegration, half-life), not that it's guaranteed profitable.
 

@@ -1178,7 +1178,7 @@ async function loadSignals() {
         <td><span class="badge ${s.status}">${s.status}</span></td>
         <td class="actions-col">${s.status==='new'
           ? `<button class="btn sm" onclick="paperTrade(${s.id})">Trade</button>
-             <button class="btn sm" onclick="brainValidate(${s.id})" title="Ask Claude">Brain</button>`
+             <button class="btn sm" onclick="brainValidate(${s.id})" title="Ask AI">Brain</button>`
           : ''}</td>
       </tr>`;
     }).join('');
@@ -1623,7 +1623,7 @@ async function runAutoTrade() {
 }
 
 async function brainValidate(signalId) {
-  toast('Asking Claude...');
+  toast('Asking AI...');
   try {
     const r = await fetch(API + `/api/brain/validate/${signalId}`, { method: 'POST' });
     const data = await r.json();
@@ -1636,7 +1636,7 @@ async function brainValidate(signalId) {
 }
 
 async function brainValidateWhale(alertId) {
-  toast('Asking Claude about whale alert...');
+  toast('Asking AI about whale alert...');
   try {
     const r = await fetch(API + `/api/brain/whale/${alertId}`, { method: 'POST' });
     const data = await r.json();
@@ -1757,7 +1757,7 @@ async function loadWhales() {
         <td style="${volColor}">${volRatio}</td>
         <td>${bigOrder}</td>
         <td>${scoreBreakdown(a)}</td>
-        <td class="actions-col" style="display:flex;gap:4px">${tradeBtn}<button class="btn sm" onclick="brainValidateWhale(${a.id})" title="Ask Claude">Brain</button>${dismissBtn}</td>
+        <td class="actions-col" style="display:flex;gap:4px">${tradeBtn}<button class="btn sm" onclick="brainValidateWhale(${a.id})" title="Ask AI">Brain</button>${dismissBtn}</td>
       </tr>${analysisRow}`;
     }).join('');
   } catch(e) { console.error('Whale error:', e); }
@@ -2003,9 +2003,9 @@ function fmtM(v) {
 function aiVerdictBadge(verdict) {
   if (!verdict) return '';
   const cfg = {
-    copy:    { bg: 'var(--green)',  text: '#000', label: '✓ Claude: Copy' },
-    caution: { bg: 'var(--amber)',  text: '#000', label: '⚠ Claude: Caution' },
-    skip:    { bg: 'var(--red)',    text: '#fff', label: '✗ Claude: Skip' },
+    copy:    { bg: 'var(--green)',  text: '#000', label: '✓ Brain: Copy' },
+    caution: { bg: 'var(--amber)',  text: '#000', label: '⚠ Brain: Caution' },
+    skip:    { bg: 'var(--red)',    text: '#fff', label: '✗ Brain: Skip' },
   }[verdict] || { bg: 'var(--text2)', text: '#fff', label: verdict };
   return `<span style="background:${cfg.bg};color:${cfg.text};border-radius:4px;padding:2px 7px;font-size:10px;font-weight:700">${cfg.label}</span>`;
 }
