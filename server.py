@@ -778,19 +778,40 @@ async def run_fast_scan(
 async def run_weather_scan(
     min_edge: float = 0.06,
     min_liquidity: float = 200,
+    correction_mode: str = "shadow",
+    intraday_observations_json: str | None = None,
 ):
     """Queue the weather scan and return a persisted job id."""
     import weather_scanner
 
+    if correction_mode not in {"shadow", "blend", "corrected"}:
+        raise HTTPException(400, "correction_mode must be one of: shadow, blend, corrected")
+
+    intraday_observations = None
+    if intraday_observations_json:
+        try:
+            intraday_observations = json.loads(intraday_observations_json)
+        except json.JSONDecodeError as exc:
+            raise HTTPException(400, f"Invalid intraday_observations_json: {exc}") from exc
+
     params = {
         "min_edge": min_edge,
         "min_liquidity": min_liquidity,
+        "correction_mode": correction_mode,
     }
-    log.info("Queued weather scan job: %s", params)
+    log.info(
+        "Queued weather scan job: %s observations=%d",
+        params,
+        len(intraday_observations) if isinstance(intraday_observations, list) else len(intraday_observations or {}),
+    )
 
     def work():
         t0 = time.time()
-        opportunities, meta = weather_scanner.scan(verbose=False, **params)
+        opportunities, meta = weather_scanner.scan(
+            verbose=False,
+            intraday_observations=intraday_observations,
+            **params,
+        )
         saved_ids = []
         for opp in opportunities:
             try:

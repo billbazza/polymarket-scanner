@@ -36,16 +36,11 @@ import re
 import time
 from datetime import date, timedelta
 
-from scipy.stats import norm
-
 import api
-import math_engine
+import weather_correction
 import weather_sources
 
 log = logging.getLogger("scanner.weather")
-
-# Forecast σ (°F) by hours ahead — calibrated to NWS verification statistics
-_SIGMA_BY_HOURS = [(24, 2.5), (48, 3.5), (72, 5.0), (999, 6.5)]
 
 MIN_EDGE = 0.06        # 6pp minimum combined edge to surface (for display)
 MIN_TRADE_EDGE = 0.15  # 15pp minimum edge required to mark tradeable
@@ -268,10 +263,7 @@ def _parse_date(q):
 # ---------------------------------------------------------------------------
 
 def _forecast_sigma(hours_ahead):
-    for hours, sigma in _SIGMA_BY_HOURS:
-        if hours_ahead <= hours:
-            return sigma
-    return 6.5
+    return weather_correction.forecast_sigma_for_hours(hours_ahead)
 
 
 def _calc_probability(forecast_val, threshold_f, direction, hours_ahead):
@@ -280,18 +272,26 @@ def _calc_probability(forecast_val, threshold_f, direction, hours_ahead):
     Returns (probability, sigma_used).
     """
     sigma = _forecast_sigma(hours_ahead)
-    if direction == "above":
-        prob = float(1 - norm.cdf((threshold_f - forecast_val) / sigma))
-    else:
-        prob = float(norm.cdf((threshold_f - forecast_val) / sigma))
-    return round(prob, 4), sigma
+    prob = weather_correction.probability_from_point_forecast(
+        forecast_val,
+        threshold_f,
+        direction,
+        sigma,
+    )
+    return prob, sigma
 
 
 # ---------------------------------------------------------------------------
 # Main scanner
 # ---------------------------------------------------------------------------
 
-def scan(min_edge=MIN_EDGE, min_liquidity=MIN_LIQUIDITY, verbose=True):
+def scan(
+    min_edge=MIN_EDGE,
+    min_liquidity=MIN_LIQUIDITY,
+    verbose=True,
+    intraday_observations=None,
+    correction_mode="shadow",
+):
     """Scan Polymarket temperature markets for edge using NOAA + Open-Meteo forecasts.
 
     Both sources must agree for a signal to be marked tradeable.
@@ -333,6 +333,7 @@ def scan(min_edge=MIN_EDGE, min_liquidity=MIN_LIQUIDITY, verbose=True):
     markets_checked = 0
     parsed_count = 0
     fetch_errors = {"noaa": 0, "om": 0}
+    normalized_observations = weather_correction.normalize_intraday_observations(intraday_observations)
 
     for event in events:
         liq = float(event.get("liquidity", 0) or 0)
@@ -403,6 +404,33 @@ def scan(min_edge=MIN_EDGE, min_liquidity=MIN_LIQUIDITY, verbose=True):
                 continue
 
             combined_prob = round(sum(available) / len(available), 4)
+            source_probability_details = []
+            for result in source_results:
+                baseline_prob = None
+                baseline_sigma = None
+                if result.get("source_id") == "noaa":
+                    baseline_prob = noaa_prob
+                    baseline_sigma = noaa_sigma
+                elif result.get("source_id") == "open-meteo":
+                    baseline_prob = om_prob
+                    baseline_sigma = _forecast_sigma(hours_ahead) if om_prob is not None else None
+                source_probability_details.append({
+                    **result,
+                    "baseline_prob": baseline_prob,
+                    "baseline_sigma_f": baseline_sigma,
+                })
+
+            correction = weather_correction.apply_intraday_probability_correction(
+                city_key=parsed["city_key"],
+                target_date=target_date,
+                threshold_f=threshold_f,
+                direction=direction,
+                hours_ahead=hours_ahead,
+                market_price=yes_price,
+                source_details=source_probability_details,
+                observation=normalized_observations.get(parsed["city_key"]),
+                correction_mode=correction_mode,
+            )
 
             # Agreement: both sources available and both point the same direction
             # relative to the market price
@@ -410,21 +438,34 @@ def scan(min_edge=MIN_EDGE, min_liquidity=MIN_LIQUIDITY, verbose=True):
                 noaa_prob is not None and om_prob is not None
                 and (noaa_prob - yes_price) * (om_prob - yes_price) > 0
             )
-            # Single-source (international cities: NOAA unavailable) — Open-Meteo only
-            single_source_ok = noaa_prob is None and om_prob is not None
-
             combined_edge = combined_prob - yes_price
             if abs(combined_edge) < min_edge:
                 continue
 
-            action = "BUY_YES" if combined_edge > 0 else "BUY_NO"
-            our_price = yes_price if action == "BUY_YES" else (1 - yes_price)
-            our_prob  = combined_prob if action == "BUY_YES" else (1 - combined_prob)
+            baseline_metrics = correction["baseline_metrics"]
+            corrected_metrics = correction["corrected_metrics"]
+            selected_metrics = correction["selected_metrics"]
+            action = baseline_metrics["action"]
+            ev_pct = baseline_metrics["ev_pct"]
+            kelly_f = baseline_metrics["kelly_fraction"]
+            baseline_price = yes_price if action == "BUY_YES" else (1 - yes_price)
 
-            ev_pct = round(
-                (our_prob * (1 - our_price) - (1 - our_prob) * our_price) * 100, 2
+            corrected_prob = correction["corrected_prob"]
+            corrected_edge = corrected_metrics.get("edge", combined_edge)
+            corrected_sources_agree = (
+                noaa_prob is not None and om_prob is not None
+                and (
+                    (correction["source_corrections"][0].get("corrected_prob", noaa_prob) - yes_price)
+                    * (correction["source_corrections"][1].get("corrected_prob", om_prob) - yes_price)
+                ) > 0
+            ) if len(correction["source_corrections"]) >= 2 else False
+            corrected_tradeable = (
+                corrected_sources_agree
+                and corrected_metrics.get("ev_pct", 0) > 0
+                and corrected_metrics.get("kelly_fraction", 0) > 0
+                and abs(corrected_edge) >= MIN_TRADE_EDGE
+                and (yes_price if corrected_metrics.get("action") == "BUY_YES" else (1 - yes_price)) >= MIN_TRADE_PRICE
             )
-            kelly_f = math_engine.kelly_fraction(our_prob, 1 - our_price, our_price)
 
             # Tradeable: BOTH sources must agree (no single-source trades for international)
             # AND edge >= 15pp AND the token we're buying must be >= 35¢ (no long shots)
@@ -433,7 +474,7 @@ def scan(min_edge=MIN_EDGE, min_liquidity=MIN_LIQUIDITY, verbose=True):
                 and ev_pct > 0
                 and kelly_f > 0
                 and abs(combined_edge) >= MIN_TRADE_EDGE
-                and our_price >= MIN_TRADE_PRICE
+                and baseline_price >= MIN_TRADE_PRICE
             )
 
             opp = {
@@ -462,27 +503,49 @@ def scan(min_edge=MIN_EDGE, min_liquidity=MIN_LIQUIDITY, verbose=True):
                 "combined_prob": combined_prob,
                 "combined_edge": round(combined_edge, 4),
                 "combined_edge_pct": round(combined_edge * 100, 2),
+                "corrected_combined_prob": corrected_prob,
+                "corrected_combined_edge": corrected_metrics.get("edge"),
+                "corrected_combined_edge_pct": corrected_metrics.get("edge_pct"),
+                "selected_prob": correction["selected_prob"],
+                "selected_edge": selected_metrics.get("edge"),
+                "selected_edge_pct": selected_metrics.get("edge_pct"),
+                "correction_mode": correction["mode"],
+                "correction_compare_only": correction["compare_only"],
+                "correction_status": correction["status"],
+                "correction_reason": correction["reason"],
+                "correction_confidence": correction["confidence_weight"],
+                "correction": correction,
                 "sources_agree": sources_agree,
+                "corrected_sources_agree": corrected_sources_agree,
                 "sources_available": len(available),
-                "source_details": source_results,
+                "source_details": source_probability_details,
                 # Scoring
                 "hours_ahead": hours_ahead,
                 "ev_pct": ev_pct,
                 "kelly_fraction": kelly_f,
                 "action": action,
                 "tradeable": tradeable,
+                "corrected_ev_pct": corrected_metrics.get("ev_pct"),
+                "corrected_kelly_fraction": corrected_metrics.get("kelly_fraction"),
+                "corrected_action": corrected_metrics.get("action"),
+                "corrected_tradeable": corrected_tradeable,
+                "selected_ev_pct": selected_metrics.get("ev_pct"),
+                "selected_kelly_fraction": selected_metrics.get("kelly_fraction"),
+                "selected_action": selected_metrics.get("action"),
                 "liquidity": liq,
             }
 
             opportunities.append(opp)
             log.info(
                 "%s | %s %s %.0f°F | price=%.3f noaa=%.3f om=%s combined=%.3f "
-                "edge=%+.1f%% agree=%s action=%s",
+                "edge=%+.1f%% corrected=%s mode=%s agree=%s action=%s",
                 parsed["city"], target_date, direction, threshold_f,
                 yes_price,
                 noaa_prob if noaa_prob is not None else -1,
                 f"{om_prob:.3f}" if om_prob is not None else "n/a",
                 combined_prob, combined_edge * 100,
+                f"{corrected_prob:.3f}" if corrected_prob is not None else "n/a",
+                correction_mode,
                 sources_agree, action,
             )
 
@@ -515,7 +578,9 @@ def scan(min_edge=MIN_EDGE, min_liquidity=MIN_LIQUIDITY, verbose=True):
                 f"mkt={opp['market_price']:.3f}  "
                 f"NOAA={noaa_str}  OM={om_str}  "
                 f"combined={opp['combined_prob']:.3f}  "
-                f"edge={opp['combined_edge_pct']:+.1f}%  → {opp['action']}"
+                f"edge={opp['combined_edge_pct']:+.1f}%  "
+                f"corr={opp['corrected_combined_prob']:.3f}({opp['correction_status']})  "
+                f"→ {opp['action']}"
             )
 
     return opportunities, {"markets_checked": markets_checked, "weather_found": parsed_count, "fetch_errors": fetch_errors}

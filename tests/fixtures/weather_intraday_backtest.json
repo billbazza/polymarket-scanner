@@ -1,0 +1,170 @@
+[
+  {
+    "id": "atl-hot-1",
+    "city": "atlanta",
+    "target_date": "2026-07-03",
+    "threshold_f": 90.0,
+    "direction": "above",
+    "hours_ahead": 8,
+    "market_price": 0.44,
+    "actual_high_f": 93.0,
+    "observation": {
+      "temp_f": 84.0,
+      "observed_at": "2026-07-03T10:00:00-04:00",
+      "previous_temp_f": 80.0,
+      "previous_observed_at": "2026-07-03T08:00:00-04:00",
+      "source": "fixture"
+    },
+    "sources": [
+      {"source_id": "noaa", "forecast_high_f": 88.0, "forecast_low_f": 72.0},
+      {"source_id": "open-meteo", "forecast_high_f": 87.0, "forecast_low_f": 71.0}
+    ]
+  },
+  {
+    "id": "dal-hot-2",
+    "city": "dallas",
+    "target_date": "2026-07-04",
+    "threshold_f": 96.0,
+    "direction": "above",
+    "hours_ahead": 7,
+    "market_price": 0.47,
+    "actual_high_f": 98.0,
+    "observation": {
+      "temp_f": 89.0,
+      "observed_at": "2026-07-04T10:30:00-05:00",
+      "previous_temp_f": 84.0,
+      "previous_observed_at": "2026-07-04T08:30:00-05:00",
+      "source": "fixture"
+    },
+    "sources": [
+      {"source_id": "noaa", "forecast_high_f": 94.0, "forecast_low_f": 77.0},
+      {"source_id": "open-meteo", "forecast_high_f": 93.0, "forecast_low_f": 76.0}
+    ]
+  },
+  {
+    "id": "phx-hot-3",
+    "city": "phoenix",
+    "target_date": "2026-07-05",
+    "threshold_f": 108.0,
+    "direction": "above",
+    "hours_ahead": 6,
+    "market_price": 0.51,
+    "actual_high_f": 111.0,
+    "observation": {
+      "temp_f": 100.0,
+      "observed_at": "2026-07-05T09:30:00-07:00",
+      "previous_temp_f": 95.0,
+      "previous_observed_at": "2026-07-05T07:30:00-07:00",
+      "source": "fixture"
+    },
+    "sources": [
+      {"source_id": "noaa", "forecast_high_f": 106.0, "forecast_low_f": 86.0},
+      {"source_id": "open-meteo", "forecast_high_f": 105.0, "forecast_low_f": 85.0}
+    ]
+  },
+  {
+    "id": "den-cool-1",
+    "city": "denver",
+    "target_date": "2026-09-10",
+    "threshold_f": 78.0,
+    "direction": "above",
+    "hours_ahead": 7,
+    "market_price": 0.55,
+    "actual_high_f": 74.0,
+    "observation": {
+      "temp_f": 60.0,
+      "observed_at": "2026-09-10T10:00:00-06:00",
+      "previous_temp_f": 61.0,
+      "previous_observed_at": "2026-09-10T08:00:00-06:00",
+      "source": "fixture"
+    },
+    "sources": [
+      {"source_id": "noaa", "forecast_high_f": 80.0, "forecast_low_f": 56.0},
+      {"source_id": "open-meteo", "forecast_high_f": 79.0, "forecast_low_f": 55.0}
+    ]
+  },
+  {
+    "id": "chi-cool-2",
+    "city": "chicago",
+    "target_date": "2026-09-11",
+    "threshold_f": 75.0,
+    "direction": "above",
+    "hours_ahead": 8,
+    "market_price": 0.49,
+    "actual_high_f": 71.0,
+    "observation": {
+      "temp_f": 58.0,
+      "observed_at": "2026-09-11T10:00:00-05:00",
+      "previous_temp_f": 59.0,
+      "previous_observed_at": "2026-09-11T08:00:00-05:00",
+      "source": "fixture"
+    },
+    "sources": [
+      {"source_id": "noaa", "forecast_high_f": 76.0, "forecast_low_f": 57.0},
+      {"source_id": "open-meteo", "forecast_high_f": 75.0, "forecast_low_f": 56.0}
+    ]
+  },
+  {
+    "id": "sea-cool-3",
+    "city": "seattle",
+    "target_date": "2026-09-12",
+    "threshold_f": 72.0,
+    "direction": "above",
+    "hours_ahead": 9,
+    "market_price": 0.46,
+    "actual_high_f": 69.0,
+    "observation": {
+      "temp_f": 55.0,
+      "observed_at": "2026-09-12T10:00:00-07:00",
+      "previous_temp_f": 54.0,
+      "previous_observed_at": "2026-09-12T08:00:00-07:00",
+      "source": "fixture"
+    },
+    "sources": [
+      {"source_id": "noaa", "forecast_high_f": 73.0, "forecast_low_f": 52.0},
+      {"source_id": "open-meteo", "forecast_high_f": 74.0, "forecast_low_f": 53.0}
+    ]
+  },
+  {
+    "id": "nyc-mixed-1",
+    "city": "new york city",
+    "target_date": "2026-07-06",
+    "threshold_f": 87.0,
+    "direction": "above",
+    "hours_ahead": 8,
+    "market_price": 0.52,
+    "actual_high_f": 88.0,
+    "observation": {
+      "temp_f": 79.0,
+      "observed_at": "2026-07-06T10:00:00-04:00",
+      "previous_temp_f": 75.0,
+      "previous_observed_at": "2026-07-06T08:00:00-04:00",
+      "source": "fixture"
+    },
+    "sources": [
+      {"source_id": "noaa", "forecast_high_f": 86.0, "forecast_low_f": 71.0},
+      {"source_id": "open-meteo", "forecast_high_f": 85.0, "forecast_low_f": 70.0}
+    ]
+  },
+  {
+    "id": "bos-mixed-2",
+    "city": "boston",
+    "target_date": "2026-07-07",
+    "threshold_f": 84.0,
+    "direction": "above",
+    "hours_ahead": 8,
+    "market_price": 0.48,
+    "actual_high_f": 83.0,
+    "observation": {
+      "temp_f": 73.0,
+      "observed_at": "2026-07-07T10:00:00-04:00",
+      "previous_temp_f": 72.0,
+      "previous_observed_at": "2026-07-07T08:00:00-04:00",
+      "source": "fixture"
+    },
+    "sources": [
+      {"source_id": "noaa", "forecast_high_f": 84.0, "forecast_low_f": 68.0},
+      {"source_id": "open-meteo", "forecast_high_f": 85.0, "forecast_low_f": 69.0}
+    ]
+  }
+]

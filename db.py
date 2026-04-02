@@ -217,6 +217,11 @@ def _migration_001_base_schema(conn):
             combined_prob REAL,
             combined_edge REAL,
             combined_edge_pct REAL,
+            selected_prob REAL,
+            selected_edge REAL,
+            selected_edge_pct REAL,
+            correction_mode TEXT,
+            correction_json TEXT,
             sources_agree INTEGER DEFAULT 0,
             sources_available INTEGER DEFAULT 0,
             hours_ahead INTEGER,
@@ -819,6 +824,17 @@ def _migration_014_signal_admission_diagnostics(conn):
     _add_column_if_missing(conn, "signals", "admission_json", "TEXT")
 
 
+def _migration_015_weather_intraday_correction(conn):
+    for col, coltype in [
+        ("selected_prob", "REAL"),
+        ("selected_edge", "REAL"),
+        ("selected_edge_pct", "REAL"),
+        ("correction_mode", "TEXT"),
+        ("correction_json", "TEXT"),
+    ]:
+        _add_column_if_missing(conn, "weather_signals", col, coltype)
+
+
 _MIGRATIONS = [
     ("001_base_schema", _migration_001_base_schema),
     ("002_backfill_columns", _migration_002_backfill_columns),
@@ -834,6 +850,7 @@ _MIGRATIONS = [
     ("012_trade_state_modes", _migration_012_trade_state_modes),
     ("013_paper_sizing_decisions", _migration_013_paper_sizing_decisions),
     ("014_signal_admission_diagnostics", _migration_014_signal_admission_diagnostics),
+    ("015_weather_intraday_correction", _migration_015_weather_intraday_correction),
 ]
 
 
@@ -852,6 +869,26 @@ def _repair_schema_gaps(conn):
     """
     _ensure_columns_if_table_exists(conn, "watched_wallets", _WATCHED_WALLET_MONITOR_COLUMNS)
     _ensure_columns_if_table_exists(conn, "signals", [("admission_json", "TEXT")])
+    _ensure_columns_if_table_exists(conn, "weather_signals", [
+        ("selected_prob", "REAL"),
+        ("selected_edge", "REAL"),
+        ("selected_edge_pct", "REAL"),
+        ("correction_mode", "TEXT"),
+        ("correction_json", "TEXT"),
+    ])
+
+
+def _deserialize_weather_signal_row(row):
+    item = dict(row)
+    if item.get("correction_json"):
+        try:
+            item["correction"] = json.loads(item["correction_json"])
+        except json.JSONDecodeError:
+            item["correction"] = None
+    else:
+        item["correction"] = None
+    item.pop("correction_json", None)
+    return item
 
 
 def _deserialize_signal_row(row):
@@ -3237,9 +3274,10 @@ def save_weather_signal(opp):
             noaa_forecast_f, noaa_prob, noaa_sigma_f,
             om_forecast_f, om_prob,
             combined_prob, combined_edge, combined_edge_pct,
+            selected_prob, selected_edge, selected_edge_pct, correction_mode, correction_json,
             sources_agree, sources_available,
             hours_ahead, ev_pct, kelly_fraction, action, tradeable, liquidity
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (
         time.time(), opp["event"], opp["market"], opp.get("market_id"),
         opp.get("yes_token"), opp.get("no_token"),
@@ -3249,6 +3287,11 @@ def save_weather_signal(opp):
         opp.get("noaa_forecast_f"), opp.get("noaa_prob"), opp.get("noaa_sigma_f"),
         opp.get("om_forecast_f"), opp.get("om_prob"),
         opp["combined_prob"], opp["combined_edge"], opp["combined_edge_pct"],
+        opp.get("selected_prob", opp.get("combined_prob")),
+        opp.get("selected_edge", opp.get("combined_edge")),
+        opp.get("selected_edge_pct", opp.get("combined_edge_pct")),
+        opp.get("correction_mode"),
+        json.dumps(opp.get("correction")) if opp.get("correction") else None,
         1 if opp.get("sources_agree") else 0,
         opp.get("sources_available", 0),
         opp.get("hours_ahead"), opp.get("ev_pct"), opp.get("kelly_fraction"),
@@ -3288,7 +3331,7 @@ def get_weather_signals(limit=50, tradeable_only=False):
     results = []
     try:
         for row in rows:
-            item = dict(row)
+            item = _deserialize_weather_signal_row(row)
             latest_trade = conn.execute(
                 """
                 SELECT id, status, closed_at, exit_reason
@@ -3352,7 +3395,7 @@ def get_weather_signal_by_id(signal_id):
     conn = get_conn()
     row = conn.execute("SELECT * FROM weather_signals WHERE id=?", (signal_id,)).fetchone()
     conn.close()
-    return dict(row) if row else None
+    return _deserialize_weather_signal_row(row) if row else None
 
 
 # --- Locked Arb ---

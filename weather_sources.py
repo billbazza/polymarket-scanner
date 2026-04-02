@@ -108,6 +108,7 @@ def fetch_threshold_forecasts(lat, lon, target_date_iso, city_key=None):
             "supported": bool(source.get("applicable")),
             "available": False,
             "value_f": None,
+            "low_f": None,
             "error": None,
             "meta": {
                 "target_date": target_date_iso,
@@ -121,8 +122,10 @@ def fetch_threshold_forecasts(lat, lon, target_date_iso, city_key=None):
         try:
             if source_id == "noaa":
                 value_f = _nws_daily_high(lat, lon, target_date_iso)
+                low_f = _nws_daily_low(lat, lon, target_date_iso)
             elif source_id == "open-meteo":
                 value_f = _om_daily_high(lat, lon, target_date_iso)
+                low_f = _om_daily_low(lat, lon, target_date_iso)
             else:
                 raise ValueError(f"Unknown weather source: {source_id}")
         except Exception as exc:
@@ -132,6 +135,7 @@ def fetch_threshold_forecasts(lat, lon, target_date_iso, city_key=None):
             continue
 
         base_result["value_f"] = value_f
+        base_result["low_f"] = low_f
         base_result["available"] = value_f is not None
         if value_f is None:
             base_result["meta"]["failure_reason"] = "no_target_value"
@@ -173,6 +177,18 @@ def _nws_hourly_url(lat, lon):
 
 def _nws_daily_high(lat, lon, target_date_iso):
     """Return NOAA forecast daily high (°F) for target date, or None."""
+    daily_range = _nws_daily_range(lat, lon, target_date_iso)
+    return daily_range["high"] if daily_range else None
+
+
+def _nws_daily_low(lat, lon, target_date_iso):
+    """Return NOAA forecast daily low (°F) for target date, or None."""
+    daily_range = _nws_daily_range(lat, lon, target_date_iso)
+    return daily_range["low"] if daily_range else None
+
+
+def _nws_daily_range(lat, lon, target_date_iso):
+    """Return NOAA forecast daily high/low (°F) for target date, or None."""
     hourly_url = _nws_hourly_url(lat, lon)
     if hourly_url is None:
         return None
@@ -198,7 +214,12 @@ def _nws_daily_high(lat, lon, target_date_iso):
             temp = temp * 9 / 5 + 32
         temps.append(temp)
 
-    return round(max(temps), 1) if temps else None
+    if not temps:
+        return None
+    return {
+        "high": round(max(temps), 1),
+        "low": round(min(temps), 1),
+    }
 
 
 def _openmeteo_forecasts(lat, lon):
@@ -246,6 +267,17 @@ def _openmeteo_forecasts(lat, lon):
 
 def _om_daily_high(lat, lon, target_date_iso):
     """Return Open-Meteo forecast daily high (°F) for target date, or None."""
-    forecasts = _openmeteo_forecasts(lat, lon)
-    entry = forecasts.get(target_date_iso)
+    entry = _om_daily_entry(lat, lon, target_date_iso)
     return entry["high"] if entry else None
+
+
+def _om_daily_low(lat, lon, target_date_iso):
+    """Return Open-Meteo forecast daily low (°F) for target date, or None."""
+    entry = _om_daily_entry(lat, lon, target_date_iso)
+    return entry["low"] if entry else None
+
+
+def _om_daily_entry(lat, lon, target_date_iso):
+    """Return Open-Meteo daily forecast entry for target date, or None."""
+    forecasts = _openmeteo_forecasts(lat, lon)
+    return forecasts.get(target_date_iso)
