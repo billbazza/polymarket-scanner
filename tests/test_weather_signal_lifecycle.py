@@ -135,6 +135,26 @@ class WeatherSignalLifecycleTests(unittest.TestCase):
         self.assertIsNone(duplicate_row["latest_trade_exit_reason"])
         self.assertIn("do not reopen", duplicate_row["status_detail"])
 
+    def test_weather_close_trade_uses_single_leg_pnl_and_closes_signal(self):
+        signal_id = self.db.save_weather_signal(
+            _weather_opp(city="Miami", market="Will Miami hit 87F?", yes_token="yes-mia", no_token="no-mia")
+        )
+        trade_id = self.db.open_weather_trade(signal_id, size_usd=20)
+        self.assertIsNotNone(trade_id)
+
+        pnl = self.db.close_trade(trade_id, exit_price_a=0.50, notes="Manual close for audit")
+        trade = self.db.get_trade(trade_id)
+        signal = self.db.get_weather_signal_by_id(signal_id)
+
+        expected_pnl = round((20 / 0.41) * 0.50 - 20, 2)
+        self.assertAlmostEqual(pnl, expected_pnl, places=2)
+        self.assertAlmostEqual(trade["pnl"], expected_pnl, places=2)
+        self.assertEqual(trade["status"], "closed")
+        self.assertEqual(trade["exit_price_a"], 0.50)
+        self.assertEqual(trade["exit_price_b"], 0.50)
+        self.assertEqual(trade["exit_reason"], "Manual close for audit")
+        self.assertEqual(signal["status"], "closed")
+
     def test_weather_stop_loss_uses_fifteen_percent_floor(self):
         signal_id = self.db.save_weather_signal(_weather_opp(city="Dallas", market="Will Dallas hit 84F?", yes_token="yes-dal", no_token="no-dal"))
         trade_id = self.db.open_weather_trade(signal_id, size_usd=20)
