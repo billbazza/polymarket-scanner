@@ -21,6 +21,15 @@ RECONCILIATION_INTERNAL = "internal_simulation"
 RECONCILIATION_WALLET = "wallet_position"
 RECONCILIATION_ORDERS = "exchange_orders"
 
+STRATEGY_ORDER = ("cointegration", "weather", "whale", "copy", "other")
+STRATEGY_LABELS = {
+    "cointegration": "Cointegration",
+    "weather": "Weather",
+    "whale": "Whale",
+    "copy": "Copy",
+    "other": "Other",
+}
+
 _WATCHED_WALLET_MONITOR_COLUMNS = [
     ("baseline_positions", "TEXT"),
     ("last_checked_at", "REAL"),
@@ -1235,6 +1244,17 @@ def _paper_unrealized_from_updates(updates):
     return unrealized
 
 
+def _paper_unrealized_map_from_updates(updates):
+    unrealized = {}
+    for item in updates or []:
+        trade_id = item.get("trade_id")
+        if not trade_id:
+            continue
+        pnl = ((item.get("unrealized_pnl") or {}).get("pnl_usd")) or 0.0
+        unrealized[int(trade_id)] = float(pnl)
+    return unrealized
+
+
 def _paper_unrealized_from_snapshots(conn):
     rows = conn.execute("""
         SELECT t.id, t.trade_type, t.side_a, t.size_usd, t.entry_price_a, t.entry_price_b,
@@ -1271,6 +1291,162 @@ def _paper_unrealized_from_snapshots(conn):
         if valuation["ok"]:
             unrealized += float(valuation["pnl_usd"])
     return unrealized
+
+
+def _paper_unrealized_map_from_snapshots(conn):
+    rows = conn.execute("""
+        SELECT t.id, t.trade_type, t.side_a, t.size_usd, t.entry_price_a, t.entry_price_b,
+               s.price_a, s.price_b
+        FROM trades t
+        LEFT JOIN snapshots s ON s.id = (
+            SELECT s2.id
+            FROM snapshots s2
+            WHERE s2.trade_id = t.id
+            ORDER BY s2.timestamp DESC, s2.id DESC
+            LIMIT 1
+        )
+        WHERE t.status='open'
+    """).fetchall()
+
+    unrealized = {}
+    for row in rows:
+        trade_type = row["trade_type"] or "pairs"
+        if trade_type in {"weather", "copy", "whale"}:
+            valuation = calculate_single_leg_mark_to_market(
+                row["size_usd"],
+                row["entry_price_a"],
+                row["price_a"],
+            )
+        else:
+            valuation = calculate_pairs_mark_to_market(
+                row["size_usd"],
+                row["entry_price_a"],
+                row["price_a"],
+                row["entry_price_b"],
+                row["price_b"],
+                row["side_a"],
+            )
+        if valuation["ok"]:
+            unrealized[int(row["id"])] = float(valuation["pnl_usd"])
+    return unrealized
+
+
+def _trade_strategy_key(trade) -> str:
+    trade_type = (trade.get("trade_type") or "pairs").strip().lower()
+    strategy_name = (trade.get("strategy_name") or "").strip().lower()
+
+    if trade_type == "pairs":
+        if strategy_name in {"cointegration", "cointegration_live", "", "unknown"}:
+            return "cointegration"
+        return strategy_name.replace("_live", "") or "cointegration"
+    if trade_type in {"weather", "copy", "whale"}:
+        return trade_type
+    return strategy_name.replace("_live", "") or "other"
+
+
+def _empty_strategy_bucket(strategy: str) -> dict:
+    return {
+        "strategy": strategy,
+        "label": STRATEGY_LABELS.get(strategy, strategy.replace("_", " ").title()),
+        "trade_count": 0,
+        "open_trades": 0,
+        "closed_trades": 0,
+        "wins": 0,
+        "losses": 0,
+        "win_rate": 0.0,
+        "realized_pnl": 0.0,
+        "unrealized_pnl": 0.0,
+        "committed_capital": 0.0,
+        "capital_deployed": 0.0,
+        "avg_trade_size": 0.0,
+        "bankroll_utilization_pct": 0.0,
+    }
+
+
+def get_strategy_performance(refresh_unrealized: bool = False) -> dict:
+    conn = get_conn()
+    account = _paper_account_row(conn)
+    starting_bankroll = float(account["starting_bankroll"] or 0.0)
+    rows = conn.execute("""
+        SELECT id, trade_type, strategy_name, status, pnl, size_usd, notes
+        FROM trades
+        ORDER BY opened_at ASC, id ASC
+    """).fetchall()
+
+    if refresh_unrealized:
+        conn.close()
+        try:
+            import tracker
+            unrealized_map = _paper_unrealized_map_from_updates(tracker.refresh_open_trades())
+        except Exception as e:
+            log.warning("Failed to refresh open paper trades for strategy summary: %s", e)
+            conn = get_conn()
+            try:
+                unrealized_map = _paper_unrealized_map_from_snapshots(conn)
+            finally:
+                conn.close()
+    else:
+        try:
+            unrealized_map = _paper_unrealized_map_from_snapshots(conn)
+        finally:
+            conn.close()
+
+    buckets = {strategy: _empty_strategy_bucket(strategy) for strategy in STRATEGY_ORDER}
+    total_committed_capital = 0.0
+    total_realized_pnl = 0.0
+    total_unrealized_pnl = 0.0
+
+    for row in rows:
+        trade = dict(row)
+        if trade.get("status") == "closed" and trade.get("notes") == "manual close - dedup cleanup":
+            continue
+        strategy = _trade_strategy_key(trade)
+        bucket = buckets.setdefault(strategy, _empty_strategy_bucket(strategy))
+        size_usd = float(trade.get("size_usd") or 0.0)
+        pnl = float(trade.get("pnl") or 0.0)
+
+        bucket["trade_count"] += 1
+        bucket["capital_deployed"] += size_usd
+
+        if trade.get("status") == "open":
+            bucket["open_trades"] += 1
+            bucket["committed_capital"] += size_usd
+            bucket["unrealized_pnl"] += float(unrealized_map.get(int(trade["id"]), 0.0))
+        elif trade.get("status") == "closed":
+            bucket["closed_trades"] += 1
+            bucket["realized_pnl"] += pnl
+            if pnl > 0:
+                bucket["wins"] += 1
+            else:
+                bucket["losses"] += 1
+
+    strategies = []
+    for strategy in list(STRATEGY_ORDER) + sorted(k for k in buckets if k not in STRATEGY_ORDER):
+        bucket = buckets[strategy]
+        closed_trades = bucket["closed_trades"]
+        bucket["win_rate"] = round((bucket["wins"] / closed_trades * 100) if closed_trades else 0.0, 1)
+        bucket["realized_pnl"] = round(bucket["realized_pnl"], 2)
+        bucket["unrealized_pnl"] = round(bucket["unrealized_pnl"], 2)
+        bucket["committed_capital"] = round(bucket["committed_capital"], 2)
+        bucket["capital_deployed"] = round(bucket["capital_deployed"], 2)
+        bucket["avg_trade_size"] = round((bucket["capital_deployed"] / bucket["trade_count"]) if bucket["trade_count"] else 0.0, 2)
+        bucket["bankroll_utilization_pct"] = round(
+            (bucket["committed_capital"] / starting_bankroll * 100) if starting_bankroll > 0 else 0.0,
+            1,
+        )
+        total_committed_capital += bucket["committed_capital"]
+        total_realized_pnl += bucket["realized_pnl"]
+        total_unrealized_pnl += bucket["unrealized_pnl"]
+        if bucket["trade_count"] or strategy in {"cointegration", "weather", "whale", "copy"}:
+            strategies.append(bucket)
+
+    return {
+        "starting_bankroll": round(starting_bankroll, 2),
+        "total_committed_capital": round(total_committed_capital, 2),
+        "total_realized_pnl": round(total_realized_pnl, 2),
+        "total_unrealized_pnl": round(total_unrealized_pnl, 2),
+        "strategies": strategies,
+    }
 
 
 def get_paper_account_state(refresh_unrealized: bool = False) -> dict:
@@ -1341,6 +1517,19 @@ def can_open_paper_trade(size_usd: float) -> dict:
         "shortfall_usd": round(max(0.0, requested - account["available_cash"]), 2),
         "account": account,
     }
+
+
+def get_paper_account_overview(refresh_unrealized: bool = False) -> dict:
+    if refresh_unrealized:
+        strategy_breakdown = get_strategy_performance(refresh_unrealized=True)
+        account = get_paper_account_state(refresh_unrealized=False)
+    else:
+        account = get_paper_account_state(refresh_unrealized=False)
+        strategy_breakdown = get_strategy_performance(refresh_unrealized=False)
+
+    overview = dict(account)
+    overview["strategy_breakdown"] = strategy_breakdown
+    return overview
 
 
 def _sanitize_operator_reason(reason, fallback: str = "Decision recorded.") -> str:
@@ -3280,7 +3469,8 @@ def get_stats():
     conn.close()
 
     win_rate = (wins / closed_trades * 100) if closed_trades > 0 else 0
-    paper_account = get_paper_account_state(refresh_unrealized=True)
+    paper_account = get_paper_account_overview(refresh_unrealized=True)
+    strategy_breakdown = paper_account["strategy_breakdown"]
 
     # Build cumulative series: each point is the running total after that trade closes
     cumulative = 0.0
@@ -3303,6 +3493,7 @@ def get_stats():
         "total_scans": total_scans,
         "pnl_series": pnl_series,
         "paper_account": paper_account,
+        "strategy_breakdown": strategy_breakdown,
         "cointegration_trial": get_cointegration_trial_summary(),
     }
 

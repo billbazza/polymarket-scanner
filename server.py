@@ -482,7 +482,7 @@ async def stats():
 
 @app.get("/api/paper-account")
 async def paper_account():
-    return db.get_paper_account_state(refresh_unrealized=True)
+    return db.get_paper_account_overview(refresh_unrealized=True)
 
 
 @app.get("/api/paper-trade-attempts")

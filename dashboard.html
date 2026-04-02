@@ -111,6 +111,28 @@
     line-height: 1.55;
   }
   .account-explainer strong { color: var(--text); }
+  .strategy-panel {
+    margin-top: 14px;
+    border: 1px solid rgba(71, 85, 105, 0.38);
+    border-radius: 12px;
+    background: rgba(15, 23, 42, 0.56);
+    overflow: hidden;
+  }
+  .strategy-panel-head {
+    display: flex;
+    justify-content: space-between;
+    gap: 12px;
+    padding: 12px 14px;
+    border-bottom: 1px solid rgba(71, 85, 105, 0.28);
+    align-items: center;
+    flex-wrap: wrap;
+  }
+  .strategy-panel-head strong { font-size: 12px; text-transform: uppercase; letter-spacing: 0.6px; }
+  .strategy-panel-head span { color: var(--text2); font-size: 12px; }
+  .strategy-panel table { width: 100%; min-width: 720px; }
+  .strategy-panel td:first-child { font-weight: 700; }
+  .metric-stack { display: flex; flex-direction: column; gap: 2px; }
+  .metric-stack .sub { color: var(--text2); font-size: 11px; }
   .mini-stats-row {
     display: grid;
     grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
@@ -432,6 +454,25 @@
 
     <div class="account-explainer" id="accountExplainer">
       <strong>Accounting rule:</strong> opening a paper trade immediately deducts its size from available cash and classifies it as committed capital until the trade closes.
+    </div>
+
+    <div class="strategy-panel">
+      <div class="strategy-panel-head">
+        <strong>Strategy Breakdown</strong>
+        <span id="strategyBreakdownMeta">Loading strategy contribution metrics…</span>
+      </div>
+      <div class="table-wrap" style="border:none;border-radius:0;background:transparent;">
+        <table>
+          <thead>
+            <tr>
+              <th>Strategy</th><th>Realized</th><th>Open MTM</th><th>Win Rate</th><th>Trades</th><th>Capital In Use</th>
+            </tr>
+          </thead>
+          <tbody id="strategyBreakdownBody">
+            <tr><td colspan="6" class="empty"><div class="icon">◻</div>Loading strategy contribution metrics…</td></tr>
+          </tbody>
+        </table>
+      </div>
     </div>
   </div>
 
@@ -895,11 +936,13 @@ async function loadStats() {
     const r = await fetch(API + '/api/stats');
     const s = await r.json();
     const account = s.paper_account || {};
+    const strategyBreakdown = (s.strategy_breakdown || account.strategy_breakdown || {});
     const setSignedValue = (id, value) => {
       const el = document.getElementById(id);
       el.textContent = fmtUsd(value);
       el.className = 'value ' + (value >= 0 ? 'green' : 'red');
     };
+    const formatSignedCell = value => `<span style="color:${value >= 0 ? 'var(--green)' : 'var(--red)'}">${fmtUsd(value)}</span>`;
 
     document.getElementById('statEquity').textContent = fmtUsd(account.total_equity);
     document.getElementById('statStartingBankroll').textContent = `Starting bankroll ${fmtUsd(account.starting_bankroll)}`;
@@ -927,6 +970,34 @@ async function loadStats() {
     document.getElementById('statClosed').textContent = s.closed_trades;
     document.getElementById('statSignals').textContent = s.total_signals;
     document.getElementById('statScans').textContent = s.total_scans;
+
+    const strategies = strategyBreakdown.strategies || [];
+    const body = document.getElementById('strategyBreakdownBody');
+    const meta = document.getElementById('strategyBreakdownMeta');
+    if (!strategies.length) {
+      body.innerHTML = '<tr><td colspan="6" class="empty"><div class="icon">◻</div>No strategy-level trade history yet.</td></tr>';
+      meta.textContent = 'No strategy contribution data recorded yet.';
+    } else {
+      const topRealized = [...strategies].sort((a, b) => (b.realized_pnl || 0) - (a.realized_pnl || 0))[0];
+      const topUtil = [...strategies].sort((a, b) => (b.committed_capital || 0) - (a.committed_capital || 0))[0];
+      meta.textContent = `Top realized: ${topRealized?.label || '—'} ${fmtUsd(topRealized?.realized_pnl || 0)}. Most capital in use: ${topUtil?.label || '—'} ${fmtUsd(topUtil?.committed_capital || 0)}.`;
+      body.innerHTML = strategies.map(row => {
+        const tradeLabel = `${row.trade_count || 0} total`;
+        const tradeSub = `${row.open_trades || 0} open / ${row.closed_trades || 0} closed`;
+        const capitalSub = `${(row.bankroll_utilization_pct || 0).toFixed(1)}% of bankroll`;
+        const winRate = row.closed_trades ? `${(row.win_rate || 0).toFixed(1)}%` : '—';
+        const winSub = row.closed_trades ? `${row.wins || 0}W / ${row.losses || 0}L` : 'No closed trades';
+        return `<tr>
+          <td>${esc(row.label || row.strategy || '')}</td>
+          <td>${formatSignedCell(row.realized_pnl || 0)}</td>
+          <td>${formatSignedCell(row.unrealized_pnl || 0)}</td>
+          <td><div class="metric-stack"><span>${winRate}</span><span class="sub">${esc(winSub)}</span></div></td>
+          <td><div class="metric-stack"><span>${esc(tradeLabel)}</span><span class="sub">${esc(tradeSub)}</span></div></td>
+          <td><div class="metric-stack"><span>${fmtUsd(row.committed_capital || 0)}</span><span class="sub">${esc(capitalSub)}</span></div></td>
+        </tr>`;
+      }).join('');
+    }
+
     drawPnlChart(s.pnl_series);
   } catch(e) {}
 }
