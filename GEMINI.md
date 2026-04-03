@@ -146,12 +146,15 @@ launchctl load ~/Library/LaunchAgents/com.polymarket.scanner.plist
 
 ## Environment Variables
 All in `.env` (see `.env.example`):
-- `BRAIN_PROVIDER` — `auto` prefers Anthropic while credits remain, then falls forward to OpenAI; `anthropic` or `openai` pins the provider
+- `BRAIN_PROVIDER` — `auto` prefers Anthropic while credits remain, then falls forward to OpenAI and finally xAI/Grok; `anthropic`, `openai`, or `xai` pins the provider.
 - `ANTHROPIC_API_KEY` — enables Anthropic as the current/default brain provider
 - `OPENAI_API_KEY` — enables OpenAI/Codex as warm standby or cutover provider for brain.py
+- `XAI_API_KEY` — enables xAI/Grok as an additional fallback brain provider
 - `OPENAI_BASE_URL` — optional OpenAI-compatible base URL override for Codex/OpenAI testing or cutover
+- `XAI_BASE_URL` — optional Grok/xAI base URL override (e.g., `https://api.x.ai/v1`)
 - `BRAIN_ANTHROPIC_MODEL` / `BRAIN_ANTHROPIC_COMPLEX_MODEL` — optional Anthropic model overrides for `brain.py`
 - `BRAIN_OPENAI_MODEL` / `BRAIN_OPENAI_COMPLEX_MODEL` — optional OpenAI model overrides for `brain.py`
+- `BRAIN_XAI_MODEL` / `BRAIN_XAI_COMPLEX_MODEL` — optional xAI/Grok model overrides for `brain.py`
 - `TELEGRAM_BOT_TOKEN` + `TELEGRAM_CHAT_ID` — enables Telegram alerts
 - `ALCHEMY_API_KEY` — enables blockchain.py (Polygon RPC)
 - `POLYMARKET_PRIVATE_KEY` — enables live trading (Tier 3)

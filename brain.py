@@ -17,6 +17,7 @@ PROMPTS_DIR = Path(__file__).parent / "prompts"
 PROMPT_VERSION = "v1"
 PROVIDER_ANTHROPIC = "anthropic"
 PROVIDER_OPENAI = "openai"
+PROVIDER_XAI = "xai"
 PROVIDER_AUTO = "auto"
 
 DEFAULT_MODEL = "default"
@@ -26,10 +27,12 @@ DEFAULT_MODEL_ALIASES = {
     DEFAULT_MODEL: {
         PROVIDER_ANTHROPIC: "claude-haiku-4-5-20251001",
         PROVIDER_OPENAI: "gpt-5-mini",
+        PROVIDER_XAI: "grok-4.20-beta-latest-non-reasoning",
     },
     OPUS_MODEL: {
         PROVIDER_ANTHROPIC: "claude-opus-4-1-20250805",
         PROVIDER_OPENAI: "gpt-5",
+        PROVIDER_XAI: "grok-4.20-beta-latest-reasoning",
     },
 }
 
@@ -45,10 +48,12 @@ def _model_aliases() -> dict[str, dict[str, str]]:
         DEFAULT_MODEL: {
             PROVIDER_ANTHROPIC: _env_value("BRAIN_ANTHROPIC_MODEL") or DEFAULT_MODEL_ALIASES[DEFAULT_MODEL][PROVIDER_ANTHROPIC],
             PROVIDER_OPENAI: _env_value("BRAIN_OPENAI_MODEL") or DEFAULT_MODEL_ALIASES[DEFAULT_MODEL][PROVIDER_OPENAI],
+            PROVIDER_XAI: _env_value("BRAIN_XAI_MODEL") or DEFAULT_MODEL_ALIASES[DEFAULT_MODEL][PROVIDER_XAI],
         },
         OPUS_MODEL: {
             PROVIDER_ANTHROPIC: _env_value("BRAIN_ANTHROPIC_COMPLEX_MODEL") or DEFAULT_MODEL_ALIASES[OPUS_MODEL][PROVIDER_ANTHROPIC],
             PROVIDER_OPENAI: _env_value("BRAIN_OPENAI_COMPLEX_MODEL") or DEFAULT_MODEL_ALIASES[OPUS_MODEL][PROVIDER_OPENAI],
+            PROVIDER_XAI: _env_value("BRAIN_XAI_COMPLEX_MODEL") or DEFAULT_MODEL_ALIASES[OPUS_MODEL][PROVIDER_XAI],
         },
     }
 
@@ -58,6 +63,8 @@ def _provider_api_key_name(provider: str) -> str:
         return "ANTHROPIC_API_KEY"
     if provider == PROVIDER_OPENAI:
         return "OPENAI_API_KEY"
+    if provider == PROVIDER_XAI:
+        return "XAI_API_KEY"
     raise ValueError(f"Unknown provider {provider}")
 
 
@@ -83,7 +90,7 @@ def _build_prompt(question, price, context=""):
 def _brain_provider():
     """Configured provider preference."""
     provider = (_env_value("BRAIN_PROVIDER") or PROVIDER_AUTO).lower()
-    if provider not in {PROVIDER_AUTO, PROVIDER_ANTHROPIC, PROVIDER_OPENAI}:
+    if provider not in {PROVIDER_AUTO, PROVIDER_ANTHROPIC, PROVIDER_OPENAI, PROVIDER_XAI}:
         log.warning("Unknown BRAIN_PROVIDER=%s — falling back to auto", provider)
         return PROVIDER_AUTO
     return provider
@@ -94,17 +101,22 @@ def _available_provider_order():
     provider = _brain_provider()
     has_anthropic = _provider_is_configured(PROVIDER_ANTHROPIC)
     has_openai = _provider_is_configured(PROVIDER_OPENAI)
+    has_xai = _provider_is_configured(PROVIDER_XAI)
 
     if provider == PROVIDER_ANTHROPIC:
         return [PROVIDER_ANTHROPIC] if has_anthropic else []
     if provider == PROVIDER_OPENAI:
         return [PROVIDER_OPENAI] if has_openai else []
+    if provider == PROVIDER_XAI:
+        return [PROVIDER_XAI] if has_xai else []
 
     order = []
     if has_anthropic:
         order.append(PROVIDER_ANTHROPIC)
     if has_openai:
         order.append(PROVIDER_OPENAI)
+    if has_xai:
+        order.append(PROVIDER_XAI)
     return order
 
 
@@ -137,6 +149,22 @@ def _get_openai_client():
         log.warning("openai package not installed — OpenAI brain disabled")
         return None
 
+def _get_xai_client():
+    """Get xAI client. Returns None if unavailable."""
+    api_key = _env_value("XAI_API_KEY")
+    if not api_key:
+        return None
+    try:
+        from xai_sdk import Client
+        base_url = _env_value("XAI_BASE_URL")
+        kwargs = {"api_key": api_key}
+        if base_url:
+            kwargs["base_url"] = base_url
+        return Client(**kwargs)
+    except ImportError:
+        log.warning("xai_sdk package not installed — xAI brain disabled")
+        return None
+
 
 def _get_provider_client(provider: str):
     """Get client for a single provider."""
@@ -144,6 +172,8 @@ def _get_provider_client(provider: str):
         return _get_anthropic_client()
     if provider == PROVIDER_OPENAI:
         return _get_openai_client()
+    if provider == PROVIDER_XAI:
+        return _get_xai_client()
     raise ValueError(f"Unknown provider {provider}")
 
 
@@ -173,6 +203,12 @@ def get_runtime_status() -> dict:
                 "default_model": aliases[DEFAULT_MODEL][PROVIDER_OPENAI],
                 "complex_model": aliases[OPUS_MODEL][PROVIDER_OPENAI],
                 "base_url": _env_value("OPENAI_BASE_URL") or None,
+            },
+            PROVIDER_XAI: {
+                "configured": _provider_is_configured(PROVIDER_XAI),
+                "default_model": aliases[DEFAULT_MODEL][PROVIDER_XAI],
+                "complex_model": aliases[OPUS_MODEL][PROVIDER_XAI],
+                "base_url": _env_value("XAI_BASE_URL") or None,
             },
         },
     }
@@ -347,6 +383,68 @@ def _openai_message_text(client, prompt: str, model: str, max_tokens: int) -> tu
     raise RuntimeError(f"No available brain model for requested model {model}")
 
 
+def _xai_should_fallback(exc: Exception) -> bool:
+    message = str(exc).lower()
+    fallback_markers = (
+        "credit",
+        "quota",
+        "billing",
+        "rate limit",
+        "timeout",
+        "429",
+        "401",
+        "authentication",
+        "model",
+    )
+    return any(marker in message for marker in fallback_markers)
+
+
+def _extract_xai_text(response) -> str:
+    """Normalize xAI response text across client surfaces."""
+    text = getattr(response, "output_text", None)
+    if text:
+        return _normalise_text_response(text)
+
+    output = getattr(response, "output", None) or []
+    for item in output:
+        if getattr(item, "type", "") == "message":
+            for chunk in getattr(item, "content", []) or []:
+                if getattr(chunk, "type", "") == "output_text":
+                    candidate = getattr(chunk, "text", "")
+                    if candidate:
+                        return _normalise_text_response(candidate)
+            for chunk in getattr(item, "content", []) or []:
+                text_value = getattr(chunk, "text", None)
+                if text_value:
+                    return _normalise_text_response(text_value)
+
+    return _normalise_text_response(str(response))
+
+
+def _xai_message_text(client, prompt: str, model: str, max_tokens: int) -> tuple[str, str]:
+    """Call Grok via the xai_sdk client."""
+    tried = []
+    for candidate in _resolve_model_candidates(PROVIDER_XAI, model):
+        if candidate in tried:
+            continue
+        tried.append(candidate)
+        try:
+            response = client.responses.create(
+                model=candidate,
+                input=[{"role": "user", "content": prompt}],
+                max_output_tokens=max_tokens,
+            )
+            if candidate != model:
+                log.warning("Brain model fallback: %s -> %s", model, candidate)
+            return _extract_xai_text(response), candidate
+        except Exception as e:
+            if _xai_should_fallback(e):
+                log.warning("Brain model unavailable: %s (%s)", candidate, e)
+                continue
+            raise
+    raise RuntimeError(f"No available brain model for requested model {model}")
+
+
 def _brain_request(prompt: str, model: str, max_tokens: int) -> dict | None:
     """Execute a brain request across configured providers."""
     candidates = _get_client_candidates()
@@ -360,8 +458,10 @@ def _brain_request(prompt: str, model: str, max_tokens: int) -> dict | None:
         try:
             if provider == PROVIDER_ANTHROPIC:
                 text, used_model = _anthropic_message_text(client, prompt, model=model, max_tokens=max_tokens)
-            else:
+            elif provider == PROVIDER_OPENAI:
                 text, used_model = _openai_message_text(client, prompt, model=model, max_tokens=max_tokens)
+            else:
+                text, used_model = _xai_message_text(client, prompt, model=model, max_tokens=max_tokens)
             return {
                 "provider": provider,
                 "model": used_model,
@@ -371,7 +471,8 @@ def _brain_request(prompt: str, model: str, max_tokens: int) -> dict | None:
             last_error = e
             should_fallback = (
                 _anthropic_should_fallback(e) if provider == PROVIDER_ANTHROPIC
-                else _openai_should_fallback(e)
+                else _openai_should_fallback(e) if provider == PROVIDER_OPENAI
+                else _xai_should_fallback(e)
             )
             if should_fallback:
                 log.warning("Brain provider fallback: %s failed (%s)", provider, e)

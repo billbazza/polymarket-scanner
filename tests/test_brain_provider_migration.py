@@ -9,9 +9,13 @@ class BrainProviderMigrationTests(unittest.TestCase):
         self.original_env = {
             "ANTHROPIC_API_KEY": os.environ.get("ANTHROPIC_API_KEY"),
             "OPENAI_API_KEY": os.environ.get("OPENAI_API_KEY"),
+            "XAI_API_KEY": os.environ.get("XAI_API_KEY"),
             "BRAIN_PROVIDER": os.environ.get("BRAIN_PROVIDER"),
             "BRAIN_OPENAI_MODEL": os.environ.get("BRAIN_OPENAI_MODEL"),
+            "BRAIN_XAI_MODEL": os.environ.get("BRAIN_XAI_MODEL"),
+            "BRAIN_XAI_COMPLEX_MODEL": os.environ.get("BRAIN_XAI_COMPLEX_MODEL"),
             "OPENAI_BASE_URL": os.environ.get("OPENAI_BASE_URL"),
+            "XAI_BASE_URL": os.environ.get("XAI_BASE_URL"),
         }
 
         import brain
@@ -39,6 +43,19 @@ class BrainProviderMigrationTests(unittest.TestCase):
         self.assertEqual(
             brain._available_provider_order(),
             [brain.PROVIDER_ANTHROPIC, brain.PROVIDER_OPENAI],
+        )
+
+    def test_auto_provider_appends_xai_fallback(self):
+        os.environ["ANTHROPIC_API_KEY"] = "ant-test"
+        os.environ["OPENAI_API_KEY"] = "openai-test"
+        os.environ["XAI_API_KEY"] = "xai-test"
+        os.environ["BRAIN_PROVIDER"] = "auto"
+
+        brain = importlib.reload(self.brain)
+
+        self.assertEqual(
+            brain._available_provider_order(),
+            [brain.PROVIDER_ANTHROPIC, brain.PROVIDER_OPENAI, brain.PROVIDER_XAI],
         )
 
     def test_auto_provider_uses_openai_when_anthropic_key_missing(self):
@@ -90,6 +107,34 @@ class BrainProviderMigrationTests(unittest.TestCase):
         self.assertEqual(response["provider"], brain.PROVIDER_OPENAI)
         self.assertEqual(response["model"], "gpt-5-mini")
 
+    def test_brain_request_falls_back_from_openai_to_xai_on_credit_error(self):
+        os.environ["OPENAI_API_KEY"] = "openai-test"
+        os.environ["XAI_API_KEY"] = "xai-test"
+        os.environ["BRAIN_PROVIDER"] = "auto"
+
+        brain = importlib.reload(self.brain)
+
+        with mock.patch.object(
+            brain,
+            "_get_client_candidates",
+            return_value=[
+                {"provider": brain.PROVIDER_OPENAI, "client": object()},
+                {"provider": brain.PROVIDER_XAI, "client": object()},
+            ],
+        ), mock.patch.object(
+            brain,
+            "_openai_message_text",
+            side_effect=RuntimeError("OpenAI credit balance is too low"),
+        ), mock.patch.object(
+            brain,
+            "_xai_message_text",
+            return_value=('{"trade": true, "reasoning": "grok fallback"}', "grok-4"),
+        ):
+            response = brain._brain_request("prompt", model=brain.DEFAULT_MODEL, max_tokens=200)
+
+        self.assertEqual(response["provider"], brain.PROVIDER_XAI)
+        self.assertEqual(response["model"], "grok-4")
+
     def test_model_aliases_are_resolved_from_runtime_env(self):
         os.environ["OPENAI_API_KEY"] = "openai-test"
         os.environ["BRAIN_PROVIDER"] = "openai"
@@ -105,8 +150,10 @@ class BrainProviderMigrationTests(unittest.TestCase):
     def test_runtime_status_reports_cutover_readiness(self):
         os.environ["ANTHROPIC_API_KEY"] = "ant-test"
         os.environ["OPENAI_API_KEY"] = "openai-test"
+        os.environ["XAI_API_KEY"] = "xai-test"
         os.environ["BRAIN_PROVIDER"] = "auto"
         os.environ["OPENAI_BASE_URL"] = "https://api.openai.com/v1"
+        os.environ["XAI_BASE_URL"] = "https://api.x.ai/v1"
 
         brain = importlib.reload(self.brain)
 
@@ -116,16 +163,20 @@ class BrainProviderMigrationTests(unittest.TestCase):
         self.assertEqual(status["mode"], brain.PROVIDER_AUTO)
         self.assertEqual(
             status["configured_order"],
-            [brain.PROVIDER_ANTHROPIC, brain.PROVIDER_OPENAI],
+            [brain.PROVIDER_ANTHROPIC, brain.PROVIDER_OPENAI, brain.PROVIDER_XAI],
         )
         self.assertEqual(
             status["client_ready_order"],
-            [brain.PROVIDER_ANTHROPIC, brain.PROVIDER_OPENAI],
+            [brain.PROVIDER_ANTHROPIC, brain.PROVIDER_OPENAI, brain.PROVIDER_XAI],
         )
         self.assertTrue(status["fallback_enabled"])
         self.assertEqual(
             status["providers"][brain.PROVIDER_OPENAI]["base_url"],
             "https://api.openai.com/v1",
+        )
+        self.assertEqual(
+            status["providers"][brain.PROVIDER_XAI]["base_url"],
+            "https://api.x.ai/v1",
         )
 
     def test_pinned_provider_with_missing_key_keeps_graceful_degradation(self):
