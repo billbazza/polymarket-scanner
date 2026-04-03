@@ -92,7 +92,7 @@ async def authorize_mutating_routes(request: Request, call_next):
     return await call_next(request)
 
 DASHBOARD_PATH = Path(__file__).parent / "dashboard.html"
-DAILY_REPORTS_DIR = Path(__file__).parent / "reports" / "daily"
+DAILY_REPORTS_DIR = Path(__file__).parent / "reports"
 DIAGNOSTICS_DIR = Path(__file__).parent / "reports" / "diagnostics"
 IMPLEMENTATION_PLAN_PATH = Path(__file__).parent / "implementation-plan.md"
 TESTING_IDEAS_PATH = Path(__file__).parent / "testing-ideas.md"
@@ -224,8 +224,11 @@ def _daily_report_context() -> dict:
 
 def _render_daily_report_markdown(report_date: str, context: dict, report: dict) -> str:
     working = "\n".join(f"- {item}" for item in report.get("working", []))
-    not_working = "\n".join(f"- {item}" for item in report.get("not_working", []))
-    improvements = "\n".join(f"{i}. {item}" for i, item in enumerate(report.get("improvements", []), start=1))
+    def checkbox_list(items, checked=False):
+        mark = "x" if checked else " "
+        return "\n".join(f"- [{mark}] {item}" for item in items)
+    not_working = checkbox_list(report.get("not_working", []))
+    improvements = checkbox_list(report.get("improvements", []))
     return f"""# Daily Report - {report_date}
 
 Generated at: {context['generated_at']}
@@ -294,12 +297,24 @@ def _parse_daily_report_markdown(content: str) -> dict:
             continue
         if current == "summary":
             report["summary"] = (report["summary"] + "\n" + line).strip()
-        elif current in {"working", "not_working"} and line.startswith("- "):
-            report[current].append(line[2:].strip())
+        elif current in {"working", "not_working"}:
+            match = re.match(r"-\s*\[(?: |x|X)\]\s*(.+)", line)
+            if match:
+                report[current].append(match.group(1).strip())
+                continue
+            if line.startswith("- "):
+                report[current].append(line[2:].strip())
         elif current == "improvements":
-            item = re.sub(r"^\d+\.\s*", "", line).strip()
-            if item:
-                report["improvements"].append(item)
+            cleaned = re.sub(r"^\d+\.\s*", "", line).strip()
+            match = re.match(r"-\s*\[(?: |x|X)\]\s*(.+)", cleaned)
+            if match:
+                candidate = match.group(1).strip()
+            elif cleaned.startswith("- "):
+                candidate = cleaned[2:].strip()
+            else:
+                candidate = cleaned
+            if candidate:
+                report["improvements"].append(candidate)
     return report
 
 
@@ -350,6 +365,44 @@ def _write_action_item(
     else:
         content = existing.rstrip() + f"\n\n{section_header}\n{bullet}\n"
     path.write_text(content.rstrip() + "\n")
+
+
+def _resolve_report_item_log_path(item: dict) -> Path | None:
+    for attr in ("diagnosis_path", "action_path"):
+        candidate = item.get(attr)
+        if candidate:
+            candidate_path = Path(candidate)
+            if candidate_path.is_file():
+                return candidate_path
+    fallback = FIX_LOGS_DIR / f"{item['report_date']}-report-followups.md"
+    if fallback.is_file():
+        return fallback
+    return None
+
+
+def _log_snippet(path: Path, needle: str | None, window: int = 8) -> str:
+    try:
+        lines = path.read_text().splitlines()
+    except Exception as exc:
+        log.warning("Failed to read log snippet from %s: %s", path, exc)
+        return ""
+    if not lines:
+        return ""
+    focus = 0
+    if needle:
+        lower = needle.lower()
+        for idx, line in enumerate(lines):
+            if lower in line.lower():
+                focus = idx
+                break
+    start = max(0, focus - window // 2)
+    end = min(len(lines), start + window)
+    snippet = lines[start:end]
+    if start > 0:
+        snippet.insert(0, "... (truncated) ...")
+    if end < len(lines):
+        snippet.append("... (truncated) ...")
+    return "\n".join(snippet)
 
 
 def _append_fix_log(item: dict) -> Path:
@@ -701,6 +754,22 @@ async def complete_report_item(item_id: int):
         notes="Completed and removed from the active review queue.",
     )
     return {"ok": True, "item": updated}
+
+
+@app.get("/api/reports/items/{item_id}/log")
+async def get_report_item_log(item_id: int):
+    item = db.get_report_item(item_id)
+    if not item:
+        raise HTTPException(404, "Report item not found")
+    path = _resolve_report_item_log_path(item)
+    if not path:
+        raise HTTPException(404, "Log file not found for this report item")
+    snippet = _log_snippet(path, item.get("item_text"))
+    return {
+        "ok": True,
+        "path": str(path),
+        "snippet": snippet,
+    }
 
 
 # --- Signals ---

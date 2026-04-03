@@ -826,6 +826,7 @@
 const API = '';
 const ALL_PANELS = ['signals','locked','weather','whales','copy','paper-attempts','trades','history','scans','reports','console'];
 const UI_PREFS_KEY = 'polymarket-scanner-ui-prefs-v1';
+let reportItemLogCache = {};
 
 // ── Utilities ──────────────────────────────────────────────────────────────
 
@@ -1877,6 +1878,7 @@ async function loadDailyReport() {
   const meta = getEl('dailyReportMeta');
   const content = getEl('dailyReportContent');
   const queues = getEl('dailyReportQueues');
+  reportItemLogCache = {};
   if (!meta || !content || !queues) return;
   try {
     const r = await fetch(API + '/api/reports/daily');
@@ -1950,6 +1952,7 @@ function dailyReportItemCard(item, buttons) {
         ${reportItemBadge(item)}
       </div>
       <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:10px">${buttons}</div>
+      <div id="reportItemLog-${item.id}" style="margin-top:10px;min-height:28px;font-size:11px;color:var(--text2)"></div>
       ${notes}${diag}${action}
     </div>`;
 }
@@ -1968,6 +1971,7 @@ function renderDailyReportQueues(report, items) {
     `
       <button class="btn sm" onclick="runReportItemAction(${item.id}, 'fix-log')">Add to Fix Log</button>
       <button class="btn sm sky" onclick="runReportItemAction(${item.id}, 'diagnose')">Diagnose</button>
+      <button class="btn sm" style="border-color:var(--text2);color:var(--text2)" onclick="viewReportItemLog(${item.id})">Check Log</button>
     `
   )).join('');
   const improvementCards = improvements.map(item => dailyReportItemCard(
@@ -1976,6 +1980,7 @@ function renderDailyReportQueues(report, items) {
       <button class="btn sm" onclick="runReportItemAction(${item.id}, 'plan')">Add to Plan</button>
       <button class="btn sm" onclick="runReportItemAction(${item.id}, 'testing')">Mark Test Only</button>
       <button class="btn sm sky" onclick="runReportItemAction(${item.id}, 'live-candidate')">Mark Live Candidate</button>
+      <button class="btn sm" style="border-color:var(--text2);color:var(--text2)" onclick="viewReportItemLog(${item.id})">Check Log</button>
     `
   )).join('');
   queues.innerHTML = `
@@ -2016,6 +2021,36 @@ async function runReportItemAction(itemId, action) {
     loadDailyReport();
   } catch(e) {
     toast('Report item action failed: ' + e.message, true);
+  }
+}
+
+async function viewReportItemLog(itemId) {
+  const container = getEl(`reportItemLog-${itemId}`);
+  if (!container) return;
+  if (reportItemLogCache[itemId]) {
+    container.innerHTML = reportItemLogCache[itemId];
+    return;
+  }
+  container.innerHTML = `<div style="font-size:11px;color:var(--text2)">Loading log…</div>`;
+  try {
+    const r = await fetch(API + `/api/reports/items/${itemId}/log`);
+    const data = await r.json();
+    if (!r.ok || !data.ok) {
+      throw new Error(data.detail || data.error || 'Request failed');
+    }
+    const pathLine = data.path
+      ? `<div style="font-size:11px;color:var(--text2);margin-bottom:4px">Log: ${esc(data.path)}</div>`
+      : '';
+    const snippet = data.snippet
+      ? `<pre style="margin:0;font-size:11px;font-family:'SF Mono','Fira Code',monospace;line-height:1.4;color:var(--text);background:rgba(148,163,184,0.08);padding:6px;border-radius:6px;border:1px solid var(--border)">${esc(data.snippet)}</pre>`
+      : `<div style="font-size:11px;color:var(--text2)">No excerpt available.</div>`;
+    const html = `${pathLine}${snippet}`;
+    container.innerHTML = html;
+    reportItemLogCache[itemId] = html;
+  } catch(e) {
+    const message = e?.message || String(e);
+    container.innerHTML = `<div style="font-size:11px;color:var(--red)">Failed to load log: ${esc(message)}</div>`;
+    toast('Check log failed: ' + message, true);
   }
 }
 
