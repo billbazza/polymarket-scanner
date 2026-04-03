@@ -13,6 +13,7 @@ System is operationally healthy with 67.3% win rate and $252.53 total PnL from 1
 - Scanner infrastructure stable with consistent 1.8-2.0 second scan times
 - Paper trading system functioning with proper position tracking and risk management
 - Whale detection actively identifying suspicious market activity with 65-69 suspicion scores
+- Stage 2 polygon gating instrumentation now snapshots Polygon block metadata and dual-leg slippage whenever `STAGE2_POLYGON_GATING=1`, giving every paper-run attempt an on-chain reference (see `fix_logs/2026-04-03-stage2-polygon-gating.md`).
 - [x] Daily report workflow is consolidated into this single Markdown file per date; redundant needed/create splits have been retired and the UI now keeps one saved entry.
 
 ## Not Working
@@ -32,11 +33,11 @@ System is operationally healthy with 67.3% win rate and $252.53 total PnL from 1
 
 ## Status Summary
 - All previously flagged “Not Working” items have corresponding fix logs and are stable; cointegration now admits trades, the copy wallet gate is stricter, whale positions auto-exit, weather guards lean on liquidity/noise filters, and confidence-based sizing drives fills.
-- Stage 2 Perplexity validation is now integrated (cached verdicts + fallback metadata) and recorded in `fix_logs/2026-04-04-stage2-perplexity-validation.md`; the remaining Stage 3 live-readiness work is sequenced via the Kanban tasks below.
+- Stage 2 Perplexity validation is now integrated (cached verdicts + fallback metadata) and recorded in `fix_logs/2026-04-04-stage2-perplexity-validation.md`; Stage 2 polygon gating instrumentation now logs block metadata/slippage (`fix_logs/2026-04-03-stage2-polygon-gating.md`); the remaining Stage 2/3 live-test work is sequenced via the Kanban tasks below.
 
 ## Kanban Tasks
-- `Stage 2 Polygon Gating` – capture Polygon rollouts for block/chain parity, liquidity gate, and slippage checks so stage 2 paper runs can log block metadata before trading.
-- `Stage 2 Perplexity Validation` – evaluation now runs during scans, the verdict is cached in `perplexity_json`, and fallback paths are logged per `fix_logs/2026-04-04-stage2-perplexity-validation.md`; remaining Kanban work now focuses on Polygon gating + Stage 3 readiness.
+- [x] `Stage 2 Polygon Gating` – capture Polygon rollouts for block/chain parity, liquidity gate, and slippage checks so stage 2 paper runs can log block metadata before trading (`fix_logs/2026-04-03-stage2-polygon-gating.md`).
+- `Stage 2 Perplexity Validation` – integrate Perplexity verdicts, tag “profitable candidate” features, and log fallback behavior per `fix_logs/2026-04-04-stage2-perplexity-validation.md`.
 - `Stage 3 Live Readiness` – document the readiness checklist (balance, slippage, quarter-Kelly caps, POLYMARKET_PRIVATE_KEY/ALCHEMY_API_KEY checks) so the limited $1–5 live exposure obeys the autonomy risk gating.
 
 ## Stage 2/3 Live-Test Plan

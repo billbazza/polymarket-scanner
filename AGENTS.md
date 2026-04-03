@@ -168,14 +168,16 @@ All in `.env` (see `.env.example`):
 - `TELEGRAM_BOT_TOKEN` + `TELEGRAM_CHAT_ID` — enables Telegram alerts
 - `ALCHEMY_API_KEY` — enables blockchain.py (Polygon RPC)
 - `POLYMARKET_PRIVATE_KEY` — enables live trading (Tier 3)
+- `STAGE2_POLYGON_GATING` — `1`/`true`/`yes` turns on Stage 2 Polygon gating; paper trades log the Polygon block snapshot, chain parity, and dual-leg slippage before execution.
 
 ## Recent Fix Logs
 - `fix_logs/2026-04-04-weather-stop-loss-tuning.md`: broadened the weather entry gate to 60+ hours and log detailed stop contexts (signal hours, obs lookback, trend) so the next tuning pass can correlate the worst -$4/-$5 exits with intraday noise.
 - `fix_logs/2026-04-03-confidence-based-sizing-rollout.md`: confidence-based sizing now overrides the requested USD amount, enforces the 0.25 Kelly cap, and carries the recommendation metadata through execution so the 53 shadow decisions actually affect fills.
 - `fix_logs/2026-04-03-copy-strategy-filter-tuning.md`: tightened the copy strategy so only "informed" wallets (score ≥65, avg trade ≥$750) get mirrored and `inspect_copy_trade_open()` now blocks wallets with negative stored PnL or an AI verdict other than `copy`.
+- `fix_logs/2026-04-03-stage2-polygon-gating.md`: Stage 2 paper runs with `STAGE2_POLYGON_GATING` now capture Polygon block metadata, chain parity, and dual-leg slippage before trading so every attempt carries the rollout snapshot.
 - `fix_logs/2026-04-03-copy-strategy-filter-rework.md`: enforced the informed/65/750 wallet filter using the precise avg size, centralized the wallet PnL/brain-verdict gate, and prevented `_add_column_if_missing()` from crashing when `signals` is still missing in a backfilled schema.
 - `fix_logs/2026-04-04-stage2-perplexity-validation.md`: Stage 2 Perplexity validation now caches verdicts, stores `perplexity_json`, and annotates profitable candidates so downstream automation can see the fallback metadata before promoting signals.
 
 ## Daily Report Updates
 - 2026-04-03 report refreshed so the “Not Working” and “Top 5 Improvements” entries now point to the resolved fix logs while still highlighting the Stage 2/3 live-test plan captured in `reports/2026-04-03-daily-report.md`.
-- Status: system health is stable with the reopened issues closed; Stage 2 Perplexity validation is now integrated (`fix_logs/2026-04-04-stage2-perplexity-validation.md`) and the remaining rollout work is tracked through the Kanban tasks for Polygon gating and live-readiness.
+- Status: system health is stable with the reopened issues closed; Stage 2 Perplexity validation is now integrated (`fix_logs/2026-04-04-stage2-perplexity-validation.md`), Stage 2 polygon gating instrumentation is logging block metadata and dual-leg slippage when `STAGE2_POLYGON_GATING=1` (`fix_logs/2026-04-03-stage2-polygon-gating.md`), and the remaining Stage 2/3 rollout work is tracked through the Kanban tasks for Polygon gating, Perplexity validation, and live-readiness.

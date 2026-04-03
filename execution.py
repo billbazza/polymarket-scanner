@@ -27,6 +27,27 @@ MAKER_AGGRESSION = 0.5
 # GTC orders expire and are cancelled after this many hours if unfilled.
 ORDER_TTL_HOURS = 4
 
+
+def _stage2_enabled():
+    """Return True when Stage 2 polygon gating instrumentation is active."""
+    return os.environ.get("STAGE2_POLYGON_GATING", "").strip().lower() in {
+        "1", "true", "yes", "on",
+    }
+
+
+def _fetch_stage2_rollout():
+    """Pull the latest Polygon rollout snapshot."""
+    try:
+        import blockchain
+    except ImportError as exc:
+        log.warning("Stage 2 polygon rollout disabled: %s", exc)
+        return {"ok": False, "error": "blockchain module unavailable"}
+    try:
+        return blockchain.capture_polygon_rollout()
+    except Exception as exc:
+        log.warning("Stage 2 polygon rollout failed: %s", exc)
+        return {"ok": False, "error": str(exc)}
+
 def _get_mode():
     """Determine trading mode from environment."""
     key = os.environ.get("POLYMARKET_PRIVATE_KEY", "")
@@ -175,12 +196,33 @@ def execute_trade(signal, size_usd, mode=None):
     log.info("Executing trade: %s | size=$%.2f mode=%s z=%.2f",
              signal.get("event", "?")[:50], size_usd, mode, signal.get("z_score", 0))
 
+    stage2_context = None
+    if _stage2_enabled() and mode == "paper":
+        rollout_snapshot = _fetch_stage2_rollout()
+        stage2_context = {"polygon_rollout": rollout_snapshot}
+        block_info = rollout_snapshot.get("block") if rollout_snapshot else {}
+        log.info(
+            "Stage 2 polygon rollout: block #%s chain=%s parity=%s error=%s",
+            block_info.get("block_number"),
+            rollout_snapshot.get("chain_id"),
+            rollout_snapshot.get("chain_parity_ok"),
+            rollout_snapshot.get("block_error") or rollout_snapshot.get("chain_error"),
+        )
+
+    def _wrap_result(payload):
+        if stage2_context is not None:
+            payload["stage2_context"] = stage2_context
+        return payload
+
     # 1. Balance pre-check
     bal = check_balance(mode)
     if not bal["ok"]:
         log.warning("Balance check failed: %s", bal.get("error"))
-        return {"ok": False, "error": f"Balance check failed: {bal.get('error')}",
-                "mode": mode}
+        return _wrap_result({
+            "ok": False,
+            "error": f"Balance check failed: {bal.get('error')}",
+            "mode": mode,
+        })
 
     quarter_kelly_capped = False
     size_before_cap = size_usd
@@ -194,8 +236,11 @@ def execute_trade(signal, size_usd, mode=None):
         )
     if bal["balance_usd"] < size_usd:
         log.warning("Insufficient balance: $%.2f < $%.2f", bal["balance_usd"], size_usd)
-        return {"ok": False, "error": f"Insufficient balance: ${bal['balance_usd']:.2f} < ${size_usd:.2f}",
-                "mode": mode}
+        return _wrap_result({
+            "ok": False,
+            "error": f"Insufficient balance: ${bal['balance_usd']:.2f} < ${size_usd:.2f}",
+            "mode": mode,
+        })
 
     # 2. Determine sides and fetch entry prices
     token_a = signal.get("token_id_a") or signal["market_a"]
@@ -211,40 +256,75 @@ def execute_trade(signal, size_usd, mode=None):
             price_a, price_b = _get_maker_prices(token_a, token_b, side_a, side_b)
         except Exception as e:
             log.error("Failed to compute maker prices: %s", e)
-            return {"ok": False, "error": f"Maker price fetch failed: {e}", "mode": mode}
+            return _wrap_result({"ok": False, "error": f"Maker price fetch failed: {e}", "mode": mode})
     else:
         try:
             price_a = api.get_midpoint(token_a)
             price_b = api.get_midpoint(token_b)
         except Exception as e:
             log.error("Failed to fetch current prices: %s", e)
-            return {"ok": False, "error": f"Price fetch failed: {e}", "mode": mode}
+            return _wrap_result({"ok": False, "error": f"Price fetch failed: {e}", "mode": mode})
 
     if price_a <= 0 or price_b <= 0:
         log.warning("Invalid prices: a=%.4f b=%.4f", price_a, price_b)
-        return {"ok": False, "error": f"Invalid prices: a={price_a} b={price_b}",
-                "mode": mode}
+        return _wrap_result({
+            "ok": False,
+            "error": f"Invalid prices: a={price_a} b={price_b}",
+            "mode": mode,
+        })
 
-    # 3. Slippage check — taker mode only (maker orders set their own price)
+    half_size = size_usd / 2
+
+    def _check(token_id):
+        return math_engine.check_slippage(
+            token_id, trade_size_usd=half_size, max_slippage_pct=MAX_SLIPPAGE_PCT,
+        )
+
+    slippage_leg_a = None
+    slippage_leg_b = None
+
     if mode == "live" and exec_mode == "taker":
-        slippage = math_engine.check_slippage(
-            token_a, trade_size_usd=size_usd / 2, max_slippage_pct=MAX_SLIPPAGE_PCT,
-        )
-        if not slippage["ok"]:
-            log.warning("Slippage check failed for leg A: %s", slippage.get("reason"))
-            return {"ok": False, "error": f"Slippage too high: {slippage.get('reason')}",
-                    "slippage": slippage, "mode": mode}
-        slippage_b = math_engine.check_slippage(
-            token_b, trade_size_usd=size_usd / 2, max_slippage_pct=MAX_SLIPPAGE_PCT,
-        )
-        if not slippage_b["ok"]:
-            log.warning("Slippage check failed for leg B: %s", slippage_b.get("reason"))
-            return {"ok": False, "error": f"Slippage too high on leg B: {slippage_b.get('reason')}",
-                    "slippage": slippage_b, "mode": mode}
+        slippage_leg_a = _check(token_a)
+        if not slippage_leg_a["ok"]:
+            log.warning("Slippage check failed for leg A: %s", slippage_leg_a.get("reason"))
+            return _wrap_result({
+                "ok": False,
+                "error": f"Slippage too high: {slippage_leg_a.get('reason')}",
+                "slippage": slippage_leg_a,
+                "mode": mode,
+            })
+        slippage_leg_b = _check(token_b)
+        if not slippage_leg_b["ok"]:
+            log.warning("Slippage check failed for leg B: %s", slippage_leg_b.get("reason"))
+            return _wrap_result({
+                "ok": False,
+                "error": f"Slippage too high on leg B: {slippage_leg_b.get('reason')}",
+                "slippage": slippage_leg_b,
+                "mode": mode,
+            })
     elif mode == "paper":
-        slippage = math_engine.check_slippage(token_a, trade_size_usd=size_usd / 2)
-        log.info("Paper slippage (informational, %s): leg A=%.2f%%",
-                 exec_mode, slippage.get("slippage_pct") or 0)
+        slippage_leg_a = _check(token_a)
+        log.info(
+            "Paper slippage (informational, %s): leg A=%.2f%%",
+            exec_mode,
+            slippage_leg_a.get("slippage_pct") or 0,
+        )
+        if stage2_context is not None:
+            slippage_leg_b = _check(token_b)
+            log.debug(
+                "Stage 2 polygon slippage leg B: %.2f%%",
+                slippage_leg_b.get("slippage_pct") or 0,
+            )
+
+    if stage2_context is not None:
+        stage2_context["liquidity_gate"] = {
+            "token_a": token_a,
+            "token_b": token_b,
+            "slippage_a": slippage_leg_a,
+            "slippage_b": slippage_leg_b,
+            "max_slippage_pct": MAX_SLIPPAGE_PCT,
+            "trade_size_usd": size_usd,
+        }
 
     # 4. HMRC gate — block live trades if GBP audit logging is unavailable
     if mode == "live":
@@ -253,7 +333,7 @@ def execute_trade(signal, size_usd, mode=None):
             gbp_rate = hmrc.require_gbp_rate()
         except RuntimeError as e:
             log.error("LIVE TRADE BLOCKED — HMRC compliance failure: %s", e)
-            return {"ok": False, "error": str(e), "mode": mode}
+            return _wrap_result({"ok": False, "error": str(e), "mode": mode})
 
     # 5. Execute based on mode and execution style
     if mode == "paper":
@@ -291,7 +371,7 @@ def execute_trade(signal, size_usd, mode=None):
         except Exception as e:
             log.error("HMRC audit log failed (trade executed but not logged): %s", e)
 
-    return result
+    return _wrap_result(result)
 
 
 def execute_weather_trade(signal, size_usd, mode=None):

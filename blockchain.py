@@ -71,6 +71,86 @@ def _get_web3():
     return w3
 
 
+def _call_rpc(method, params=None):
+    """Make a generic JSON-RPC call to Polygon via Alchemy."""
+    rpc_url = _get_rpc_url()
+    if not rpc_url:
+        return {"ok": False, "error": "ALCHEMY_API_KEY not configured"}
+    payload = {
+        "jsonrpc": "2.0",
+        "method": method,
+        "params": params or [],
+        "id": 1,
+    }
+    try:
+        resp = requests.post(rpc_url, json=payload, timeout=10)
+        resp.raise_for_status()
+        data = resp.json()
+        if "error" in data:
+            return {"ok": False, "error": data["error"].get("message", "RPC error")}
+        return {"ok": True, "result": data.get("result")}
+    except Exception as exc:
+        log.warning("Polygon RPC %s failed: %s", method, exc)
+        return {"ok": False, "error": str(exc)}
+
+
+def _hex_to_int(value):
+    """Decode a hex string (0x..) into an int or return None."""
+    try:
+        return int(value, 16)
+    except (TypeError, ValueError):
+        return None
+
+
+def get_chain_id():
+    """Return the latest chain ID reported by the Polygon RPC."""
+    resp = _call_rpc("eth_chainId")
+    if not resp["ok"]:
+        return {"ok": False, "error": resp["error"]}
+    chain_id = _hex_to_int(resp["result"])
+    if chain_id is None:
+        return {"ok": False, "error": "Invalid chain ID payload"}
+    return {"ok": True, "chain_id": chain_id}
+
+
+def get_latest_block_metadata():
+    """Fetch the latest block metadata from Polygon via RPC."""
+    resp = _call_rpc("eth_getBlockByNumber", ["latest", False])
+    if not resp["ok"]:
+        return {"ok": False, "error": resp["error"]}
+    block = resp.get("result")
+    if not isinstance(block, dict):
+        return {"ok": False, "error": "Missing block payload"}
+    parsed = {
+        "block_number": _hex_to_int(block.get("number")),
+        "block_hash": block.get("hash"),
+        "timestamp": _hex_to_int(block.get("timestamp")),
+        "gas_limit": _hex_to_int(block.get("gasLimit")),
+        "gas_used": _hex_to_int(block.get("gasUsed")),
+        "base_fee_per_gas": _hex_to_int(block.get("baseFeePerGas")),
+    }
+    return {"ok": True, "block": parsed}
+
+
+def capture_polygon_rollout():
+    """Return on-chain rollouts used for Stage 2 Polygon gating."""
+    block_meta = get_latest_block_metadata()
+    chain_meta = get_chain_id()
+    block = block_meta.get("block") if block_meta.get("ok") else None
+    chain_id = chain_meta.get("chain_id")
+    expected_chain = 137
+    context = {
+        "block": block,
+        "chain_id": chain_id,
+        "expected_chain_id": expected_chain,
+        "chain_parity_ok": chain_id == expected_chain,
+        "block_error": block_meta.get("error"),
+        "chain_error": chain_meta.get("error"),
+    }
+    context["ok"] = bool(block_meta.get("ok") and chain_meta.get("ok") and context["chain_parity_ok"])
+    return context
+
+
 def get_wallet_address():
     """Derive wallet address from POLYMARKET_PRIVATE_KEY.
 

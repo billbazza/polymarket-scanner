@@ -590,6 +590,12 @@ def run_cycle(state):
         this_cycle_signal_ids = set()
         this_cycle_events = set()
 
+        def _stage2_details(result_obj):
+            context = (result_obj or {}).get("stage2_context")
+            if not context:
+                return {}
+            return {"stage2_polygon": context}
+
         for opp in admitted_signals:
             if traded >= slots:
                 break
@@ -740,6 +746,7 @@ def run_cycle(state):
                                 "admission_path": opp.get("admission_path"),
                                 "experiment_status": opp.get("experiment_status"),
                                 "paper_sizing": sizing_decision,
+                                **_stage2_details(result),
                             },
                         )
                     journal({
@@ -760,22 +767,23 @@ def run_cycle(state):
                         "reason": opp.get("experiment_reason") or f"Signal admitted, z={opp.get('z_score', 0):+.2f}",
                     })
                 else:
-                    if mode == "paper":
-                        record_attempt(
-                            level,
-                            "pairs",
-                            "blocked",
-                            "execution_rejected",
-                            result.get("error", "Trade execution rejected."),
-                            event=event_name,
-                            signal_id=signal_id,
-                            size_usd=trade_size,
-                            phase=current_stage,
-                            details={
-                                "grade": opp.get("grade_label"),
-                                "paper_sizing": sizing_decision,
-                            },
-                        )
+                        if mode == "paper":
+                            record_attempt(
+                                level,
+                                "pairs",
+                                "blocked",
+                                "execution_rejected",
+                                result.get("error", "Trade execution rejected."),
+                                event=event_name,
+                                signal_id=signal_id,
+                                size_usd=trade_size,
+                                phase=current_stage,
+                                details={
+                                    "grade": opp.get("grade_label"),
+                                    "paper_sizing": sizing_decision,
+                                    **_stage2_details(result),
+                                },
+                            )
                     journal({
                         "action": "trade_rejected",
                         "level": level,
