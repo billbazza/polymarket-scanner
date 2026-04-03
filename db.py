@@ -990,6 +990,18 @@ def _deserialize_signal_row(row):
             d["perplexity"] = None
     else:
         d["perplexity"] = None
+    d["profitable_candidate_feature"] = bool(
+        d.get("perplexity") and d["perplexity"].get("profitable_candidate")
+    )
+    d["profitable_candidate_reason"] = (
+        d.get("perplexity") and d["perplexity"].get("reason")
+    )
+    d["perplexity_status"] = (
+        d.get("perplexity") and d["perplexity"].get("status")
+    )
+    d["perplexity_confidence"] = (
+        d.get("perplexity") and d["perplexity"].get("confidence")
+    )
     d.pop("perplexity_json", None)
     return _attach_signal_observability(d)
 

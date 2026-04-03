@@ -30,10 +30,12 @@ System is operationally healthy with 67.3% win rate and $252.53 total PnL from 1
 - [x] Add concrete exit criteria for whale positions (per-position loss limit, max hold time, volatility trigger) or retire the strategy, since the $54.52 unrealized loss on three live trades shows the current guardrails are ineffective and weather already carries the win-rate lead (`fix_logs/2026-04-03-whale-exit-controls.md`).
 - [x] Disable or refine copy strategy filters as current implementation is unprofitable despite decent win rate - or remove it altogether - not worth developing vs weather (`fix_logs/2026-04-03-copy-strategy-filter-rework.md` & `fix_logs/2026-04-03-copy-strategy-filter-tuning.md`).
 - [x] Stage 2 Perplexity Validation – Perplexity verdicts now annotate each profitable candidate and fallback metadata is logged alongside `perplexity_json` in the database (`fix_logs/2026-04-04-stage2-perplexity-validation.md`).
+- [x] Stage 3 Perplexity gating now trusts the cached verdict so only profitable candidate features progress toward the live bucket (`fix_logs/2026-04-04-stage3-perplexity-gating.md`).
 
 ## Status Summary
 - All previously flagged “Not Working” items have corresponding fix logs and are stable; cointegration now admits trades, the copy wallet gate is stricter, whale positions auto-exit, weather guards lean on liquidity/noise filters, and confidence-based sizing drives fills.
 - Stage 2 Perplexity validation is now integrated (cached verdicts + fallback metadata) and recorded in `fix_logs/2026-04-04-stage2-perplexity-validation.md`; Stage 2 polygon gating instrumentation now logs block metadata/slippage (`fix_logs/2026-04-03-stage2-polygon-gating.md`); the remaining Stage 2/3 live-test work is sequenced via the Kanban tasks below.
+- Stage 3 readiness now depends on the cached Perplexity verdict so only profitable candidates reach the live bucket (`fix_logs/2026-04-04-stage3-perplexity-gating.md`).
 
 ## Kanban Tasks
 - `Stage 2 Polygon Gating` – capture Polygon rollouts for block/chain parity, liquidity gate, and slippage checks so stage 2 paper runs can log block metadata before trading (`fix_logs/2026-04-03-stage2-polygon-gating.md`).

@@ -172,10 +172,11 @@ All in `.env` (see `.env.example`):
 - `fix_logs/2026-04-03-stage2-polygon-gating.md`: Stage 2 paper runs with `STAGE2_POLYGON_GATING` now capture Polygon block metadata, chain parity, and dual-leg slippage before trading so every attempt carries the rollout snapshot.
 - `fix_logs/2026-04-03-copy-strategy-filter-rework.md`: enforced the informed/65/750 wallet filter using the precise avg size, centralized the wallet PnL/brain-verdict gate, and prevented `_add_column_if_missing()` from crashing when `signals` is still missing in a backfilled schema.
 - `fix_logs/2026-04-04-stage2-perplexity-validation.md`: Stage 2 Perplexity validation now caches verdicts, stores `perplexity_json`, and tags profitable candidates with fallback metadata for downstream automation.
+- `fix_logs/2026-04-04-stage3-perplexity-gating.md`: Stage 3 readiness now trusts the cached Perplexity verdict (`profitable_candidate_feature`) so only profitable candidate features can be promoted into the live bucket and the dashboard highlights the readiness filter.
 
 ## Daily Report Updates
 - 2026-04-03 report refreshed so the “Not Working” and “Top 5 Improvements” entries now point to the resolved fix logs while still highlighting the Stage 2/3 live-test plan captured in `reports/2026-04-03-daily-report.md`.
 - Status: system health is stable with the reopened issues closed; Stage 2 Perplexity validation is now integrated (`fix_logs/2026-04-04-stage2-perplexity-validation.md`), Stage 2 polygon gating instrumentation is logging block metadata and dual-leg slippage when `STAGE2_POLYGON_GATING=1` (`fix_logs/2026-04-03-stage2-polygon-gating.md`), and the remaining Stage 2/3 rollout work is tracked through the Kanban tasks for Polygon gating, Perplexity validation, and live-readiness.
-
 ## Stage 3 Live Readiness
 - Stage 3 live exposure is intentionally capped at $1–5 per trade via the `autonomy.py` `penny`/`book` levels. Follow the canonical checklist in `reports/2026-04-04-stage3-live-readiness.md` before escalating beyond paper: balance verification, ≤2% slippage locks, quarter-Kelly (≤0.25) sizing, and the presence/validation of `POLYMARKET_PRIVATE_KEY` plus `ALCHEMY_API_KEY`. Log each gate so the risk jury can audit why a live fill was permitted.
+- Stage 3 readiness is now based on the cached Perplexity verdict so only profitable candidates reach the live bucket, and the new dashboard/automation wiring is tracked in `fix_logs/2026-04-04-stage3-perplexity-gating.md`.

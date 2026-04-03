@@ -536,6 +536,9 @@
         <label style="color:var(--text2);font-size:12px;display:flex;align-items:center;gap:4px;">
           <input type="checkbox" id="signalHideSports" onchange="persistUiPrefs(); loadSignals()"> Hide sports
         </label>
+        <label style="color:var(--text2);font-size:12px;display:flex;align-items:center;gap:4px;">
+          <input type="checkbox" id="signalStage3Only" onchange="persistUiPrefs(); loadSignals()"> Stage 3 profitable only
+        </label>
       </div>
     </div>
     <table>
@@ -543,7 +546,7 @@
         <tr>
           <th>Time</th><th>Event</th><th>Market A</th><th>Market B</th>
           <th>Z-Score</th><th>P-Val</th><th>Grade</th>
-          <th>EV%</th><th>Kelly $</th><th>Liquidity</th><th>Status</th><th>Action</th>
+          <th>EV%</th><th>Kelly $</th><th>Liquidity</th><th>Status</th><th>Stage 3</th><th>Action</th>
         </tr>
       </thead>
       <tbody id="signalsBody"></tbody>
@@ -861,6 +864,7 @@ function isSportsEvent(text) {
 function persistUiPrefs() {
   const prefs = {
     signalHideSports: !!getEl('signalHideSports')?.checked,
+    signalStage3Only: !!getEl('signalStage3Only')?.checked,
     lockedTradeableOnly: !!getEl('lockedTradeableOnly')?.checked,
     weatherTradeableOnly: !!getEl('weatherTradeableOnly')?.checked,
     whaleHideSports: !!getEl('whaleHideSports')?.checked,
@@ -880,6 +884,7 @@ function loadUiPrefs() {
   try {
     const prefs = JSON.parse(localStorage.getItem(UI_PREFS_KEY) || '{}');
     if (getEl('signalHideSports')) getEl('signalHideSports').checked = !!prefs.signalHideSports;
+    if (getEl('signalStage3Only')) getEl('signalStage3Only').checked = !!prefs.signalStage3Only;
     if (getEl('lockedTradeableOnly')) getEl('lockedTradeableOnly').checked = !!prefs.lockedTradeableOnly;
     if (getEl('weatherTradeableOnly')) getEl('weatherTradeableOnly').checked = !!prefs.weatherTradeableOnly;
     if (getEl('whaleHideSports')) getEl('whaleHideSports').checked = !!prefs.whaleHideSports;
@@ -1165,22 +1170,27 @@ async function loadSignals() {
     const r = await fetch(API + '/api/signals?limit=50');
     const signals = await r.json();
     const hideSports = !!getEl('signalHideSports')?.checked;
+    const stage3Only = !!getEl('signalStage3Only')?.checked;
     const filtered = hideSports
       ? signals.filter(s => !isSportsEvent(`${s.event || ''} ${s.market_a || ''} ${s.market_b || ''}`))
       : signals;
-    getEl('cntSignals').textContent = filtered.length;
+    const visible = stage3Only
+      ? filtered.filter(s => !!s.profitable_candidate_feature)
+      : filtered;
+    const stage3Note = stage3Only ? ' · Stage 3 profitable only' : '';
+    getEl('cntSignals').textContent = visible.length;
     getEl('signalsInfo').textContent = hideSports
-      ? `${filtered.length} operator-meaningful signals shown · ${signals.length - filtered.length} sports rows hidden`
-      : `${signals.length} recent operator-meaningful cointegration signals`;
+      ? `${filtered.length} operator-meaningful signals shown · ${signals.length - filtered.length} sports rows hidden${stage3Note}`
+      : `${signals.length} recent operator-meaningful cointegration signals${stage3Note}`;
     const body = getEl('signalsBody');
-    if (!filtered.length) {
+    if (!visible.length) {
       const msg = signals.length
         ? 'No signals match the active filters.'
         : 'No signals yet — run a scan.';
-      body.innerHTML = `<tr><td colspan="12" class="empty"><div class="icon">◎</div>${msg}</td></tr>`;
+      body.innerHTML = `<tr><td colspan="13" class="empty"><div class="icon">◎</div>${msg}</td></tr>`;
       return;
     }
-    body.innerHTML = filtered.map(s => {
+    body.innerHTML = visible.map(s => {
       const gl = s.grade_label || '-';
       const gc = gl.startsWith('A') ? 'grade-a' : gl==='B' ? 'grade-b' : gl==='C' ? 'grade-c' : gl==='D' ? 'grade-d' : 'grade-f';
       const evPct     = s.ev     && s.ev.ev_pct     != null ? s.ev.ev_pct.toFixed(1) + '%' : '-';
@@ -1194,6 +1204,14 @@ async function loadSignals() {
             : 'rejected';
       const statusTitle = esc(s.admission_summary || s.admission_reason || '');
       const blocker = !s.tradeable && (s.admission_reason || s.experiment_reason);
+      const stage3StatusText = s.profitable_candidate_feature
+        ? 'Ready'
+        : s.perplexity?.status === 'ok'
+          ? 'Not profitable'
+          : (s.perplexity?.status || 'Awaiting');
+      const stage3Title = s.perplexity?.reason || stage3StatusText;
+      const stage3Class = s.profitable_candidate_feature ? 'yes' : 'disagree';
+      const stage3Badge = `<span class="badge ${stage3Class}" title="${esc(stage3Title)}">${esc(stage3StatusText)}</span>`;
       const actionCell = s.status==='new'
         ? `<button class="btn sm" onclick="paperTrade(${s.id})">Trade</button>
            <button class="btn sm" onclick="brainValidate(${s.id})" title="Ask AI">Brain</button>`
@@ -1210,6 +1228,7 @@ async function loadSignals() {
         <td>${kellySize}</td>
         <td>${fmtUsd(s.liquidity)}</td>
         <td><span class="badge ${s.status}" title="${statusTitle}">${statusLabel}</span></td>
+        <td>${stage3Badge}</td>
         <td class="actions-col">${actionCell || (blocker
           ? `<span style="color:var(--amber);font-size:11px" title="${statusTitle}">${esc(blocker)}</span>`
           : '')}</td>
