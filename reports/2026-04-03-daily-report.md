@@ -13,6 +13,7 @@ System is operationally healthy with 67.3% win rate and $252.53 total PnL from 1
 - Scanner infrastructure stable with consistent 1.8-2.0 second scan times
 - Paper trading system functioning with proper position tracking and risk management
 - Whale detection actively identifying suspicious market activity with 65-69 suspicion scores
+- [x] Daily report workflow is consolidated into this single Markdown file per date; redundant needed/create splits have been retired and the UI now keeps one saved entry.
 
 ## Not Working
 - [ ] Cointegration strategy completely inactive (0 trades) despite 339 A+ signals seen. A+ trades picked up in UI, but none traded - if profitable, this will move to stage 2 test.
@@ -20,7 +21,6 @@ System is operationally healthy with 67.3% win rate and $252.53 total PnL from 1
 - [ ] Whale strategy deeply underwater at -$54.52 unrealized loss on 3 open positions - add hard exit criteria (e.g., exit when loss >$15 per position or hold time >48h) or retire the strategy entirely to stop the bleed; removal/parking is still being considered.
 - [ ] Stop-losses triggering frequently on weather trades causing -$4 to -$5 losses
 - [ ] Position sizing not utilizing confidence scoring (53 shadow decisions, 0 applied)
-- [ ] Daily report buttons on needed & create too many disparate files. This one file should be used in place of the buttons
  
 ## Top 5 Improvements
 - [ ] Fix cointegration trade execution - 339 A+ signals with zero trades indicates critical filter/execution bug

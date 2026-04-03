@@ -252,7 +252,26 @@ Confidence: {report.get('confidence', 'unknown')}
 def _latest_daily_report_path() -> Path | None:
     DAILY_REPORTS_DIR.mkdir(parents=True, exist_ok=True)
     reports = sorted(DAILY_REPORTS_DIR.glob("*-daily-report.md"))
-    return reports[-1] if reports else None
+    if not reports:
+        return None
+    latest = reports[-1]
+    report_date = _extract_report_date(latest)
+    _cleanup_extra_daily_report_files(report_date, latest)
+    return latest
+
+
+def _cleanup_extra_daily_report_files(report_date: str, keep: Path | None) -> None:
+    if keep is None:
+        return
+    pattern = f"{report_date}-daily-report*.md"
+    for candidate in DAILY_REPORTS_DIR.glob(pattern):
+        if candidate.resolve() == keep.resolve():
+            continue
+        try:
+            candidate.unlink()
+            log.info("Removed redundant daily report file %s", candidate.name)
+        except Exception as exc:
+            log.warning("Failed to prune extra daily report %s: %s", candidate.name, exc)
 
 
 def _extract_report_date(path: Path) -> str:
@@ -643,6 +662,7 @@ async def generate_daily_report():
     report_path = DAILY_REPORTS_DIR / f"{report_date}-daily-report.md"
     report_content = _render_daily_report_markdown(report_date, context, report)
     report_path.write_text(report_content)
+    _cleanup_extra_daily_report_files(report_date, report_path)
     items = _visible_report_items(_persist_report_items(report_date, report))
 
     return {

@@ -773,7 +773,7 @@
 
   <div id="panel-reports" style="display:none">
     <div class="panel-toolbar">
-      <span class="info" id="reportsInfo">Generate or refresh the AI daily report and open the saved Markdown file for review.</span>
+      <span class="info" id="reportsInfo">Generate or refresh the AI daily report (now consolidated into a single saved Markdown file per date; the redundant "needed"/"create" actions have been removed) and open it for review.</span>
       <div style="display:flex;gap:8px;align-items:center;">
         <button class="btn sm" id="dailyReportBtn" onclick="generateDailyReport()">Generate Report</button>
         <button class="btn sm sky" onclick="loadDailyReport()">Refresh</button>
@@ -782,6 +782,9 @@
     </div>
     <div class="table-wrap" style="padding:14px;">
       <div id="dailyReportMeta" style="color:var(--text2);font-size:12px;margin-bottom:10px"></div>
+      <div style="color:var(--text2);font-size:11px;margin-bottom:10px">
+        Follow-ups now stay within this report and the fix_logs/ or reports/diagnostics/ folders; we no longer split the log into separate needed/create files.
+      </div>
       <div id="dailyReportQueues"></div>
       <details style="margin-top:14px">
         <summary style="cursor:pointer;color:var(--text2);font-size:12px;">Raw markdown report</summary>

@@ -78,6 +78,7 @@ SQLite at `scanner.db`. Schema auto-migrates on import via `db.init_db()`. New c
 - Log bug-fix work in a dated markdown file under `fix_logs/` and update that file when behavior changes.
 - Route Daily Report follow-ups explicitly: `Not Working` items can be logged to `fix_logs/` or `reports/diagnostics/`, and improvements should only go to `implementation-plan.md` or `testing-ideas.md` when intentionally promoted.
 - Store daily reports directly within `reports/` as `YYYY-MM-DD-daily-report.md` files with checkbox-style bullets so the UI can show tickable items and the new “Check Log” action can point to the fix/diagnostic entry.
+- Keep the daily-report workflow consolidated: always rewrite the single `reports/YYYY-MM-DD-daily-report.md` file per date, rely on the dashboard notice instead of separate needed/create buttons, and treat `fix_logs/` or `reports/diagnostics/` as the only follow-up sinks.
 - Update `CLAUDE.md` and `GEMINI.md` and `AGENTS.md` if the bug-fix logging process or location changes.
 - keep `CLAUDE.md` and `GEMINI.md` and `AGENTS.md` in sync and always updates all three files if changes are made.
 - Cap Kelly fraction at 0.25 (quarter-Kelly). Full Kelly is too aggressive.
