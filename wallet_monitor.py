@@ -155,9 +155,10 @@ def score_wallet(address: str, label: str, activity_limit: int = 500) -> dict:
     """Score a wallet 0-100. Returns full scoring breakdown."""
     trades = get_activity(address, limit=activity_limit)
     positions = get_positions(address)
+    avg_size = 0.0
 
     if not trades:
-        return _score_result(address, label, 0, "no_data", {}, trades, positions)
+        return _score_result(address, label, 0, "no_data", {}, trades, positions, avg_size=avg_size)
 
     now = time.time()
     trade_count = len(trades)
@@ -197,22 +198,45 @@ def score_wallet(address: str, label: str, activity_limit: int = 500) -> dict:
 
     # 1. Sample size (need enough history)
     if trade_count < MIN_TRADES:
-        return _score_result(address, label, 0, "insufficient_data",
-                             {"reason": f"only {trade_count} trades, need {MIN_TRADES}"},
-                             trades, positions)
+        return _score_result(
+            address,
+            label,
+            0,
+            "insufficient_data",
+            {"reason": f"only {trade_count} trades, need {MIN_TRADES}"},
+            trades,
+            positions,
+            avg_size=avg_size,
+        )
 
     # 2. Bot filter — high frequency AND small size = bot (large frequent traders are fine)
     if trades_per_month > BOT_TRADES_MONTH and avg_size < 200:
-        return _score_result(address, label, 0, "bot",
-                             {"trades_per_month": round(trades_per_month, 1),
-                              "avg_size_usd": round(avg_size, 0)},
-                             trades, positions)
+        return _score_result(
+            address,
+            label,
+            0,
+            "bot",
+            {
+                "trades_per_month": round(trades_per_month, 1),
+                "avg_size_usd": round(avg_size, 2),
+            },
+            trades,
+            positions,
+            avg_size=avg_size,
+        )
 
     # 3. Size filter (only copy meaningful positions)
     if avg_size < MIN_AVG_SIZE:
-        return _score_result(address, label, 15, "small_trader",
-                             {"avg_size_usd": round(avg_size, 0)},
-                             trades, positions)
+        return _score_result(
+            address,
+            label,
+            15,
+            "small_trader",
+            {"avg_size_usd": round(avg_size, 2)},
+            trades,
+            positions,
+            avg_size=avg_size,
+        )
 
     # Score each dimension
     s_sample   = min(100, (trade_count / 200) * 100)          # up to 200 trades
@@ -245,7 +269,7 @@ def score_wallet(address: str, label: str, activity_limit: int = 500) -> dict:
     breakdown = {
         "trade_count": trade_count,
         "trades_per_month": round(trades_per_month, 1),
-        "avg_size_usd": round(avg_size, 0),
+        "avg_size_usd": round(avg_size, 2),
         "total_volume_usd": round(total_volume, 0),
         "n_categories": n_cats,
         "top_category": max(cat_counts, key=cat_counts.get) if cat_counts else "?",
@@ -263,19 +287,44 @@ def score_wallet(address: str, label: str, activity_limit: int = 500) -> dict:
             "buy_hold":  round(s_buy_hold, 1),
         },
     }
-    return _score_result(address, label, score, classification, breakdown, trades, positions)
+    return _score_result(
+        address,
+        label,
+        score,
+        classification,
+        breakdown,
+        trades,
+        positions,
+        avg_size=avg_size,
+    )
 
 
-def _score_result(address, label, score, classification, breakdown, trades, positions):
-    breakdown = breakdown or {}
-    score_value = float(score or 0)
-    classification_value = classification or ""
-    avg_size = float(breakdown.get("avg_size_usd") or 0)
-    will_copy = (
+def _should_copy_wallet(score_value: float, classification_value: str, avg_size: float) -> bool:
+    """Return True if the wallet clears the auto-copy thresholds."""
+    return (
         classification_value == COPY_REQUIRED_CLASSIFICATION
         and score_value >= COPY_MIN_SCORE
         and avg_size >= COPY_MIN_AVG_SIZE
     )
+
+
+def _score_result(
+    address,
+    label,
+    score,
+    classification,
+    breakdown,
+    trades,
+    positions,
+    *,
+    avg_size: float | None = None,
+):
+    breakdown = breakdown or {}
+    score_value = float(score or 0)
+    classification_value = classification or ""
+    baseline_avg = float(breakdown.get("avg_size_usd") or 0)
+    avg_size_value = float(avg_size if avg_size is not None else baseline_avg)
+    will_copy = _should_copy_wallet(score_value, classification_value, avg_size_value)
     return {
         "address": address,
         "label": label,
