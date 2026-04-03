@@ -28,4 +28,7 @@ System is operationally healthy with 67.3% win rate and $252.53 total PnL from 1
 - [ ] Tighten weather strategy stop-losses or improve entry timing to reduce frequency of stopped trades
 - [ ] Add concrete exit criteria for whale positions (per-position loss limit, max hold time, volatility trigger) or retire the strategy, since the $54.52 unrealized loss on three live trades shows the current guardrails are ineffective and weather already carries the win-rate lead
 - [ ] Disable or refine copy strategy filters as current implementation is unprofitable despite decent win rate - or remove it altogether - not worth developing vs weather.
-- [ ] Build and plan for a live test for stage 2 & 3 with real Polygon/ perplexity API's (new UI only with proffitable features)
+- [ ] Plan stage 2/3 live tests with Polygon data gating and Perplexity validation; details logged in `fix_logs/2026-04-03-stage2-3-live-tests.md`
+
+## Stage 2/3 Live-Test Plan
+- Outline and requirements for Polygon + Perplexity live integration, including the risk checklist and paper-to-live test matrix, are recorded in `fix_logs/2026-04-03-stage2-3-live-tests.md` so our Daily Report references the same actionable plan.
