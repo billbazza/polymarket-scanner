@@ -181,3 +181,6 @@ All in `.env` (see `.env.example`):
 ## Daily Report Updates
 - 2026-04-03 report refreshed so the “Not Working” and “Top 5 Improvements” entries now point to the resolved fix logs while still highlighting the Stage 2/3 live-test plan captured in `reports/2026-04-03-daily-report.md`.
 - Status: system health is stable with the reopened issues closed; Stage 2 Perplexity validation is now integrated (`fix_logs/2026-04-04-stage2-perplexity-validation.md`), Stage 2 polygon gating instrumentation is logging block metadata and dual-leg slippage when `STAGE2_POLYGON_GATING=1` (`fix_logs/2026-04-03-stage2-polygon-gating.md`), and the remaining Stage 2/3 rollout work is tracked through the Kanban tasks for Polygon gating, Perplexity validation, and live-readiness.
+
+## Stage 3 Live Readiness
+- Stage 3 live exposure is intentionally capped at $1–5 per trade via the `autonomy.py` `penny`/`book` levels. Follow the canonical checklist in `reports/2026-04-04-stage3-live-readiness.md` before escalating beyond paper: balance verification, ≤2% slippage locks, quarter-Kelly (≤0.25) sizing, and the presence/validation of `POLYMARKET_PRIVATE_KEY` plus `ALCHEMY_API_KEY`. Log each gate so the risk jury can audit why a live fill was permitted.
