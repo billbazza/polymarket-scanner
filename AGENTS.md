@@ -92,6 +92,10 @@ SQLite at `scanner.db`. Schema auto-migrates on import via `db.init_db()`. New c
 - Return structured dicts from functions (not bare values).
 - Degrade gracefully when optional services are unavailable (AI providers, web3, Telegram).
 
+## Strategy Guardrails
+
+- Whale trades now auto-close as soon as a single position loses more than $15, has been held over 48h, or suffers a 15% adverse move, and the tracker logs an aggregate drawdown alert whenever open whale PnL drops below -$50 so the prior $-54.52 incident surfaces in `logs/scanner.log` with a dedicated warning.
+
 ### Testing Changes
 ```bash
 # Verify all imports work

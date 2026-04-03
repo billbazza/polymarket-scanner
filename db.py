@@ -1470,6 +1470,36 @@ def _latest_open_trade_valuation_rows(conn):
     """).fetchall()
 
 
+def get_whale_open_drawdown_snapshot():
+    """Return the aggregate unrealized PnL and count for open whale trades."""
+    conn = get_conn()
+    try:
+        total = 0.0
+        count = 0
+        missing_marks = False
+        for row in _latest_open_trade_valuation_rows(conn):
+            trade_type = (row["trade_type"] or "pairs").strip().lower()
+            if trade_type != "whale":
+                continue
+            count += 1
+            valuation = calculate_single_leg_mark_to_market(
+                row["size_usd"],
+                row["entry_price_a"],
+                row["price_a"],
+            )
+            if not valuation["ok"]:
+                missing_marks = True
+                continue
+            total += float(valuation["pnl_usd"])
+        return {
+            "pnl_usd": round(total, 2),
+            "open_trades": count,
+            "mark_missing": missing_marks,
+        }
+    finally:
+        conn.close()
+
+
 def _open_trade_valuation_map_from_snapshots(conn):
     valuations = {}
     for row in _latest_open_trade_valuation_rows(conn):

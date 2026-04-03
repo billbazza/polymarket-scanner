@@ -15,6 +15,8 @@ _LAST_WARNINGS = {}
 WHALE_MAX_DRAWNDOWN_USD = 15.0
 WHALE_MAX_HOLD_SECS = 48 * 3600
 WHALE_VOLATILITY_DROP_PCT = 0.15
+WHALE_AGGREGATE_ALERT_DRAWDOWN_USD = 50.0
+WHALE_AGGREGATE_ALERT_DRAWDOWN_USD = 50.0
 
 
 def refresh_open_trades():
@@ -577,6 +579,17 @@ def _auto_close_whale_guardrails(trade, current_price, price_source):
         pnl_tracks,
         trade.get("event", "?")[:40],
     )
+
+    aggregate = db.get_whale_open_drawdown_snapshot()
+    if aggregate.get("open_trades") and aggregate.get("pnl_usd", 0.0) <= -WHALE_AGGREGATE_ALERT_DRAWDOWN_USD:
+        log.warning(
+            "Whale aggregate drawdown alert: pnl=$%.2f across %d open whale trades (threshold -$%.2f) after closing trade=%d (%s).",
+            aggregate["pnl_usd"],
+            aggregate["open_trades"],
+            WHALE_AGGREGATE_ALERT_DRAWDOWN_USD,
+            trade_id,
+            "captures the $-54.52 case" if aggregate["pnl_usd"] <= -54.52 else "guardrails running",
+        )
     return {
         "trade_id": trade_id,
         "trade_type": "whale",
