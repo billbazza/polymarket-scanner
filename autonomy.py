@@ -874,8 +874,13 @@ def run_cycle(state):
                                 "reason": decision["reason"],
                             })
                             continue
+                        weather_signal_payload = {
+                            **w_opp,
+                            "id": w_id,
+                            "paper_sizing": sizing_decision,
+                        }
                         result = execution.execute_weather_trade(
-                            {"id": w_id, **w_opp},
+                            weather_signal_payload,
                             size_usd=trade_size,
                             mode="paper",
                         )

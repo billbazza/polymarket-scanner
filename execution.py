@@ -35,6 +35,48 @@ def _get_mode():
     return "paper"
 
 
+def _extract_confidence_decision(signal: dict | None) -> dict | None:
+    """Return the applied paper-sizing decision, if any."""
+    if not isinstance(signal, dict):
+        return None
+    decision = signal.get("paper_sizing")
+    if not isinstance(decision, dict):
+        return None
+    return decision
+
+
+def _apply_confidence_sizing(signal: dict | None, size_usd: float) -> tuple[float, dict | None]:
+    """Override size_usd with confidence-recommended sizing when active."""
+    decision = _extract_confidence_decision(signal)
+    if not decision or not decision.get("applied"):
+        return size_usd, None
+    try:
+        recommended = round(float(decision.get("selected_size_usd") or size_usd), 2)
+    except (TypeError, ValueError):
+        recommended = size_usd
+    if recommended <= 0:
+        return size_usd, None
+    meta = {
+        "confidence_score": round(float(decision.get("confidence_score") or 0.0), 4),
+        "confidence_policy": decision.get("selected_policy"),
+        "confidence_baseline_size_usd": round(float(decision.get("baseline_size_usd") or 0.0), 2),
+        "confidence_selected_size_usd": recommended,
+    }
+    return recommended, meta
+
+
+def _cap_quarter_kelly(size_usd: float, balance_usd: float) -> tuple[float, bool]:
+    """Cap trade size to 25% of available balance (quarter Kelly)."""
+    try:
+        balance = float(balance_usd or 0.0)
+    except (TypeError, ValueError):
+        balance = 0.0
+    cap = round(balance * 0.25, 2)
+    if cap <= 0 or size_usd <= cap:
+        return size_usd, False
+    return cap, True
+
+
 def check_balance(mode=None):
     """Check available USDC balance.
 
@@ -117,6 +159,19 @@ def execute_trade(signal, size_usd, mode=None):
         dict with trade result, fill prices, trade_id, or error.
     """
     mode = mode or _get_mode()
+    signal = signal or {}
+    signal = dict(signal)
+    size_usd = round(float(size_usd or 0.0), 2)
+    size_before_confidence = size_usd
+    size_usd, confidence_meta = _apply_confidence_sizing(signal, size_usd)
+    if confidence_meta and abs(size_usd - size_before_confidence) >= 0.01:
+        log.info(
+            "  Confidence sizing override: requested $%.2f → $%.2f (score %.4f, policy=%s)",
+            size_before_confidence,
+            size_usd,
+            confidence_meta["confidence_score"],
+            confidence_meta["confidence_policy"],
+        )
     log.info("Executing trade: %s | size=$%.2f mode=%s z=%.2f",
              signal.get("event", "?")[:50], size_usd, mode, signal.get("z_score", 0))
 
@@ -127,6 +182,16 @@ def execute_trade(signal, size_usd, mode=None):
         return {"ok": False, "error": f"Balance check failed: {bal.get('error')}",
                 "mode": mode}
 
+    quarter_kelly_capped = False
+    size_before_cap = size_usd
+    size_usd, quarter_kelly_capped = _cap_quarter_kelly(size_usd, bal["balance_usd"])
+    if quarter_kelly_capped:
+        log.warning(
+            "  Size $%.2f exceeds 25%% of balance $%.2f; capping to $%.2f",
+            size_before_cap,
+            bal["balance_usd"],
+            size_usd,
+        )
     if bal["balance_usd"] < size_usd:
         log.warning("Insufficient balance: $%.2f < $%.2f", bal["balance_usd"], size_usd)
         return {"ok": False, "error": f"Insufficient balance: ${bal['balance_usd']:.2f} < ${size_usd:.2f}",
@@ -192,11 +257,29 @@ def execute_trade(signal, size_usd, mode=None):
 
     # 5. Execute based on mode and execution style
     if mode == "paper":
-        result = _execute_paper(signal, size_usd, price_a, price_b,
-                                side_a=side_a, side_b=side_b, exec_mode=exec_mode)
+        result = _execute_paper(
+            signal,
+            size_usd,
+            price_a,
+            price_b,
+            side_a=side_a,
+            side_b=side_b,
+            exec_mode=exec_mode,
+            confidence_metadata=confidence_meta,
+            quarter_kelly_capped=quarter_kelly_capped,
+        )
     else:
-        result = _execute_live(signal, size_usd, price_a, price_b,
-                               side_a=side_a, side_b=side_b, exec_mode=exec_mode)
+        result = _execute_live(
+            signal,
+            size_usd,
+            price_a,
+            price_b,
+            side_a=side_a,
+            side_b=side_b,
+            exec_mode=exec_mode,
+            confidence_metadata=confidence_meta,
+            quarter_kelly_capped=quarter_kelly_capped,
+        )
 
     # 6. Stamp and audit-log real trades
     if mode == "live" and result.get("ok"):
@@ -231,6 +314,17 @@ def execute_weather_trade(signal, size_usd, mode=None):
         or signal.get("market_family")
         or "weather"
     )
+    size_usd = round(float(size_usd or 0.0), 2)
+    size_before_confidence = size_usd
+    size_usd, confidence_meta = _apply_confidence_sizing(signal, size_usd)
+    if confidence_meta and abs(size_usd - size_before_confidence) >= 0.01:
+        log.info(
+            "  Weather confidence sizing override: requested $%.2f → $%.2f (score %.4f, policy=%s)",
+            size_before_confidence,
+            size_usd,
+            confidence_meta["confidence_score"],
+            confidence_meta["confidence_policy"],
+        )
     log.info(
         "Executing weather trade: signal=%s strategy=%s size=$%.2f mode=%s",
         weather_signal_id,
@@ -263,6 +357,16 @@ def execute_weather_trade(signal, size_usd, mode=None):
             "error": f"Balance check failed: {bal.get('error')}",
             "weather_signal_id": weather_signal_id,
         }
+    quarter_kelly_capped = False
+    size_before_cap = size_usd
+    size_usd, quarter_kelly_capped = _cap_quarter_kelly(size_usd, bal["balance_usd"])
+    if quarter_kelly_capped:
+        log.warning(
+            "  Weather size $%.2f exceeds 25%% of balance $%.2f; capping to $%.2f",
+            size_before_cap,
+            bal["balance_usd"],
+            size_usd,
+        )
     if bal["balance_usd"] < size_usd:
         return {
             "ok": False,
@@ -309,11 +413,16 @@ def execute_weather_trade(signal, size_usd, mode=None):
         "trade_state_mode": db.TRADE_STATE_PAPER,
         "reconciliation_mode": db.RECONCILIATION_INTERNAL,
         "paper_account": account,
+        "confidence_score": confidence_meta.get("confidence_score") if confidence_meta else None,
+        "confidence_policy": confidence_meta.get("confidence_policy") if confidence_meta else None,
+        "confidence_applied": bool(confidence_meta),
+        "quarter_kelly_capped": bool(quarter_kelly_capped),
     }
 
 
 def _execute_paper(signal, size_usd, price_a, price_b,
-                   side_a="BUY", side_b="SELL", exec_mode="maker"):
+                   side_a="BUY", side_b="SELL", exec_mode="maker",
+                   confidence_metadata=None, quarter_kelly_capped=False):
     """Simulate order fill.
 
     Maker mode: records limit prices (better than mid) with 0% fee — optimistic
@@ -364,6 +473,10 @@ def _execute_paper(signal, size_usd, price_a, price_b,
         "size_usd": size_usd,
         "remaining_balance": account["available_cash"],
         "paper_account": account,
+        "confidence_score": confidence_metadata.get("confidence_score") if confidence_metadata else None,
+        "confidence_policy": confidence_metadata.get("confidence_policy") if confidence_metadata else None,
+        "confidence_applied": bool(confidence_metadata),
+        "quarter_kelly_capped": bool(quarter_kelly_capped),
     }
 
 
@@ -381,7 +494,8 @@ def settle_paper_trade(trade_id, pnl_usd):
 
 
 def _execute_live(signal, size_usd, price_a, price_b,
-                  side_a="BUY", side_b="SELL", exec_mode="maker"):
+                  side_a="BUY", side_b="SELL", exec_mode="maker",
+                  confidence_metadata=None, quarter_kelly_capped=False):
     """Execute real orders via py-clob-client.
 
     Maker mode: GTC limit orders posted inside spread — fills when someone
@@ -484,6 +598,10 @@ def _execute_live(signal, size_usd, price_a, price_b,
             "fill_price_b": price_b,
             "size_usd": size_usd,
             "pending": exec_mode == "maker",
+            "confidence_score": confidence_metadata.get("confidence_score") if confidence_metadata else None,
+            "confidence_policy": confidence_metadata.get("confidence_policy") if confidence_metadata else None,
+            "confidence_applied": bool(confidence_metadata),
+            "quarter_kelly_capped": bool(quarter_kelly_capped),
         }
 
     except Exception as e:
