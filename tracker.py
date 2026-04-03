@@ -48,6 +48,51 @@ def _trade_kind(trade):
     return trade.get("trade_type") or "weather"
 
 
+def _safe_float(value):
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _build_weather_stop_context(trade, signal, entry_price, current_price, stop_floor):
+    observation = {}
+    if signal and signal.get("correction"):
+        observation = signal["correction"].get("observation") or {}
+
+    observed_temp = _safe_float(observation.get("temp_f"))
+    previous_temp = _safe_float(observation.get("previous_temp_f"))
+    observed_hour = _safe_float(observation.get("observed_hour_local"))
+    previous_hour = _safe_float(observation.get("previous_hour_local"))
+    trend_f_per_hour = _safe_float(observation.get("trend_f_per_hour"))
+    lookback_hours = (
+        round(observed_hour - previous_hour, 2)
+        if observed_hour is not None and previous_hour is not None
+        else None
+    )
+
+    context = {
+        "signal_id": trade.get("weather_signal_id"),
+        "entry_price": entry_price,
+        "stop_floor": stop_floor,
+        "current_price": current_price,
+        "hours_ahead": signal.get("hours_ahead") if signal else None,
+        "edge_pct": signal.get("combined_edge_pct") if signal else None,
+        "liquidity": signal.get("liquidity") if signal else None,
+        "observation": {
+            "source": observation.get("source"),
+            "observed_at": observation.get("observed_at"),
+            "observed_temp": observed_temp,
+            "previous_temp": previous_temp,
+            "observed_hour": observed_hour,
+            "previous_hour": previous_hour,
+            "lookback_hours": lookback_hours,
+            "trend_f_per_hour": trend_f_per_hour,
+        },
+    }
+    return context
+
+
 def _trade_label(trade):
     return f"{_trade_kind(trade)} trade {trade['id']}"
 
@@ -464,8 +509,13 @@ def _auto_close_weather(trade):
         reason = f"stop-loss hit ({current_a:.3f} <= {stop_loss_floor:.3f})"
         pnl_usd = db.close_trade(trade_id, current_a, notes=f"Auto-closed: {reason}")
         if pnl_usd is not None:
-            log.info("AUTO-CLOSE weather: trade=%d %s pnl=$%.2f event=%s",
-                     trade_id, reason, pnl_usd, trade.get("event", "?")[:40])
+            signal = _load_weather_signal(trade)
+            context = _build_weather_stop_context(trade, signal, entry_price, current_a, stop_loss_floor)
+            event_label = (trade.get("event") or "?")[:40]
+            log.info(
+                "AUTO-CLOSE weather: trade=%d %s pnl=$%.2f event=%s context=%s",
+                trade_id, reason, pnl_usd, event_label, context,
+            )
             return {
                 "trade_id": trade_id,
                 "trade_type": "weather",

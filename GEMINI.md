@@ -160,4 +160,5 @@ All in `.env` (see `.env.example`):
 - `POLYMARKET_PRIVATE_KEY` — enables live trading (Tier 3)
 
 ## Recent Fix Logs
+- `fix_logs/2026-04-04-weather-stop-loss-tuning.md`: broadened the weather entry gate to 60+ hours and log detailed stop contexts (signal hours, obs lookback, trend) so the next tuning pass can correlate the worst -$4/-$5 exits with intraday noise.
 - `fix_logs/2026-04-03-copy-strategy-filter-tuning.md`: tightened the copy strategy so only "informed" wallets (score ≥65, avg trade ≥$750) get mirrored and `inspect_copy_trade_open()` now blocks wallets with negative stored PnL or an AI verdict other than `copy`.

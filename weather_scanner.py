@@ -47,7 +47,7 @@ MIN_TRADE_EDGE = 0.15  # 15pp minimum edge required to mark tradeable
 MIN_TRADE_PRICE = 0.35 # never buy a token below this price (avoids near-wipeout long shots)
 MIN_LIQUIDITY = 200    # minimum event liquidity USD
 MIN_STABLE_LIQUIDITY = 10_000  # avoid ultra-thin weather books
-MIN_HOURS_AHEAD_FOR_TRADE = 48  # require at least two days to let noise settle
+MIN_HOURS_AHEAD_FOR_TRADE = 60  # require at least ~2.5 days to let noise settle
 MAX_SOURCE_DISAGREEMENT = 0.12  # difference between NOAA/OM probabilities
 
 _WEATHER_KEYWORDS = [
