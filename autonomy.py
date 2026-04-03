@@ -656,36 +656,39 @@ def run_cycle(state):
             # Execute
             mode = "paper" if level in ("paper", "scout") else "live"
 
-            # Step 4.5: Brain validation (if available)
+            # Step 4.5: Brain validation (live-only)
             # Ask Claude + Perplexity if this signal makes sense in the real world
-            try:
-                import brain
-                should_trade, brain_reasoning = brain.validate_signal(opp)
-                if not should_trade:
-                    log.info("  Brain REJECTED trade: %s", brain_reasoning)
-                    journal({
-                        "action": "brain_reject",
-                        "level": level,
-                        "event": event_name[:60],
-                        "reason": brain_reasoning,
-                    })
-                    if mode == "paper":
-                        record_attempt(
-                            level,
-                            "pairs",
-                            "blocked",
-                            "brain_rejected",
-                            brain_reasoning,
-                            event=event_name,
-                            signal_id=signal_id,
-                            size_usd=trade_size,
-                            phase="step 4.5 brain validation",
-                        )
-                    continue
-                log.info("  Brain VALIDATED trade: %s", brain_reasoning)
-                opp["brain_reasoning"] = brain_reasoning
-            except Exception as e:
-                log.warning("  Brain validation failed (defaulting to math-only): %s", e)
+            if mode == "live":
+                try:
+                    import brain
+                    should_trade, brain_reasoning = brain.validate_signal(opp)
+                    if not should_trade:
+                        log.info("  Brain REJECTED trade: %s", brain_reasoning)
+                        journal({
+                            "action": "brain_reject",
+                            "level": level,
+                            "event": event_name[:60],
+                            "reason": brain_reasoning,
+                        })
+                        if mode == "paper":
+                            record_attempt(
+                                level,
+                                "pairs",
+                                "blocked",
+                                "brain_rejected",
+                                brain_reasoning,
+                                event=event_name,
+                                signal_id=signal_id,
+                                size_usd=trade_size,
+                                phase="step 4.5 brain validation",
+                            )
+                        continue
+                    log.info("  Brain VALIDATED trade: %s", brain_reasoning)
+                    opp["brain_reasoning"] = brain_reasoning
+                except Exception as e:
+                    log.warning("  Brain validation failed (defaulting to math-only): %s", e)
+            else:
+                log.debug("  Brain validation skipped in paper mode; trusting math-only filters")
 
             sizing_decision = None
             if mode == "paper":
