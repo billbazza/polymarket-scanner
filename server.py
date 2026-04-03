@@ -13,7 +13,7 @@ from datetime import datetime
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 
 from auth import require_admin, require_operator
 import db
@@ -620,6 +620,17 @@ async def get_daily_report():
         "report": report,
         "items": items,
     }
+
+
+@app.get("/reports/{filename}")
+async def serve_daily_report_file(filename: str):
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}-daily-report\.md", filename):
+        raise HTTPException(404, "Invalid report name")
+    path = DAILY_REPORTS_DIR / filename
+    if not path.exists():
+        raise HTTPException(404, "Daily report not found")
+    content = path.read_text()
+    return PlainTextResponse(content, media_type="text/markdown")
 
 
 @app.post("/api/reports/daily")

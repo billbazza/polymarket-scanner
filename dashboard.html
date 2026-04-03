@@ -773,10 +773,11 @@
 
   <div id="panel-reports" style="display:none">
     <div class="panel-toolbar">
-      <span class="info" id="reportsInfo">Generate a saved AI daily report, then route issues into fix logs, diagnostics, implementation, or testing.</span>
+      <span class="info" id="reportsInfo">Generate or refresh the AI daily report and open the saved Markdown file for review.</span>
       <div style="display:flex;gap:8px;align-items:center;">
         <button class="btn sm" id="dailyReportBtn" onclick="generateDailyReport()">Generate Report</button>
         <button class="btn sm sky" onclick="loadDailyReport()">Refresh</button>
+        <button class="btn sm" id="openDailyReportBtn" onclick="openDailyReportFile()" disabled>View Saved File</button>
       </div>
     </div>
     <div class="table-wrap" style="padding:14px;">
@@ -826,7 +827,7 @@
 const API = '';
 const ALL_PANELS = ['signals','locked','weather','whales','copy','paper-attempts','trades','history','scans','reports','console'];
 const UI_PREFS_KEY = 'polymarket-scanner-ui-prefs-v1';
-let reportItemLogCache = {};
+let latestDailyReportFilename = null;
 
 // ── Utilities ──────────────────────────────────────────────────────────────
 
@@ -1874,39 +1875,107 @@ async function checkWhaleAlerts() {
   } catch(e) {}
 }
 
-async function loadDailyReport() {
+function configureDailyReportLink(path) {
+  latestDailyReportFilename = path ? path.split('/').pop() : null;
+  const btn = getEl('openDailyReportBtn');
+  if (btn) {
+    btn.disabled = !latestDailyReportFilename;
+  }
+  return latestDailyReportFilename;
+}
+
+function updateDailyReportMeta(path, message) {
   const meta = getEl('dailyReportMeta');
+  if (!meta) return;
+  meta.innerHTML = '';
+  if (path) {
+    const name = path.split('/').pop();
+    configureDailyReportLink(path);
+    const text = document.createElement('span');
+    text.textContent = 'Saved report: ';
+    const link = document.createElement('a');
+    link.href = `${API}/reports/${encodeURIComponent(name)}`;
+    link.target = '_blank';
+    link.textContent = name;
+    link.style.textDecoration = 'underline';
+    meta.appendChild(text);
+    meta.appendChild(link);
+  } else {
+    configureDailyReportLink(null);
+    meta.textContent = message || 'No daily report yet.';
+  }
+}
+
+function formatReportList(items, fallback) {
+  if (!items || !items.length) {
+    return `<div style="color:var(--text2);font-size:12px">${fallback}</div>`;
+  }
+  const list = items.map(item => `<li style="margin-bottom:4px">${esc(item)}</li>`).join('');
+  return `<ul style="margin:0;padding-left:18px;list-style:disc;font-size:13px;line-height:1.5">${list}</ul>`;
+}
+
+function renderDailyReportQueues(report) {
+  const queues = getEl('dailyReportQueues');
+  if (!queues) return;
+  const summary = report.summary || 'No summary available.';
+  const workingList = formatReportList(report.working, 'No working items recorded.');
+  const notWorkingList = formatReportList(report.not_working, 'No issues recorded.');
+  const improvementsList = formatReportList(report.improvements, 'No improvement items recorded.');
+  queues.innerHTML = `
+    <div style="margin-bottom:14px;padding:12px;border:1px solid var(--border);border-radius:10px;background:rgba(16,185,129,0.06)">
+      <div style="font-size:12px;color:var(--text2);margin-bottom:6px">Summary</div>
+      <div style="font-size:13px;line-height:1.6">${esc(summary)}</div>
+      <div style="font-size:12px;color:var(--text2);margin-top:8px">Confidence: ${esc(report.confidence || 'unknown')} · Model: ${esc(report.model || 'unknown')}</div>
+    </div>
+    <div style="margin-bottom:14px;padding:12px;border:1px solid var(--border);border-radius:10px;">
+      <div style="font-size:12px;color:var(--text2);margin-bottom:8px">Working</div>
+      ${workingList}
+    </div>
+    <div style="margin-bottom:14px">
+      <div style="font-size:12px;color:var(--text2);margin-bottom:8px">Not Working</div>
+      ${notWorkingList}
+    </div>
+    <div>
+      <div style="font-size:12px;color:var(--text2);margin-bottom:8px">Top 5 Improvements</div>
+      ${improvementsList}
+    </div>
+  `;
+}
+
+async function loadDailyReport() {
   const content = getEl('dailyReportContent');
   const queues = getEl('dailyReportQueues');
-  reportItemLogCache = {};
-  if (!meta || !content || !queues) return;
+  updateDailyReportMeta(null, 'Loading daily report metadata…');
+  if (queues) queues.innerHTML = '';
+  if (content) content.textContent = 'Loading…';
   try {
     const r = await fetch(API + '/api/reports/daily');
     const data = await r.json();
     if (!data.exists) {
-      meta.textContent = `No daily report yet. Implementation plan: ${data.implementation_plan_path} · Testing ideas: ${data.testing_ideas_path}`;
-      queues.innerHTML = '';
-      content.textContent = 'Generate the first report to create a dated report and actionable queues.';
+      const expected = data.path ? data.path.split('/').pop() : 'daily report file';
+      updateDailyReportMeta(null, `No daily report yet. Generate one to create ${expected}.`);
+      if (content) content.textContent = 'Generate the first report to create a dated report and actionable queues.';
+      if (queues) queues.innerHTML = '';
       return;
     }
-    meta.textContent = `Saved report: ${data.path} · Implementation plan: ${data.implementation_plan_path} · Testing ideas: ${data.testing_ideas_path}`;
-    renderDailyReportQueues(data.report || {}, data.items || []);
-    content.textContent = data.content || '';
+    updateDailyReportMeta(data.path);
+    renderDailyReportQueues(data.report || {});
+    if (content) content.textContent = data.content || '';
   } catch(e) {
-    meta.textContent = 'Failed to load daily report';
-    queues.innerHTML = '';
-    content.textContent = String(e);
+    updateDailyReportMeta(null, 'Failed to load daily report');
+    if (queues) queues.innerHTML = '';
+    if (content) content.textContent = String(e);
   }
 }
 
 async function generateDailyReport() {
   const btn = getEl('dailyReportBtn');
-  const meta = getEl('dailyReportMeta');
   const content = getEl('dailyReportContent');
   const queues = getEl('dailyReportQueues');
   if (btn) { btn.disabled = true; btn.textContent = 'Generating…'; }
-  if (meta) meta.textContent = 'Generating report…';
+  updateDailyReportMeta(null, 'Generating report…');
   if (queues) queues.innerHTML = '';
+  if (content) content.textContent = 'Generating report…';
   try {
     const r = await fetch(API + '/api/reports/daily', { method: 'POST' });
     const data = await r.json();
@@ -1914,144 +1983,25 @@ async function generateDailyReport() {
       toast('Daily report error: ' + (data.detail || data.error || 'Request failed'), true);
       return;
     }
-    if (meta) meta.textContent = `Saved report: ${data.path} · Implementation plan: ${data.implementation_plan_path} · Testing ideas: ${data.testing_ideas_path}`;
-    if (queues) renderDailyReportQueues(data.report || {}, data.items || []);
+    updateDailyReportMeta(data.path);
+    renderDailyReportQueues(data.report || {});
     if (content) content.textContent = data.content || '';
-    toast('Daily report generated and report items queued', 10000);
+    toast('Daily report generated', 6000);
   } catch(e) {
     toast('Daily report error: ' + e.message, true);
-    if (meta) meta.textContent = 'Daily report generation failed';
+    updateDailyReportMeta(null, 'Daily report generation failed');
   } finally {
     if (btn) { btn.disabled = false; btn.textContent = 'Generate Report'; }
   }
 }
 
-function reportItemBadge(item) {
-  const label = item.disposition || item.status || 'new';
-  const palette = {
-    implement: ['rgba(16,185,129,0.18)', 'var(--green)'],
-    live_candidate: ['rgba(56,189,248,0.18)', 'var(--sky)'],
-    diagnose: ['rgba(245,158,11,0.18)', 'var(--amber)'],
-    test_only: ['rgba(148,163,184,0.18)', 'var(--text2)'],
-    planned: ['rgba(16,185,129,0.18)', 'var(--green)'],
-    queued: ['rgba(245,158,11,0.18)', 'var(--amber)'],
-    needs_review: ['rgba(239,68,68,0.18)', 'var(--red)'],
-    new: ['rgba(148,163,184,0.18)', 'var(--text2)'],
-  }[label] || ['rgba(148,163,184,0.18)', 'var(--text2)'];
-  return `<span style="display:inline-block;padding:2px 8px;border-radius:999px;background:${palette[0]};color:${palette[1]};font-size:11px;font-weight:700;text-transform:capitalize">${esc(label.replaceAll('_', ' '))}</span>`;
-}
-
-function dailyReportItemCard(item, buttons) {
-  const notes = item.notes ? `<div style="color:var(--text2);font-size:11px;margin-top:6px">${esc(item.notes)}</div>` : '';
-  const diag = item.diagnosis_path ? `<div style="color:var(--text2);font-size:11px;margin-top:4px">Diagnosis log: ${esc(item.diagnosis_path)}</div>` : '';
-  const action = item.action_path ? `<div style="color:var(--text2);font-size:11px;margin-top:4px">Tracked in: ${esc(item.action_path)}</div>` : '';
-  return `
-    <div style="border:1px solid var(--border);border-radius:10px;padding:12px;background:rgba(15,23,42,0.35);margin-bottom:10px">
-      <div style="display:flex;justify-content:space-between;gap:10px;align-items:flex-start">
-        <div style="font-size:13px;line-height:1.5">${esc(item.item_text)}</div>
-        ${reportItemBadge(item)}
-      </div>
-      <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:10px">${buttons}</div>
-      <div id="reportItemLog-${item.id}" style="margin-top:10px;min-height:28px;font-size:11px;color:var(--text2)"></div>
-      ${notes}${diag}${action}
-    </div>`;
-}
-
-function renderDailyReportQueues(report, items) {
-  const queues = getEl('dailyReportQueues');
-  if (!queues) return;
-  const bySection = (section) => items.filter(item => item.section === section);
-  const notWorking = bySection('not_working');
-  const improvements = bySection('improvement');
-  const working = (report.working || []).map(item =>
-    `<li style="margin:0 0 6px 18px">${esc(item)}</li>`
-  ).join('');
-  const notWorkingCards = notWorking.map(item => dailyReportItemCard(
-    item,
-    `
-      <button class="btn sm" onclick="runReportItemAction(${item.id}, 'fix-log')">Add to Fix Log</button>
-      <button class="btn sm sky" onclick="runReportItemAction(${item.id}, 'diagnose')">Diagnose</button>
-      <button class="btn sm" style="border-color:var(--text2);color:var(--text2)" onclick="viewReportItemLog(${item.id})">Check Log</button>
-    `
-  )).join('');
-  const improvementCards = improvements.map(item => dailyReportItemCard(
-    item,
-    `
-      <button class="btn sm" onclick="runReportItemAction(${item.id}, 'plan')">Add to Plan</button>
-      <button class="btn sm" onclick="runReportItemAction(${item.id}, 'testing')">Mark Test Only</button>
-      <button class="btn sm sky" onclick="runReportItemAction(${item.id}, 'live-candidate')">Mark Live Candidate</button>
-      <button class="btn sm" style="border-color:var(--text2);color:var(--text2)" onclick="viewReportItemLog(${item.id})">Check Log</button>
-    `
-  )).join('');
-  queues.innerHTML = `
-    <div style="margin-bottom:14px;padding:12px;border:1px solid var(--border);border-radius:10px;background:rgba(16,185,129,0.06)">
-      <div style="font-size:12px;color:var(--text2);margin-bottom:6px">Summary</div>
-      <div style="font-size:13px;line-height:1.6">${esc(report.summary || 'No summary available.')}</div>
-      <div style="font-size:12px;color:var(--text2);margin-top:8px">Confidence: ${esc(report.confidence || 'unknown')} · Model: ${esc(report.model || 'unknown')}</div>
-    </div>
-    <div style="margin-bottom:14px;padding:12px;border:1px solid var(--border);border-radius:10px;">
-      <div style="font-size:12px;color:var(--text2);margin-bottom:8px">Working</div>
-      <ul style="margin:0;padding:0">${working || '<li style="margin:0 0 6px 18px">No working items recorded.</li>'}</ul>
-    </div>
-    <div style="margin-bottom:14px">
-      <div style="font-size:12px;color:var(--text2);margin-bottom:8px">Not Working</div>
-      ${notWorkingCards || '<div style="color:var(--text2);font-size:12px">No issues recorded.</div>'}
-    </div>
-    <div>
-      <div style="font-size:12px;color:var(--text2);margin-bottom:8px">Top 5 Improvements</div>
-      ${improvementCards || '<div style="color:var(--text2);font-size:12px">No improvement items recorded.</div>'}
-    </div>
-  `;
-}
-
-async function runReportItemAction(itemId, action) {
-  try {
-    const r = await fetch(API + `/api/reports/items/${itemId}/${action}`, { method: 'POST' });
-    const data = await r.json();
-    if (!r.ok || !data.ok) {
-      throw new Error(data.detail || data.error || 'Request failed');
-    }
-    if (action === 'diagnose' && data.path) {
-      toast(`Diagnosis saved: ${data.path}`, 10000);
-    } else if (data.path) {
-      toast(`Saved: ${data.path}`, 8000);
-    } else {
-      toast('Report item updated', 6000);
-    }
-    loadDailyReport();
-  } catch(e) {
-    toast('Report item action failed: ' + e.message, true);
-  }
-}
-
-async function viewReportItemLog(itemId) {
-  const container = getEl(`reportItemLog-${itemId}`);
-  if (!container) return;
-  if (reportItemLogCache[itemId]) {
-    container.innerHTML = reportItemLogCache[itemId];
+function openDailyReportFile() {
+  if (!latestDailyReportFilename) {
+    toast('No saved daily report yet', true);
     return;
   }
-  container.innerHTML = `<div style="font-size:11px;color:var(--text2)">Loading log…</div>`;
-  try {
-    const r = await fetch(API + `/api/reports/items/${itemId}/log`);
-    const data = await r.json();
-    if (!r.ok || !data.ok) {
-      throw new Error(data.detail || data.error || 'Request failed');
-    }
-    const pathLine = data.path
-      ? `<div style="font-size:11px;color:var(--text2);margin-bottom:4px">Log: ${esc(data.path)}</div>`
-      : '';
-    const snippet = data.snippet
-      ? `<pre style="margin:0;font-size:11px;font-family:'SF Mono','Fira Code',monospace;line-height:1.4;color:var(--text);background:rgba(148,163,184,0.08);padding:6px;border-radius:6px;border:1px solid var(--border)">${esc(data.snippet)}</pre>`
-      : `<div style="font-size:11px;color:var(--text2)">No excerpt available.</div>`;
-    const html = `${pathLine}${snippet}`;
-    container.innerHTML = html;
-    reportItemLogCache[itemId] = html;
-  } catch(e) {
-    const message = e?.message || String(e);
-    container.innerHTML = `<div style="font-size:11px;color:var(--red)">Failed to load log: ${esc(message)}</div>`;
-    toast('Check log failed: ' + message, true);
-  }
+  const url = `${API}/reports/${encodeURIComponent(latestDailyReportFilename)}`;
+  window.open(url, '_blank');
 }
 
 // ── Copy Trader ─────────────────────────────────────────────────────────────
