@@ -41,8 +41,11 @@ POLL_INTERVAL   = 120        # seconds between position checks
 SCORE_INTERVAL  = 3600       # rescore wallets every hour
 MIN_TRADES      = 50         # skip wallets with fewer trades
 BOT_TRADES_MONTH = 150       # above this = bot, skip
-MIN_AVG_SIZE    = 500        # minimum avg trade size USD to copy
+MIN_AVG_SIZE    = 750        # minimum avg trade size USD to copy
 MIN_SCORE       = 60         # only auto-copy wallets scoring >= this
+COPY_MIN_SCORE  = 65         # minimum score to auto-copy (informed classification)
+COPY_MIN_AVG_SIZE = MIN_AVG_SIZE
+COPY_REQUIRED_CLASSIFICATION = "informed"
 COPY_SIZE_USD   = 20         # paper trade size per copy
 STATE_FILE      = Path(__file__).parent / "logs" / "wallet_state.json"
 
@@ -264,12 +267,21 @@ def score_wallet(address: str, label: str, activity_limit: int = 500) -> dict:
 
 
 def _score_result(address, label, score, classification, breakdown, trades, positions):
+    breakdown = breakdown or {}
+    score_value = float(score or 0)
+    classification_value = classification or ""
+    avg_size = float(breakdown.get("avg_size_usd") or 0)
+    will_copy = (
+        classification_value == COPY_REQUIRED_CLASSIFICATION
+        and score_value >= COPY_MIN_SCORE
+        and avg_size >= COPY_MIN_AVG_SIZE
+    )
     return {
         "address": address,
         "label": label,
         "score": score,
         "classification": classification,
-        "will_copy": score >= MIN_SCORE and classification not in ("bot", "no_data", "insufficient_data", "skip"),
+        "will_copy": will_copy,
         "breakdown": breakdown,
         "scored_at": time.time(),
     }

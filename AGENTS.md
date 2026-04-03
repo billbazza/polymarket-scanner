@@ -163,3 +163,6 @@ All in `.env` (see `.env.example`):
 - `TELEGRAM_BOT_TOKEN` + `TELEGRAM_CHAT_ID` — enables Telegram alerts
 - `ALCHEMY_API_KEY` — enables blockchain.py (Polygon RPC)
 - `POLYMARKET_PRIVATE_KEY` — enables live trading (Tier 3)
+
+## Recent Fix Logs
+- `fix_logs/2026-04-03-copy-strategy-filter-tuning.md`: tightened the copy strategy so only "informed" wallets (score ≥65, avg trade ≥$750) get mirrored and `inspect_copy_trade_open()` now blocks wallets with negative stored PnL or an AI verdict other than `copy`.

@@ -2661,6 +2661,54 @@ def inspect_copy_trade_open(
             **_paper_position_policy_dict(),
         }
 
+    wallet_meta = None
+    meta_conn = get_conn()
+    try:
+        wallet_meta = meta_conn.execute(
+            "SELECT score_breakdown, ai_verdict FROM watched_wallets WHERE address=?",
+            (wallet,),
+        ).fetchone()
+    finally:
+        meta_conn.close()
+    ai_verdict_raw = wallet_meta["ai_verdict"] if wallet_meta and wallet_meta["ai_verdict"] else ""
+    ai_verdict = ai_verdict_raw.strip().lower() if ai_verdict_raw else ""
+    wallet_total_pnl = None
+    if wallet_meta:
+        breakdown_text = wallet_meta["score_breakdown"] or ""
+        breakdown_data: dict = {}
+        if breakdown_text:
+            try:
+                breakdown_data = json.loads(breakdown_text)
+            except Exception:
+                breakdown_data = {}
+        realised_pnl = float(breakdown_data.get("realised_pnl") or 0)
+        unrealised_pnl = float(breakdown_data.get("unrealised_pnl") or 0)
+        wallet_total_pnl = realised_pnl + unrealised_pnl
+        if wallet_total_pnl < 0:
+            return {
+                "ok": False,
+                "reason_code": "wallet_negative_pnl",
+                "reason": (
+                    f"Wallet total PnL ${wallet_total_pnl:.2f} is negative — skip copy trades until it recovers."
+                ),
+                "wallet": wallet,
+                "condition_id": condition_id,
+                "wallet_total_pnl": round(wallet_total_pnl, 2),
+                **_paper_position_policy_dict(),
+            }
+        if ai_verdict and ai_verdict != "copy":
+            return {
+                "ok": False,
+                "reason_code": "brain_verdict_block",
+                "reason": (
+                    f"Brain verdict '{ai_verdict_raw}' forbids copying this wallet."
+                ),
+                "wallet": wallet,
+                "condition_id": condition_id,
+                "ai_verdict": ai_verdict_raw,
+                **_paper_position_policy_dict(),
+            }
+
     return {
         "ok": True,
         "reason_code": "ready",
