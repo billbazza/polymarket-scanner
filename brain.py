@@ -582,18 +582,28 @@ def validate_signal(signal, model=DEFAULT_MODEL):
         return True, "Brain unavailable — defaulting to statistical signal"
 
     # Fetch real-time context from Perplexity if available
-    research_context = ""
+    context_block = ""
+    perplexity_result = signal.get("perplexity")
     try:
         import perplexity
         if perplexity.is_available():
-            research = perplexity.research_signal(signal)
-            research_context = research.get("combined", "")
-            if research_context:
+            needs_eval = not perplexity_result or perplexity_result.get("status") != "ok"
+            if needs_eval:
+                perplexity_result = perplexity.evaluate_signal(signal)
+                signal["perplexity"] = perplexity_result
+            context = perplexity_result.get("context", "") if perplexity_result else ""
+            if context:
+                context_block = f"\nReal-time research context:\n{context}\n"
                 log.info("Perplexity context fetched for: %s", signal.get("event", "?")[:40])
+            if perplexity_result and perplexity_result.get("status") != "ok":
+                log.info(
+                    "Perplexity fallback (%s) for %s: %s",
+                    perplexity_result.get("status"),
+                    signal.get("event", "?")[:40],
+                    perplexity_result.get("reason"),
+                )
     except Exception as e:
         log.warning("Perplexity research failed, continuing without context: %s", e)
-
-    context_block = f"\nReal-time research context:\n{research_context}\n" if research_context else ""
 
     prompt = f"""You are a prediction market risk analyst. A statistical scanner found this trading signal:
 

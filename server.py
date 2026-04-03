@@ -20,6 +20,7 @@ import db
 import scanner
 import brain
 import cointegration_trial
+import perplexity
 import trade_monitor
 from log_setup import init_logging
 
@@ -482,6 +483,7 @@ def _save_pairs_scan_run(scan_result, duration):
     trial_settings = cointegration_trial.get_trial_settings()
     for opp in opportunities:
         cointegration_trial.annotate_opportunity(opp, mode="paper", settings=trial_settings)
+        perplexity.annotate_profitable_candidate(opp)
     db.save_scan_run(
         pairs_tested=scan_result["pairs_tested"],
         cointegrated=scan_result["pairs_cointegrated"],

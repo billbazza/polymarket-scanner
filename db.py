@@ -137,7 +137,8 @@ def _migration_001_base_schema(conn):
             experiment_reason_code TEXT,
             experiment_reason TEXT,
             experiment_guardrails_json TEXT,
-            admission_json TEXT
+            admission_json TEXT,
+            perplexity_json TEXT
         );
 
         CREATE TABLE IF NOT EXISTS trades (
@@ -872,6 +873,10 @@ def _migration_016_weather_exact_temp_metadata(conn):
         _add_column_if_missing(conn, "weather_signals", col, coltype)
 
 
+def _migration_017_perplexity_metadata(conn):
+    _add_column_if_missing(conn, "signals", "perplexity_json", "TEXT")
+
+
 _MIGRATIONS = [
     ("001_base_schema", _migration_001_base_schema),
     ("002_backfill_columns", _migration_002_backfill_columns),
@@ -889,6 +894,7 @@ _MIGRATIONS = [
     ("014_signal_admission_diagnostics", _migration_014_signal_admission_diagnostics),
     ("015_weather_intraday_correction", _migration_015_weather_intraday_correction),
     ("016_weather_exact_temp_metadata", _migration_016_weather_exact_temp_metadata),
+    ("017_perplexity_metadata", _migration_017_perplexity_metadata),
 ]
 
 
@@ -906,7 +912,10 @@ def _repair_schema_gaps(conn):
     work without manual SQLite intervention.
     """
     _ensure_columns_if_table_exists(conn, "watched_wallets", _WATCHED_WALLET_MONITOR_COLUMNS)
-    _ensure_columns_if_table_exists(conn, "signals", [("admission_json", "TEXT")])
+    _ensure_columns_if_table_exists(conn, "signals", [
+        ("admission_json", "TEXT"),
+        ("perplexity_json", "TEXT"),
+    ])
     _ensure_columns_if_table_exists(conn, "weather_signals", [
         ("strategy_name", "TEXT"),
         ("market_family", "TEXT"),
@@ -974,6 +983,14 @@ def _deserialize_signal_row(row):
     del d["filters_json"]
     del d["experiment_guardrails_json"]
     del d["admission_json"]
+    if d.get("perplexity_json"):
+        try:
+            d["perplexity"] = json.loads(d["perplexity_json"])
+        except json.JSONDecodeError:
+            d["perplexity"] = None
+    else:
+        d["perplexity"] = None
+    d.pop("perplexity_json", None)
     return _attach_signal_observability(d)
 
 
@@ -1061,8 +1078,8 @@ def save_signal(opp):
             grade_label, tradeable, paper_tradeable, ev_json, sizing_json, filters_json,
             token_id_a, token_id_b, admission_path, experiment_name,
             experiment_status, experiment_reason_code, experiment_reason,
-            experiment_guardrails_json, admission_json)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            experiment_guardrails_json, admission_json, perplexity_json)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (
         time.time(), opp["event"], opp["market_a"], opp["market_b"],
         opp["price_a"], opp["price_b"], opp["z_score"], opp["coint_pvalue"],
@@ -1079,6 +1096,7 @@ def save_signal(opp):
         opp.get("experiment_reason"),
         json.dumps(opp.get("experiment_guardrails")) if opp.get("experiment_guardrails") else None,
         json.dumps(opp.get("admission")) if opp.get("admission") else None,
+        json.dumps(opp.get("perplexity")) if opp.get("perplexity") else None,
     ))
     signal_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
     conn.commit()

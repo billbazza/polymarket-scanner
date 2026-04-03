@@ -28,15 +28,15 @@ System is operationally healthy with 67.3% win rate and $252.53 total PnL from 1
 - [x] Tighten weather strategy stop-losses or improve entry timing to reduce frequency of stopped trades (`fix_logs/2026-04-03-weather-stop-noise.md`).
 - [x] Add concrete exit criteria for whale positions (per-position loss limit, max hold time, volatility trigger) or retire the strategy, since the $54.52 unrealized loss on three live trades shows the current guardrails are ineffective and weather already carries the win-rate lead (`fix_logs/2026-04-03-whale-exit-controls.md`).
 - [x] Disable or refine copy strategy filters as current implementation is unprofitable despite decent win rate - or remove it altogether - not worth developing vs weather (`fix_logs/2026-04-03-copy-strategy-filter-rework.md` & `fix_logs/2026-04-03-copy-strategy-filter-tuning.md`).
-- [ ] Plan stage 2/3 live tests with Polygon data gating and Perplexity validation; details logged in `fix_logs/2026-04-03-stage2-3-live-tests.md` (Kanban cards now track Polygon gating, Perplexity validation, and live-readiness readiness work).
+- [x] Stage 2 Perplexity Validation – Perplexity verdicts now annotate each profitable candidate and fallback metadata is logged alongside `perplexity_json` in the database (`fix_logs/2026-04-04-stage2-perplexity-validation.md`).
 
 ## Status Summary
 - All previously flagged “Not Working” items have corresponding fix logs and are stable; cointegration now admits trades, the copy wallet gate is stricter, whale positions auto-exit, weather guards lean on liquidity/noise filters, and confidence-based sizing drives fills.
-- Stage 2/3 live-test planning is in progress with the stage outline captured in `fix_logs/2026-04-03-stage2-3-live-tests.md`; the remaining open work is sequenced via the Kanban tasks below.
+- Stage 2 Perplexity validation is now integrated (cached verdicts + fallback metadata) and recorded in `fix_logs/2026-04-04-stage2-perplexity-validation.md`; the remaining Stage 3 live-readiness work is sequenced via the Kanban tasks below.
 
 ## Kanban Tasks
 - `Stage 2 Polygon Gating` – capture Polygon rollouts for block/chain parity, liquidity gate, and slippage checks so stage 2 paper runs can log block metadata before trading.
-- `Stage 2 Perplexity Validation` – integrate Perplexity verdicts, tag “profitable candidate” features, and log fallback behavior per the new plan.
+- `Stage 2 Perplexity Validation` – evaluation now runs during scans, the verdict is cached in `perplexity_json`, and fallback paths are logged per `fix_logs/2026-04-04-stage2-perplexity-validation.md`; remaining Kanban work now focuses on Polygon gating + Stage 3 readiness.
 - `Stage 3 Live Readiness` – document the readiness checklist (balance, slippage, quarter-Kelly caps, POLYMARKET_PRIVATE_KEY/ALCHEMY_API_KEY checks) so the limited $1–5 live exposure obeys the autonomy risk gating.
 
 ## Stage 2/3 Live-Test Plan
