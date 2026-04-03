@@ -155,7 +155,7 @@ class WeatherSignalLifecycleTests(unittest.TestCase):
         self.assertEqual(trade["exit_reason"], "Manual close for audit")
         self.assertEqual(signal["status"], "closed")
 
-    def test_weather_stop_loss_uses_fifteen_percent_floor(self):
+    def test_weather_stop_loss_uses_configured_floor(self):
         signal_id = self.db.save_weather_signal(_weather_opp(city="Dallas", market="Will Dallas hit 84F?", yes_token="yes-dal", no_token="no-dal"))
         trade_id = self.db.open_weather_trade(signal_id, size_usd=20)
         trade = self.db.get_trade(trade_id)
@@ -176,7 +176,7 @@ class WeatherSignalLifecycleTests(unittest.TestCase):
         self.assertEqual(close["trade_id"], trade_id)
         self.assertIn("stop-loss hit", close["reason"])
         self.assertEqual(self.db.get_trade(trade_id)["status"], "closed")
-        self.assertAlmostEqual(trade["entry_price_a"] * (1 - tracker.WEATHER_STOP_LOSS_PCT), 0.3485, places=4)
+        self.assertAlmostEqual(trade["entry_price_a"] * (1 - tracker.WEATHER_STOP_LOSS_PCT), 0.3362, places=4)
 
 
 if __name__ == "__main__":

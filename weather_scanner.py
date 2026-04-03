@@ -46,6 +46,9 @@ MIN_EDGE = 0.06        # 6pp minimum combined edge to surface (for display)
 MIN_TRADE_EDGE = 0.15  # 15pp minimum edge required to mark tradeable
 MIN_TRADE_PRICE = 0.35 # never buy a token below this price (avoids near-wipeout long shots)
 MIN_LIQUIDITY = 200    # minimum event liquidity USD
+MIN_STABLE_LIQUIDITY = 10_000  # avoid ultra-thin weather books
+MIN_HOURS_AHEAD_FOR_TRADE = 48  # require at least two days to let noise settle
+MAX_SOURCE_DISAGREEMENT = 0.12  # difference between NOAA/OM probabilities
 
 _WEATHER_KEYWORDS = [
     "temperature", "°f", "°c", "degrees", "high temp", "low temp",
@@ -459,12 +462,22 @@ def scan(
                     * (correction["source_corrections"][1].get("corrected_prob", om_prob) - yes_price)
                 ) > 0
             ) if len(correction["source_corrections"]) >= 2 else False
+            source_disagreement = (
+                abs(noaa_prob - om_prob) if noaa_prob is not None and om_prob is not None else None
+            )
+            liquidity_ok = liq >= MIN_STABLE_LIQUIDITY
+            horizon_ok = hours_ahead >= MIN_HOURS_AHEAD_FOR_TRADE
+            disagreement_ok = (
+                source_disagreement is not None and source_disagreement <= MAX_SOURCE_DISAGREEMENT
+            )
+            stable_noise_guard = liquidity_ok and horizon_ok and disagreement_ok
             corrected_tradeable = (
                 corrected_sources_agree
                 and corrected_metrics.get("ev_pct", 0) > 0
                 and corrected_metrics.get("kelly_fraction", 0) > 0
                 and abs(corrected_edge) >= MIN_TRADE_EDGE
                 and (yes_price if corrected_metrics.get("action") == "BUY_YES" else (1 - yes_price)) >= MIN_TRADE_PRICE
+                and stable_noise_guard
             )
 
             # Tradeable: BOTH sources must agree (no single-source trades for international)
@@ -475,6 +488,7 @@ def scan(
                 and kelly_f > 0
                 and abs(combined_edge) >= MIN_TRADE_EDGE
                 and baseline_price >= MIN_TRADE_PRICE
+                and stable_noise_guard
             )
 
             opp = {
@@ -521,6 +535,11 @@ def scan(
                 "source_details": source_probability_details,
                 # Scoring
                 "hours_ahead": hours_ahead,
+                "source_disagreement": round(source_disagreement, 4) if source_disagreement is not None else None,
+                "stable_liquidity": liquidity_ok,
+                "horizon_ok": horizon_ok,
+                "disagreement_ok": disagreement_ok,
+                "stable_noise_guard": stable_noise_guard,
                 "ev_pct": ev_pct,
                 "kelly_fraction": kelly_f,
                 "action": action,
@@ -538,7 +557,7 @@ def scan(
             opportunities.append(opp)
             log.info(
                 "%s | %s %s %.0f°F | price=%.3f noaa=%.3f om=%s combined=%.3f "
-                "edge=%+.1f%% corrected=%s mode=%s agree=%s action=%s",
+                "edge=%+.1f%% corrected=%s mode=%s agree=%s action=%s noise=%s",
                 parsed["city"], target_date, direction, threshold_f,
                 yes_price,
                 noaa_prob if noaa_prob is not None else -1,
@@ -547,6 +566,7 @@ def scan(
                 f"{corrected_prob:.3f}" if corrected_prob is not None else "n/a",
                 correction_mode,
                 sources_agree, action,
+                "ok" if stable_noise_guard else "blocked",
             )
 
     opportunities.sort(key=lambda x: (not x["tradeable"], -abs(x["combined_edge"])))
