@@ -12,6 +12,9 @@ log = logging.getLogger("scanner.tracker")
 WEATHER_STOP_LOSS_PCT = 0.15
 _WARN_TTL_SECS = 6 * 60 * 60
 _LAST_WARNINGS = {}
+WHALE_MAX_DRAWNDOWN_USD = 15.0
+WHALE_MAX_HOLD_SECS = 48 * 3600
+WHALE_VOLATILITY_DROP_PCT = 0.15
 
 
 def refresh_open_trades():
@@ -476,6 +479,64 @@ def _auto_close_weather(trade):
     return None
 
 
+def _auto_close_whale_guardrails(trade, current_price, price_source):
+    """Exit whale trades that hit loss, hold-time, or volatility limits."""
+    trade_id = trade["id"]
+    size_usd = float(trade.get("size_usd") or 0.0)
+    entry_price = trade.get("entry_price_a")
+    if entry_price is None or size_usd <= 0:
+        return None
+
+    valuation = db.calculate_single_leg_mark_to_market(size_usd, entry_price, current_price)
+    if not valuation.get("ok"):
+        return None
+
+    pnl_usd = valuation["pnl_usd"]
+    now = time.time()
+    age_secs = now - (trade.get("opened_at") or now)
+    reason = None
+
+    if pnl_usd <= -WHALE_MAX_DRAWNDOWN_USD:
+        reason = f"loss guardrail hit (${pnl_usd:.2f} <= -${WHALE_MAX_DRAWNDOWN_USD:.2f})"
+    elif age_secs >= WHALE_MAX_HOLD_SECS:
+        hours = age_secs / 3600
+        reason = f"max hold time exceeded ({hours:.1f}h >= {WHALE_MAX_HOLD_SECS/3600:.0f}h)"
+    else:
+        side = (trade.get("side_a") or "").upper()
+        entry = float(entry_price or 0)
+        if entry > 0:
+            adverse_pct = 0.0
+            if "YES" in side:
+                adverse_pct = max(0.0, (entry - current_price) / entry)
+            elif "NO" in side:
+                adverse_pct = max(0.0, (current_price - entry) / entry)
+            if adverse_pct >= WHALE_VOLATILITY_DROP_PCT:
+                reason = f"volatility stop triggered ({adverse_pct*100:.1f}% adverse move)"
+
+    if not reason:
+        return None
+
+    pnl_tracks = db.close_trade(trade_id, current_price, notes=f"Auto-closed: {reason}")
+    if pnl_tracks is None:
+        return None
+
+    log.info(
+        "AUTO-CLOSE whale guardrail: trade=%d reason=%s pnl=$%.2f event=%s",
+        trade_id,
+        reason,
+        pnl_tracks,
+        trade.get("event", "?")[:40],
+    )
+    return {
+        "trade_id": trade_id,
+        "trade_type": "whale",
+        "exit_price_a": current_price,
+        "pnl_usd": round(pnl_tracks, 2),
+        "reason": reason,
+        "price_source": price_source or "guardrail",
+    }
+
+
 def _auto_close_single_leg(trade):
     """Auto-close a single-leg trade when the underlying market resolves."""
     trade_type = _trade_kind(trade)
@@ -484,25 +545,33 @@ def _auto_close_single_leg(trade):
 
     trade_id = trade["id"]
     price_state = _resolve_single_leg_price(trade, "auto-close")
-    if not price_state or price_state.get("price") is None or not price_state.get("resolved"):
+    if not price_state or price_state.get("price") is None:
         return None
 
     current_a = price_state["price"]
-    reason = "resolved"
-    pnl_usd = db.close_trade(trade_id, current_a, notes=f"Auto-closed: {reason}")
-    if pnl_usd is None:
-        return None
+    if price_state.get("resolved"):
+        reason = "resolved"
+        pnl_usd = db.close_trade(trade_id, current_a, notes=f"Auto-closed: {reason}")
+        if pnl_usd is None:
+            return None
 
-    log.info("AUTO-CLOSE %s: trade=%d %s pnl=$%.2f event=%s",
-             trade_type, trade_id, reason, pnl_usd, trade.get("event", "?")[:40])
-    return {
-        "trade_id": trade_id,
-        "trade_type": trade_type,
-        "exit_price_a": current_a,
-        "pnl_usd": round(pnl_usd, 2),
-        "price_source": price_state.get("source"),
-        "reason": reason,
-    }
+        log.info("AUTO-CLOSE %s: trade=%d %s pnl=$%.2f event=%s",
+                 trade_type, trade_id, reason, pnl_usd, trade.get("event", "?")[:40])
+        return {
+            "trade_id": trade_id,
+            "trade_type": trade_type,
+            "exit_price_a": current_a,
+            "pnl_usd": round(pnl_usd, 2),
+            "price_source": price_state.get("source"),
+            "reason": reason,
+        }
+
+    if trade_type == "whale":
+        guardrail_result = _auto_close_whale_guardrails(trade, current_a, price_state.get("source"))
+        if guardrail_result:
+            return guardrail_result
+
+    return None
 
 
 def _auto_close_pairs(trade, z_threshold):
