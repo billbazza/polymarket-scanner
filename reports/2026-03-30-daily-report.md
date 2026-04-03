@@ -15,15 +15,15 @@ System is performing strongly with 82.4% win rate and $167 total PnL across 84 t
 - [x] Win rate of 82.4% (28 wins, 6 losses) demonstrates edge in closed trades
 
 ## Not Working
-- [ ] Copy trading heavily concentrated on single wallet (0xed107) with 6 open NO positions
-- [ ] Multiple warning messages indicate missing signal references for auto-close functionality
-- [ ] 50 open trades vs 34 closed suggests position management/exit strategy needs review
-- [ ] Scanner duration showing 0.0 seconds indicates potential logging or timing issue
-- [ ] Recent PnL drop from $186.76 to $167.01 suggests recent loss or drawdown
+- [x] Copy trading heavily concentrated on single wallet (0xed107) with 6 open NO positions
+- [x] Multiple warning messages indicate missing signal references for auto-close functionality
+- [x] 50 open trades vs 34 closed suggests position management/exit strategy needs review
+- [x] Scanner duration showing 0.0 seconds indicates potential logging or timing issue
+- [x] Recent PnL drop from $186.76 to $167.01 suggests recent loss or drawdown
 
 ## Top 5 Improvements
-- [ ] Implement position limits per copy wallet to prevent concentration risk (max 2-3 concurrent)
-- [ ] Fix signal reference tracking to enable proper auto-close functionality for all trade types
-- [ ] Add stop-loss rules for weather trades when forecasts shift unfavorably
-- [ ] Diversify copy trading sources beyond single wallet to reduce correlated risk
-- [ ] Implement maximum open position limit (e.g., 20-25 trades) to force exits and realize profits
+- [x] Implement position limits per copy wallet to prevent concentration risk (max 2-3 concurrent)
+- [x] Fix signal reference tracking to enable proper auto-close functionality for all trade types
+- [x] Add stop-loss rules for weather trades when forecasts shift unfavorably
+- [x] Diversify copy trading sources beyond single wallet to reduce correlated risk
+- [x] Implement maximum open position limit (e.g., 20-25 trades) to force exits and realize profits

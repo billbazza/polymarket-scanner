@@ -16,8 +16,8 @@ System is operationally healthy with 67.3% win rate and $252.53 total PnL from 1
 
 ## Not Working
 - [ ] Cointegration strategy completely inactive (0 trades) despite 339 A+ signals seen
-- [ ] Copy strategy losing money with -$14.85 PnL and 57.9% win rate
-- [ ] Whale strategy deeply underwater at -$54.52 unrealized loss on 3 open positions
+- [ ] Copy strategy losing money with -$14.85 PnL and 57.9% win rate - remove it?
+- [ ] Whale strategy deeply underwater at -$54.52 unrealized loss on 3 open positions - remove it?
 - [ ] Stop-losses triggering frequently on weather trades causing -$4 to -$5 losses
 - [ ] Position sizing not utilizing confidence scoring (53 shadow decisions, 0 applied)
 
@@ -25,5 +25,5 @@ System is operationally healthy with 67.3% win rate and $252.53 total PnL from 1
 - [ ] Fix cointegration trade execution - 339 A+ signals with zero trades indicates critical filter/execution bug
 - [ ] Implement dynamic position sizing using confidence scores to improve risk-adjusted returns
 - [ ] Tighten weather strategy stop-losses or improve entry timing to reduce frequency of stopped trades
-- [ ] Add exit criteria for whale positions to prevent large unrealized losses from accumulating
-- [ ] Disable or refine copy strategy filters as current implementation is unprofitable despite decent win rate
+- [ ] Add exit criteria for whale positions to prevent large unrealized losses from accumulating - or remove it altogether - not worth developing vs weather.
+- [ ] Disable or refine copy strategy filters as current implementation is unprofitable despite decent win rate - or remove it altogether - not worth developing vs weather.
