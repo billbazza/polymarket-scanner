@@ -272,7 +272,8 @@ def run_cycle(state):
     This is called every 30 minutes by the LaunchAgent.
     """
     level = state["level"]
-    config = LEVELS[level]
+    level_key = str(level).strip().lower()
+    config = LEVELS.get(level, LEVELS.get(level_key, LEVELS["scout"]))
     current_stage = "initializing"
 
     try:
@@ -324,7 +325,7 @@ def run_cycle(state):
         db.save_scan_run(pairs_tested=scan_result["pairs_tested"], cointegrated=scan_result["pairs_cointegrated"],
                          opportunities=len(opportunities), duration=scan_duration)
 
-        paper_mode = level == "paper"
+        paper_mode = level_key == "paper"
         trial_settings = cointegration_trial.get_trial_settings()
         admitted_signals = []
         a_trial_candidates = 0
@@ -410,6 +411,15 @@ def run_cycle(state):
             "a_trial_rejection_counts": rejection_counts,
             "signal_ids": new_signal_ids,
         })
+
+        if paper_mode and admitted_signals:
+            journal({
+                "action": "brain_validation_skipped",
+                "level": level,
+                "signal_count": len(admitted_signals),
+                "signal_ids": [opp.get("id") for opp in admitted_signals if opp.get("id")],
+                "reason": "Paper mode trusts math-only filters for cointegration opportunities.",
+            })
 
         # Step 2: Monitor existing positions
         current_stage = "step 2 refresh open trades"
@@ -654,7 +664,7 @@ def run_cycle(state):
                     trade_size = min(trade_size, trial_size) if trade_size else trial_size
 
             # Execute
-            mode = "paper" if level in ("paper", "scout") else "live"
+            mode = "paper" if paper_mode else "live"
 
             # Step 4.5: Brain validation (live-only)
             # Ask Claude + Perplexity if this signal makes sense in the real world

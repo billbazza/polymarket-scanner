@@ -9,8 +9,9 @@
 - Paper mode should trust the math scoring filters and sizing logic when AI services are unavailable or disabled, since these runs are purely for evaluation/training and there is no external risk.
 
 ## Fixes Applied
-- Updated `autonomy.py` so the brain validation step only runs for live trades; paper and scout levels now skip the provider gate and log that they are trusting the statistical filters.
-- Preserved the existing rejection logging, so any future change to this gating still records whether a rejection occurred (even when live-only).
+- Updated `autonomy.py` so paper/sprint levels now sanitize the stored level string before deriving `config` and `paper_mode`. The loop now uses the normalized flag to pick `mode="paper"` and skip `brain.validate_signal()` for paper runs while continuing to log the usual `trade_opened`/`trade_rejected` events.
+- Added a `brain_validation_skipped` journal entry for paper-driven cointegration admissions so the audit trail shows math-only trades explicitly and we can still track which signals were eligible.
+- Confirmed the existing `execution.execute_trade()` logic still calls `check_balance()` and `math_engine.check_slippage()` before opening paper trades, so slippage and cash rules are enforced even when the AI gate is now bypassed.
 
 ## Verification
 - `python3 -m py_compile autonomy.py`

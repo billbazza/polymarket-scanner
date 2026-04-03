@@ -61,7 +61,7 @@ Every module follows: docstring → imports → `log = logging.getLogger("scanne
 Every opportunity flows: scanner finds pair → `math_engine.score_opportunity()` grades A+ to F → optionally `brain.validate_signal()` for AI validation → `execution.execute_trade()` if tradeable.
 
 ### Trading Modes
-- **Paper** (default): simulates against current prices, tracks in SQLite. There are no limits on numbers of trades while in paper mode.
+- **Paper** (default): simulates against current prices, tracks in SQLite. There are no limits on numbers of trades while in paper mode. Autonomy now derives `mode="paper"` explicitly from the normalized `level` string so paper-level cointegration trades never invoke `brain.validate_signal()`; the system logs a `brain_validation_skipped` journal entry for each admitted A+ cohort signal, making the math-only trade path auditable while still enforcing slippage and balance checks.
 - **Live**: requires `POLYMARKET_PRIVATE_KEY` in `.env`, uses py-clob-client
 
 ### Database
