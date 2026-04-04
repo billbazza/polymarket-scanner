@@ -10,6 +10,7 @@ import requests
 import api
 import db
 import journal_writer
+import weather_guard_state
 
 log = logging.getLogger("scanner.tracker")
 WEATHER_STOP_LOSS_PCT = 0.18
@@ -552,6 +553,7 @@ def _auto_close_weather(trade):
                 trade_id, reason, pnl_usd, event_label, context,
             )
             _record_weather_stop_context(trade, context, reason)
+            weather_guard_state.register_failure(reason)
             return {
                 "trade_id": trade_id,
                 "trade_type": "weather",

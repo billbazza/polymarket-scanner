@@ -171,6 +171,7 @@ All in `.env` (see `.env.example`):
 - `STAGE2_POLYGON_GATING` — `1`/`true`/`yes` turns on Stage 2 Polygon gating; paper trades log the Polygon block snapshot, chain parity, and dual-leg slippage before execution.
 
 ## Recent Fix Logs
+- `fix_logs/2026-04-04-weather-guard-state.md`: added a persisted guard-state machine to keep the low-guardrail regime active until repeated stop-loss failures escalate the thresholds, and now log both the current and legacy blockers so we always know which filters would have vetoed the trade.
 - `fix_logs/2026-04-04-weather-guard-relaxation.md`: relaxed the weather guard (liquidity>=5k / horizon>=48h / disagreement<=18pp) and now log the legacy vs relaxed tradeable counts so the before/after volumes stay auditable.
 - `fix_logs/2026-04-04-weather-guardrail-improvements.md`: enforced the reopen probation counter for approved weather tokens, re-validated the horizon before fills, capped weather holds to ~72h, and logged stop contexts per token so the new diagnostics/journal payloads stay aligned.
 - `fix_logs/2026-04-04-weather-stop-loss-tuning.md`: broadened the weather entry gate to 60+ hours and log detailed stop contexts (signal hours, obs lookback, trend) so the next tuning pass can correlate the worst -$4/-$5 exits with intraday noise.

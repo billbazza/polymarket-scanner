@@ -39,6 +39,7 @@ from datetime import date, timedelta
 
 import api
 import weather_correction
+import weather_guard_state
 import weather_risk_review
 import weather_sources
 
@@ -53,6 +54,7 @@ LEGACY_MIN_STABLE_LIQUIDITY = 10_000  # previous ultra-thin book guard
 LEGACY_MIN_HOURS_AHEAD_FOR_TRADE = 60  # previous horizon guard
 LEGACY_MAX_SOURCE_DISAGREEMENT = 0.12  # previous source consensus guard
 
+# These thresholds are now governed by weather_guard_state to keep the low-guard rail active until failures accumulate.
 MIN_STABLE_LIQUIDITY = 0       # minimal liquidity guard to rediscover opportunities
 MIN_HOURS_AHEAD_FOR_TRADE = 0  # allow same-day markets through while keeping logging alive
 MAX_SOURCE_DISAGREEMENT = 1.0  # effectively remove the consensus window (max diff = 1)
@@ -339,6 +341,7 @@ def scan(
     if verbose:
         print(f"{len(events)} events")
 
+    guard = weather_guard_state.current_guard()
     opportunities = []
     markets_checked = 0
     parsed_count = 0
@@ -480,10 +483,10 @@ def scan(
             legacy_stable_noise_guard = (
                 legacy_liquidity_ok and legacy_horizon_ok and legacy_disagreement_ok
             )
-            liquidity_ok = liq >= MIN_STABLE_LIQUIDITY
-            horizon_ok = hours_ahead >= MIN_HOURS_AHEAD_FOR_TRADE
+            liquidity_ok = liq >= guard["min_liquidity"]
+            horizon_ok = hours_ahead >= guard["min_hours_ahead"]
             disagreement_ok = (
-                source_disagreement is not None and source_disagreement <= MAX_SOURCE_DISAGREEMENT
+                source_disagreement is not None and source_disagreement <= guard["max_disagreement"]
             )
             stable_noise_guard = liquidity_ok and horizon_ok and disagreement_ok
             corrected_tradeable = (
@@ -506,6 +509,14 @@ def scan(
                 "disagreement": disagreement_ok,
             }
             blocking_filters = [name for name, ok in filter_status.items() if not ok]
+            legacy_filter_status = {
+                "liquidity": legacy_liquidity_ok,
+                "horizon": legacy_horizon_ok,
+                "disagreement": legacy_disagreement_ok,
+            }
+            legacy_blocking_filters = [
+                name for name, ok in legacy_filter_status.items() if not ok
+            ]
 
             # Tradeable: BOTH sources must agree (no single-source trades for international)
             # AND edge >= 15pp AND the token we're buying must be >= 35¢ (no long shots)
@@ -589,8 +600,17 @@ def scan(
                 "selected_kelly_fraction": selected_metrics.get("kelly_fraction"),
                 "selected_action": selected_metrics.get("action"),
                 "liquidity": liq,
+                "guard_tier": guard["tier_index"],
+                "guard_name": guard["name"],
+                "guard_thresholds": {
+                    "min_liquidity": guard["min_liquidity"],
+                    "min_hours_ahead": guard["min_hours_ahead"],
+                    "max_disagreement": guard["max_disagreement"],
+                },
                 "filter_status": filter_status,
                 "blocking_filters": blocking_filters,
+                "legacy_filter_status": legacy_filter_status,
+                "legacy_blocking_filters": legacy_blocking_filters,
             }
 
             opportunities.append(opp)
@@ -615,6 +635,12 @@ def scan(
             block_counts[filter_name] += 1
     if block_counts:
         log.info("Weather blocking filters: %s", dict(block_counts))
+    legacy_block_counts = Counter()
+    for opp in opportunities:
+        for filter_name in opp.get("legacy_blocking_filters", ()):
+            legacy_block_counts[filter_name] += 1
+    if legacy_block_counts:
+        log.info("Weather legacy guard blockers: %s", dict(legacy_block_counts))
 
     duration = round(time.time() - t0, 1)
     tradeable_count = sum(1 for o in opportunities if o["tradeable"])
@@ -626,15 +652,25 @@ def scan(
         fetch_errors["noaa"], fetch_errors["om"],
     )
     log.info(
+        "Weather guard state: tier=%s (%s) thresholds liq>=%d,hours>=%d,disagree<=%.2f failures=%d/%d",
+        guard["name"],
+        guard.get("description") or "dynamic guard tier",
+        guard["min_liquidity"],
+        guard["min_hours_ahead"],
+        guard["max_disagreement"],
+        guard["failures"],
+        guard["failure_threshold"],
+    )
+    log.info(
         "Weather guard relaxation: legacy guard (liq>=%d,hours>=%d,disagree<=%.2f) saw %d tradeable → "
-        "relaxed guard (liq>=%d,hours>=%d,disagree<=%.2f) sees %d tradeable",
+        "current guard (liq>=%d,hours>=%d,disagree<=%.2f) sees %d tradeable",
         LEGACY_MIN_STABLE_LIQUIDITY,
         LEGACY_MIN_HOURS_AHEAD_FOR_TRADE,
         LEGACY_MAX_SOURCE_DISAGREEMENT,
         legacy_tradeable_count,
-        MIN_STABLE_LIQUIDITY,
-        MIN_HOURS_AHEAD_FOR_TRADE,
-        MAX_SOURCE_DISAGREEMENT,
+        guard["min_liquidity"],
+        guard["min_hours_ahead"],
+        guard["max_disagreement"],
         tradeable_count,
     )
 

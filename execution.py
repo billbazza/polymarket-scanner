@@ -10,7 +10,7 @@ import time
 import api
 import db
 import math_engine
-from weather_scanner import MIN_HOURS_AHEAD_FOR_TRADE
+import weather_guard_state
 
 log = logging.getLogger("scanner.execution")
 
@@ -414,13 +414,15 @@ def _revalidate_weather_horizon(signal: dict | None):
     except (TypeError, ValueError):
         age_hours = 0.0
     remaining_hours = hours_ahead - age_hours
-    if remaining_hours < MIN_HOURS_AHEAD_FOR_TRADE:
+    guard = weather_guard_state.current_guard()
+    min_hours_required = guard["min_hours_ahead"]
+    if remaining_hours < min_hours_required:
         return {
             "ok": False,
             "reason_code": "horizon_too_short",
             "reason": (
                 f"Signal horizon now {remaining_hours:.1f}h, below required "
-                f"{MIN_HOURS_AHEAD_FOR_TRADE}h minimum."
+                f"{min_hours_required}h minimum."
             ),
             "remaining_hours": remaining_hours,
         }
