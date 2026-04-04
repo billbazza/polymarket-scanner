@@ -893,6 +893,10 @@ def _migration_018_weather_token_probation(conn):
     """)
 
 
+def _migration_019_signal_grade_field(conn):
+    _add_column_if_missing(conn, "signals", "grade", "INTEGER")
+
+
 _MIGRATIONS = [
     ("001_base_schema", _migration_001_base_schema),
     ("002_backfill_columns", _migration_002_backfill_columns),
@@ -912,6 +916,7 @@ _MIGRATIONS = [
     ("016_weather_exact_temp_metadata", _migration_016_weather_exact_temp_metadata),
     ("017_perplexity_metadata", _migration_017_perplexity_metadata),
     ("018_weather_token_probation", _migration_018_weather_token_probation),
+    ("019_signal_grade_field", _migration_019_signal_grade_field),
 ]
 
 
@@ -930,6 +935,7 @@ def _repair_schema_gaps(conn):
     """
     _ensure_columns_if_table_exists(conn, "watched_wallets", _WATCHED_WALLET_MONITOR_COLUMNS)
     _ensure_columns_if_table_exists(conn, "signals", [
+        ("grade", "INTEGER"),
         ("admission_json", "TEXT"),
         ("perplexity_json", "TEXT"),
     ])
@@ -1100,21 +1106,29 @@ def init_db():
 def save_signal(opp):
     """Save a scan opportunity as a signal."""
     conn = get_conn()
+    grade_value = opp.get("grade")
+    if grade_value is not None:
+        try:
+            grade_value = int(grade_value)
+        except (TypeError, ValueError):
+            grade_value = None
     conn.execute("""
         INSERT INTO signals (timestamp, event, market_a, market_b, price_a, price_b,
             z_score, coint_pvalue, beta, half_life, spread_mean, spread_std,
             current_spread, liquidity, volume_24h, action,
-            grade_label, tradeable, paper_tradeable, ev_json, sizing_json, filters_json,
+            grade_label, grade, tradeable, paper_tradeable, ev_json, sizing_json, filters_json,
             token_id_a, token_id_b, admission_path, experiment_name,
             experiment_status, experiment_reason_code, experiment_reason,
             experiment_guardrails_json, admission_json, perplexity_json)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (
+            ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+        )
     """, (
         time.time(), opp["event"], opp["market_a"], opp["market_b"],
         opp["price_a"], opp["price_b"], opp["z_score"], opp["coint_pvalue"],
         opp["beta"], opp["half_life"], opp["spread_mean"], opp["spread_std"],
         opp["current_spread"], opp["liquidity"], opp["volume_24h"], opp["action"],
-        opp.get("grade_label"), 1 if opp.get("tradeable") else 0,
+        opp.get("grade_label"), grade_value, 1 if opp.get("tradeable") else 0,
         1 if opp.get("paper_tradeable") else 0,
         json.dumps(opp.get("ev")) if opp.get("ev") else None,
         json.dumps(opp.get("sizing")) if opp.get("sizing") else None,

@@ -1193,6 +1193,9 @@ async function loadSignals() {
     body.innerHTML = visible.map(s => {
       const gl = s.grade_label || '-';
       const gc = gl.startsWith('A') ? 'grade-a' : gl==='B' ? 'grade-b' : gl==='C' ? 'grade-c' : gl==='D' ? 'grade-d' : 'grade-f';
+      const gradeValue = s.grade != null ? Number(s.grade) : null;
+      const gradeScore = Number.isFinite(gradeValue) ? gradeValue : null;
+      const gradeLabelDisplay = gradeScore !== null ? `${gl} (${gradeScore}/8)` : gl;
       const evPct     = s.ev     && s.ev.ev_pct     != null ? s.ev.ev_pct.toFixed(1) + '%' : '-';
       const kellySize = s.sizing && s.sizing.recommended_size != null ? fmtUsd(s.sizing.recommended_size) : '-';
       const statusLabel = s.tradeable
@@ -1202,8 +1205,21 @@ async function loadSignals() {
           : s.monitorable_signal
             ? 'monitor'
             : 'rejected';
-      const statusTitle = esc(s.admission_summary || s.admission_reason || '');
-      const blocker = !s.tradeable && (s.admission_reason || s.experiment_reason);
+      const statusSummary = s.admission_summary || s.admission_reason || '';
+      const failedCount = typeof s.failed_filter_count === 'number'
+        ? s.failed_filter_count
+        : (Array.isArray(s.failed_filters) ? s.failed_filters.length : 0);
+      const filterList = Array.isArray(s.failed_filters) && s.failed_filters.length
+        ? `: ${s.failed_filters.join(', ')}`
+        : '';
+      const gradeFailureNote = !s.tradeable && s.grade_label === 'A'
+        ? `Grade ${gradeScore ?? '?'} /8 blocked (${failedCount} filter${failedCount===1 ? '' : 's'} failed${filterList})`
+        : '';
+      const statusTitle = esc(
+        [statusSummary, gradeFailureNote].filter(Boolean).join(' · ')
+      );
+      const blockerReason = !s.tradeable && (s.admission_reason || s.experiment_reason);
+      const blockerDisplay = gradeFailureNote || blockerReason;
       const stage3StatusText = s.profitable_candidate_feature
         ? 'Ready'
         : s.perplexity?.status === 'ok'
@@ -1223,14 +1239,14 @@ async function loadSignals() {
         <td class="market-name" title="${esc(s.market_b)}">${esc(s.market_b||'')}</td>
         <td class="${s.z_score>0?'z-pos':'z-neg'}">${s.z_score>0?'+':''}${s.z_score.toFixed(2)}</td>
         <td>${s.coint_pvalue.toFixed(4)}</td>
-        <td><span class="grade ${gc}">${gl}</span></td>
+        <td><span class="grade ${gc}">${gradeLabelDisplay}</span></td>
         <td>${evPct}</td>
         <td>${kellySize}</td>
         <td>${fmtUsd(s.liquidity)}</td>
         <td><span class="badge ${s.status}" title="${statusTitle}">${statusLabel}</span></td>
         <td>${stage3Badge}</td>
-        <td class="actions-col">${actionCell || (blocker
-          ? `<span style="color:var(--amber);font-size:11px" title="${statusTitle}">${esc(blocker)}</span>`
+        <td class="actions-col">${actionCell || (blockerDisplay
+          ? `<span style="color:var(--amber);font-size:11px" title="${statusTitle}">${esc(blockerDisplay)}</span>`
           : '')}</td>
       </tr>`;
     }).join('');
