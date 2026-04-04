@@ -10,6 +10,7 @@ System is operationally healthy with 68.2% win rate and +$425.48 total equity (+
 ## Working
 - Weather strategy generating consistent profits (+$259.81 realized, +$148.51 unrealized)
 - Cointegration showing perfect win rate on closed trades with A+ grade signals
+- [x] A-grade near-misses now open weighted, smaller paper entries so the trial keeps flowing through the relaxed guardrails (see fix_logs/2026-04-04-grade-a-weighted-entries.md)
 - Low capital utilization at 19% keeps risk controlled
 - System stability with 206 successful scans and no critical errors
 - Whale strategy now executes 9x+ volume/liquidity anomalies through gated trades while logging each decision (see fix_logs/2026-04-04-whale-execution.md)
@@ -27,7 +28,7 @@ System is operationally healthy with 68.2% win rate and +$425.48 total equity (+
 
 ## Top 5 Improvements
 - [ ] Tighten weather strategy stop-losses or improve entry timing to reduce -$5 drawdowns
-- [x] Increase cointegration trade frequency by relaxing A+ criteria or expanding to A-grade trials (new guardrail logging lets us see whether candidates are 7/8 near misses before moving live; details in fix_logs/2026-04-04-grade-a-paper-promotion.md)
+- [x] Increase cointegration trade frequency by relaxing A+ criteria and letting weighted A-grade entries run, with the new thresholds/guardrails and weighted-size metadata captured in fix_logs/2026-04-04-grade-a-weighted-entries.md
 - [x] Harden the copy strategy by refusing entry prices outside 0.15-0.85 so losses scale with wins (fix_logs/2026-04-04-copy-strategy-risk-reward.md)
 - [x] Implement whale strategy execution logic to capitalize on detected anomalies (see fix_logs/2026-04-04-whale-execution.md)
 - [x] Apply confidence-based position sizing more aggressively (currently 97.8% shadow decisions) — telemetry now confirms the gate outcome per trade (see fix_logs/2026-04-04-paper-sizing-activation.md)

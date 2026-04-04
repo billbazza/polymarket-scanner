@@ -23,6 +23,7 @@ def _base_signal():
         "volume_24h": 15000,
         "action": "SELL Fed cuts / BUY CPI below 3%",
         "grade_label": "A",
+        "grade": 7,
         "tradeable": False,
         "paper_tradeable": False,
         "token_id_a": "tok-a",
@@ -30,12 +31,12 @@ def _base_signal():
         "ev": {"ev_pct": 1.2},
         "sizing": {"recommended_size": 12.5},
         "filters": {
-            "ev_pass": False,
+            "ev_pass": True,
             "kelly_pass": True,
             "z_pass": True,
             "coint_pass": True,
             "hl_pass": True,
-            "momentum_pass": True,
+            "momentum_pass": False,
             "price_pass": True,
             "spread_std_pass": True,
         },
@@ -60,7 +61,10 @@ class CointegrationTrialLogicTests(unittest.TestCase):
         self.assertTrue(result["admit_trade"])
         self.assertEqual(result["admission_path"], "paper_a_trial")
         self.assertEqual(result["experiment_status"], "eligible")
-        self.assertEqual(result["recommended_size_usd"], 10.0)
+        self.assertEqual(result["recommended_size_usd"], 6.5)
+        self.assertEqual(result["grade_weight"], 0.65)
+        self.assertAlmostEqual(result["guardrails"]["grade_weight"], 0.65)
+        self.assertAlmostEqual(result["guardrails"]["weighted_entry_size_usd"], 6.5)
         self.assertAlmostEqual(result["guardrails"]["reversion_exit_z"], 0.35)
         self.assertGreater(result["guardrails"]["stop_z_threshold"], abs(signal["z_score"]))
 
@@ -72,6 +76,7 @@ class CointegrationTrialLogicTests(unittest.TestCase):
         self.assertEqual(live_result["reason_code"], "paper_only")
 
         bad_signal = _base_signal()
+        bad_signal["filters"]["momentum_pass"] = True
         bad_signal["filters"]["hl_pass"] = False
         with mock.patch.object(
             cointegration_trial.math_engine,
@@ -82,11 +87,12 @@ class CointegrationTrialLogicTests(unittest.TestCase):
         self.assertFalse(result["admit_trade"])
         self.assertEqual(result["reason_code"], "filter_failure_outside_trial")
 
-    def test_two_allowed_filter_misses_remain_eligible(self):
+    def test_allowed_filter_failure_remains_eligible(self):
         import cointegration_trial
 
         signal = _base_signal()
-        signal["filters"]["momentum_pass"] = False
+        signal["filters"]["momentum_pass"] = True
+        signal["filters"]["spread_std_pass"] = False
         with mock.patch.object(
             cointegration_trial.math_engine,
             "check_slippage",
@@ -98,13 +104,14 @@ class CointegrationTrialLogicTests(unittest.TestCase):
             result = cointegration_trial.evaluate_signal(signal, mode="paper")
 
         self.assertTrue(result["admit_trade"])
-        self.assertEqual(result["failed_filter_count"], 2)
-        self.assertEqual(set(result["filters_failed"]), {"ev_pass", "momentum_pass"})
+        self.assertEqual(result["failed_filter_count"], 1)
+        self.assertEqual(set(result["filters_failed"]), {"spread_std_pass"})
 
     def test_blocker_context_reports_disallowed_filters(self):
         import cointegration_trial
 
         signal = _base_signal()
+        signal["filters"]["momentum_pass"] = True
         signal["filters"]["price_pass"] = False
         with mock.patch.object(
             cointegration_trial.math_engine,

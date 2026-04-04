@@ -13,11 +13,13 @@ DEFAULT_TRIAL_SETTINGS = {
     "enabled": True,
     "paper_only": True,
     "size_usd": 10.0,
-    "min_z_abs": 1.6,
-    "min_liquidity": 7500.0,
-    "max_slippage_pct": 1.5,
+    "min_z_abs": 1.45,
+    "min_liquidity": 6000.0,
+    "max_slippage_pct": 2.0,
     "max_half_life": 12.0,
-    "min_ev_pct": 0.30,
+    "min_ev_pct": 0.25,
+    "grade_weight_min": 0.25,
+    "grade_weight_max": 0.65,
     "max_allowed_failed_filters": 1,
     "allowed_failed_filters": [
         "momentum_pass",
@@ -48,7 +50,7 @@ def get_trial_settings():
     settings["max_half_life"] = max(
         0.1, float(settings.get("max_half_life", 12.0) or 12.0)
     )
-    settings["min_ev_pct"] = float(settings.get("min_ev_pct", 0.35) or 0.0)
+    settings["min_ev_pct"] = float(settings.get("min_ev_pct", 0.25) or 0.0)
     raw_max = settings.get("max_allowed_failed_filters", 2) or 2
     try:
         raw_max = int(float(raw_max))
@@ -72,6 +74,13 @@ def get_trial_settings():
     settings["allowed_failed_filters"] = [str(item) for item in failed_filters]
     settings["setting_key"] = TRIAL_SETTING_KEY
     settings["trial_name"] = TRIAL_NAME
+    min_weight = max(0.0, min(1.0, float(settings.get("grade_weight_min", 0.25) or 0.25)))
+    max_weight = max(
+        min_weight,
+        min(1.0, float(settings.get("grade_weight_max", 0.65) or min_weight)),
+    )
+    settings["grade_weight_min"] = min_weight
+    settings["grade_weight_max"] = max_weight
     return settings
 
 
@@ -103,6 +112,7 @@ def _base_result(opp, settings, mode):
         "reason": "Standard A+ signal." if grade == "A+" else f"Grade {grade} is outside the A-grade trial.",
         "cohort": "A+" if grade == "A+" else grade,
         "recommended_size_usd": None,
+        "grade_weight": None,
         "slippage": {},
         "guardrails": {},
         "filters_failed": filters_failed,
@@ -110,6 +120,18 @@ def _base_result(opp, settings, mode):
         "blocker_context": None,
         "ev_pct": ev.get("ev_pct"),
     }
+
+
+def _grade_weight_for_signal(grade_value, settings):
+    """Return a normalized weight for A-grade entries based on the raw grade score."""
+    try:
+        normalized = float(grade_value or 0.0) / 8.0
+    except (TypeError, ValueError):
+        normalized = 0.0
+    normalized = max(0.0, min(1.0, normalized))
+    min_weight = settings.get("grade_weight_min", 0.25)
+    max_weight = settings.get("grade_weight_max", 0.65)
+    return max(min_weight, min(max_weight, normalized))
 
 
 def evaluate_signal(opp, mode="paper", settings=None):
@@ -132,6 +154,7 @@ def evaluate_signal(opp, mode="paper", settings=None):
     if grade == "A+":
         result["admit_trade"] = True
         result["paper_tradeable"] = True
+        result["grade_weight"] = 1.0
         return result
 
     if grade != "A":
@@ -313,8 +336,12 @@ def evaluate_signal(opp, mode="paper", settings=None):
             },
         )
 
+    weight_base = _grade_weight_for_signal(float(opp.get("grade") or 0), settings)
+    weighted_size_usd = round(settings["size_usd"] * weight_base, 2)
     guardrails = {
         "size_usd": round(settings["size_usd"], 2),
+        "weighted_entry_size_usd": weighted_size_usd,
+        "grade_weight": round(weight_base, 3),
         "reversion_exit_z": settings["reversion_exit_z"],
         "stop_z_threshold": round(z_abs + settings["stop_z_buffer"], 4),
         "max_hold_hours": settings["max_hold_hours"],
@@ -331,11 +358,12 @@ def evaluate_signal(opp, mode="paper", settings=None):
         "experiment_status": "eligible",
         "reason_code": "trial_eligible",
         "reason": (
-            "A-grade signal admitted to the paper trial with smaller size, "
-            "tighter slippage, and explicit stop/hold guardrails."
+            "A-grade signal admitted to the paper trial with weighted high-risk entries "
+            f"(${weighted_size_usd:.2f}, weight {weight_base:.2f}) and explicit stop/hold guardrails."
         ),
-        "recommended_size_usd": round(settings["size_usd"], 2),
+        "recommended_size_usd": weighted_size_usd,
         "guardrails": guardrails,
+        "grade_weight": weight_base,
     })
     return result
 
@@ -350,6 +378,7 @@ def annotate_opportunity(opp, mode="paper", settings=None):
     opp["experiment_reason_code"] = evaluation["reason_code"]
     opp["experiment_reason"] = evaluation["reason"]
     opp["experiment_guardrails"] = evaluation["guardrails"]
+    opp["experiment_grade_weight"] = evaluation.get("grade_weight")
     opp["trial_slippage"] = evaluation["slippage"]
     opp["trial_recommended_size_usd"] = evaluation["recommended_size_usd"]
     opp["filters_failed"] = evaluation["filters_failed"]
