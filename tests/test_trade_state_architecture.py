@@ -128,6 +128,37 @@ class TradeStateArchitectureTests(unittest.TestCase):
         self.assertEqual(second_decision["external_position_id"], "asset-no")
         self.assertNotEqual(second_decision["canonical_ref"], trade["canonical_ref"])
 
+    def test_copy_trade_blocks_extreme_entry_prices(self):
+        wallet = "0xabc1230000000000000000000000000000000002"
+        high_price_position = {
+            "conditionId": "cond-extreme",
+            "outcome": "NO",
+            "title": "Extreme high price",
+            "curPrice": 0.96,
+            "asset": "asset-extreme-high",
+        }
+        low_price_position = {
+            "conditionId": "cond-extreme",
+            "outcome": "YES",
+            "title": "Extreme low price",
+            "curPrice": 0.04,
+            "asset": "asset-extreme-low",
+        }
+        for position in (high_price_position, low_price_position):
+            decision = self.db.inspect_copy_trade_open(wallet, position, size_usd=20)
+            self.assertFalse(decision["ok"], msg=f"{position}")
+            self.assertEqual(decision["reason_code"], "entry_price_range_violation")
+
+        balanced_position = {
+            "conditionId": "cond-extreme",
+            "outcome": "YES",
+            "title": "Balanced price",
+            "curPrice": 0.45,
+            "asset": "asset-balanced",
+        }
+        balanced_decision = self.db.inspect_copy_trade_open(wallet, balanced_position, size_usd=20)
+        self.assertTrue(balanced_decision["ok"])
+
     def test_trade_monitor_flags_attached_trade_missing_canonical_identity(self):
         conn = self.db.get_conn()
         try:

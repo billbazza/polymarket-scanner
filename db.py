@@ -31,6 +31,9 @@ STRATEGY_LABELS = {
     "copy": "Copy",
     "other": "Other",
 }
+COPY_ENTRY_PRICE_MIN = 0.15
+COPY_ENTRY_PRICE_MAX = 0.85
+
 
 _WATCHED_WALLET_MONITOR_COLUMNS = [
     ("baseline_positions", "TEXT"),
@@ -2807,6 +2810,23 @@ def inspect_copy_trade_open(
             "wallet": wallet,
             "condition_id": condition_id,
             "external_position_id": external_position_id,
+            **_paper_position_policy_dict(),
+        }
+    if entry_price < COPY_ENTRY_PRICE_MIN or entry_price > COPY_ENTRY_PRICE_MAX:
+        return {
+            "ok": False,
+            "reason_code": "entry_price_range_violation",
+            "reason": (
+                f"Entry price {entry_price:.2f} is outside the {COPY_ENTRY_PRICE_MIN:.2f}-{COPY_ENTRY_PRICE_MAX:.2f}"
+                " range the copy strategy considers acceptable."
+            ),
+            "wallet": wallet,
+            "condition_id": condition_id,
+            "entry_price": entry_price,
+            "allowed_range": (
+                COPY_ENTRY_PRICE_MIN,
+                COPY_ENTRY_PRICE_MAX,
+            ),
             **_paper_position_policy_dict(),
         }
 
