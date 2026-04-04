@@ -16,8 +16,9 @@ System is operationally healthy with 68.2% win rate and +$425.48 total equity (+
 - [x] Autonomy cron loop now runs cleanly after the rejected-trade journal indentation was corrected (see fix_logs/2026-04-04-autonomy-journal-crash.md)
 
 ## Not Working
-- [ ] Copy strategy losing money despite 57.9% win rate (poor risk/reward ratio)
-- [ ] Whale strategy inactive with zero trades executed
+- [ ] Weather trading is losing more trades than it is winning. Investigate what has changed and see what might be the cause. 
+- [ ] Copy strategy losing money despite 57.9% win rate (poor risk/reward ratio) - remove from tests
+- [ ] Whale strategy inactive with zero trades executed - remove from tests
 - [ ] Weather stop-losses triggering frequently (multiple -$4 to -$5 losses)
 - [ ] Cointegration underutilized with only 7 total trades despite 3,407 A-grade signals
 - [ ] Paper sizing decisions mostly in shadow mode (87 of 89 not applied)
