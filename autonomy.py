@@ -372,6 +372,17 @@ def run_cycle(state):
                 continue
             if opp.get("admit_trade"):
                 continue
+            details = {
+                "grade_label": opp.get("grade_label"),
+                "grade": opp.get("grade"),
+                "tradeable": bool(opp.get("tradeable")),
+                "paper_tradeable": bool(opp.get("paper_tradeable")),
+                "admission_path": opp.get("admission_path"),
+                "filters_failed": opp.get("filters_failed"),
+                "failed_filter_count": opp.get("failed_filter_count"),
+                "blocker_context": opp.get("blocker_context"),
+                "guardrails": opp.get("experiment_guardrails"),
+            }
             record_attempt(
                 level,
                 "pairs",
@@ -382,15 +393,7 @@ def run_cycle(state):
                 signal_id=opp.get("id"),
                 size_usd=config.get("size_usd"),
                 phase="step 1 strategy admission",
-                details={
-                    "grade_label": opp.get("grade_label"),
-                    "grade": opp.get("grade"),
-                    "tradeable": bool(opp.get("tradeable")),
-                    "paper_tradeable": bool(opp.get("paper_tradeable")),
-                    "admission_path": opp.get("admission_path"),
-                    "failed_filter_count": opp.get("trial_failed_filter_count"),
-                    "filters_failed": opp.get("trial_filters_failed"),
-                },
+                details=details,
             )
             if opp.get("grade_label") == "A":
                 journal({
@@ -400,12 +403,14 @@ def run_cycle(state):
                     "signal_id": opp.get("id"),
                     "grade_label": opp.get("grade_label"),
                     "grade": opp.get("grade"),
-                    "failed_filter_count": opp.get("trial_failed_filter_count"),
-                    "filters_failed": opp.get("trial_filters_failed"),
+                    "failed_filter_count": opp.get("failed_filter_count"),
+                    "filters_failed": opp.get("filters_failed"),
+                    "blocker_context": opp.get("blocker_context"),
                     "admission_path": opp.get("admission_path"),
                     "reason_code": opp.get("experiment_reason_code"),
                     "reason": opp.get("experiment_reason"),
                     "allowed_failed_filters": trial_settings["allowed_failed_filters"],
+                    "max_allowed_failed_filters": trial_settings["max_allowed_failed_filters"],
                 })
 
         stage3_gate_applied = not paper_mode

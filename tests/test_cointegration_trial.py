@@ -82,6 +82,42 @@ class CointegrationTrialLogicTests(unittest.TestCase):
         self.assertFalse(result["admit_trade"])
         self.assertEqual(result["reason_code"], "filter_failure_outside_trial")
 
+    def test_two_allowed_filter_misses_remain_eligible(self):
+        import cointegration_trial
+
+        signal = _base_signal()
+        signal["filters"]["momentum_pass"] = False
+        with mock.patch.object(
+            cointegration_trial.math_engine,
+            "check_slippage",
+            side_effect=[
+                {"ok": True, "slippage_pct": 0.4, "reason": None},
+                {"ok": True, "slippage_pct": 0.6, "reason": None},
+            ],
+        ):
+            result = cointegration_trial.evaluate_signal(signal, mode="paper")
+
+        self.assertTrue(result["admit_trade"])
+        self.assertEqual(result["failed_filter_count"], 2)
+        self.assertEqual(set(result["filters_failed"]), {"ev_pass", "momentum_pass"})
+
+    def test_blocker_context_reports_disallowed_filters(self):
+        import cointegration_trial
+
+        signal = _base_signal()
+        signal["filters"]["price_pass"] = False
+        with mock.patch.object(
+            cointegration_trial.math_engine,
+            "check_slippage",
+            return_value={"ok": True, "slippage_pct": 0.2, "reason": None},
+        ):
+            result = cointegration_trial.evaluate_signal(signal, mode="paper")
+
+        self.assertFalse(result["admit_trade"])
+        self.assertEqual(result["reason_code"], "filter_failure_outside_trial")
+        self.assertEqual(result["blocker_context"]["type"], "filter")
+        self.assertEqual(result["blocker_context"]["disallowed_filters"], ["price_pass"])
+
 
 class CointegrationTrialSummaryTests(unittest.TestCase):
     def setUp(self):

@@ -14,12 +14,17 @@ DEFAULT_TRIAL_SETTINGS = {
     "paper_only": True,
     "size_usd": 10.0,
     "min_z_abs": 1.6,
-    "min_liquidity": 12000.0,
+    "min_liquidity": 10000.0,
     "max_slippage_pct": 1.25,
     "max_half_life": 12.0,
     "min_ev_pct": 0.35,
-    "allowed_failed_filters": ["ev_pass", "kelly_pass", "momentum_pass", "spread_std_pass"],
     "max_allowed_failed_filters": 2,
+    "allowed_failed_filters": [
+        "ev_pass",
+        "momentum_pass",
+        "spread_std_pass",
+        "kelly_pass",
+    ],
     "reversion_exit_z": 0.35,
     "stop_z_buffer": 0.75,
     "max_hold_hours": 36.0,
@@ -35,26 +40,38 @@ def get_trial_settings():
     settings["enabled"] = bool(settings.get("enabled", True))
     settings["paper_only"] = bool(settings.get("paper_only", True))
     settings["size_usd"] = max(1.0, float(settings.get("size_usd", 10.0) or 10.0))
-    settings["min_z_abs"] = max(0.0, float(settings.get("min_z_abs", 1.75) or 0.0))
-    settings["min_liquidity"] = max(0.0, float(settings.get("min_liquidity", 12000.0) or 0.0))
-    settings["max_slippage_pct"] = max(0.1, float(settings.get("max_slippage_pct", 1.25) or 1.25))
-    settings["max_half_life"] = max(0.1, float(settings.get("max_half_life", 12.0) or 12.0))
+    settings["min_z_abs"] = max(0.0, float(settings.get("min_z_abs", 1.6) or 0.0))
+    settings["min_liquidity"] = max(
+        0.0, float(settings.get("min_liquidity", 10000.0) or 0.0)
+    )
+    settings["max_slippage_pct"] = max(
+        0.1, float(settings.get("max_slippage_pct", 1.25) or 1.25)
+    )
+    settings["max_half_life"] = max(
+        0.1, float(settings.get("max_half_life", 12.0) or 12.0)
+    )
     settings["min_ev_pct"] = float(settings.get("min_ev_pct", 0.35) or 0.0)
-    settings["reversion_exit_z"] = max(0.0, float(settings.get("reversion_exit_z", 0.35) or 0.35))
-    settings["stop_z_buffer"] = max(0.1, float(settings.get("stop_z_buffer", 0.75) or 0.75))
-    settings["max_hold_hours"] = max(1.0, float(settings.get("max_hold_hours", 36.0) or 36.0))
+    raw_max = settings.get("max_allowed_failed_filters", 2) or 2
+    try:
+        raw_max = int(float(raw_max))
+    except (TypeError, ValueError):
+        raw_max = 2
+    settings["max_allowed_failed_filters"] = max(1, raw_max)
+    settings["reversion_exit_z"] = max(
+        0.0, float(settings.get("reversion_exit_z", 0.35) or 0.35)
+    )
+    settings["stop_z_buffer"] = max(
+        0.1, float(settings.get("stop_z_buffer", 0.75) or 0.75)
+    )
+    settings["max_hold_hours"] = max(
+        1.0, float(settings.get("max_hold_hours", 36.0) or 36.0)
+    )
     settings["regime_break_z_buffer"] = max(
         settings["stop_z_buffer"],
         float(settings.get("regime_break_z_buffer", 1.0) or 1.0),
     )
     failed_filters = settings.get("allowed_failed_filters", ["ev_pass"]) or ["ev_pass"]
     settings["allowed_failed_filters"] = [str(item) for item in failed_filters]
-    max_failed = settings.get("max_allowed_failed_filters", 2) or 2
-    try:
-        max_failed = int(float(max_failed))
-    except (TypeError, ValueError):
-        max_failed = 2
-    settings["max_allowed_failed_filters"] = max(1, max_failed)
     settings["setting_key"] = TRIAL_SETTING_KEY
     settings["trial_name"] = TRIAL_NAME
     return settings
@@ -73,10 +90,8 @@ def set_trial_settings(settings):
 def _base_result(opp, settings, mode):
     grade = opp.get("grade_label") or "?"
     ev = opp.get("ev") or {}
-    filters_failed = [
-        name for name, passed in (opp.get("filters") or {}).items()
-        if not passed
-    ]
+    filters = opp.get("filters") or {}
+    filters_failed = [name for name, passed in filters.items() if not passed]
     return {
         "mode": mode,
         "grade_label": grade,
@@ -94,6 +109,7 @@ def _base_result(opp, settings, mode):
         "guardrails": {},
         "filters_failed": filters_failed,
         "failed_filter_count": len(filters_failed),
+        "blocker_context": None,
         "ev_pct": ev.get("ev_pct"),
     }
 
@@ -104,6 +120,16 @@ def evaluate_signal(opp, mode="paper", settings=None):
     result = _base_result(opp, settings, mode)
     grade = result["grade_label"]
     filters = opp.get("filters") or {}
+    failed_filters = result["filters_failed"]
+
+    def _block(code, message, context=None):
+        ctx = dict(context or {})
+        ctx.setdefault("filters_failed", list(failed_filters))
+        ctx.setdefault("failed_filter_count", len(failed_filters))
+        result["blocker_context"] = ctx
+        result["reason_code"] = code
+        result["reason"] = message
+        return result
 
     if grade == "A+":
         result["admit_trade"] = True
@@ -122,72 +148,135 @@ def evaluate_signal(opp, mode="paper", settings=None):
     })
 
     if settings["paper_only"] and mode != "paper":
-        result["reason_code"] = "paper_only"
-        result["reason"] = "A-grade trial is restricted to paper mode."
-        return result
+        return _block(
+            "paper_only",
+            "A-grade trial is restricted to paper mode.",
+            {"type": "mode"},
+        )
 
     if not settings["enabled"]:
-        result["reason_code"] = "trial_disabled"
-        result["reason"] = "A-grade paper trial is disabled."
-        return result
+        return _block(
+            "trial_disabled",
+            "A-grade paper trial is disabled.",
+            {"type": "mode"},
+        )
 
     if not filters:
-        result["reason_code"] = "missing_filters"
-        result["reason"] = "Signal filters are unavailable, so trial guardrails cannot be checked."
-        return result
+        return _block(
+            "missing_filters",
+            "Signal filters are unavailable, so trial guardrails cannot be checked.",
+            {"type": "metadata"},
+        )
 
-    failed_filters = result["filters_failed"]
     allowed_failed = set(settings["allowed_failed_filters"])
     max_allowed = settings["max_allowed_failed_filters"]
+    allowed_list = ", ".join(settings["allowed_failed_filters"])
+
+    if not failed_filters:
+        return _block(
+            "filter_failure_outside_trial",
+            "A-grade trial saw no recorded filter failures; cannot evaluate near-misses.",
+            {
+                "type": "filter",
+                "allowed_failed_filters": settings["allowed_failed_filters"],
+                "max_allowed_failed_filters": max_allowed,
+            },
+        )
+
+    if len(failed_filters) > max_allowed:
+        return _block(
+            "too_many_filter_failures",
+            (
+                f"A-trial accepts at most {max_allowed} soft miss(es) ({allowed_list}); actual failures: {', '.join(failed_filters)}."
+            ),
+            {
+                "type": "filter",
+                "allowed_failed_filters": settings["allowed_failed_filters"],
+                "max_allowed_failed_filters": max_allowed,
+            },
+        )
+
     disallowed = [name for name in failed_filters if name not in allowed_failed]
     if disallowed:
-        result["reason_code"] = "filter_failure_disallowed"
-        result["reason"] = (
-            "A-grade trial only allows misses from "
-            + ", ".join(settings["allowed_failed_filters"])
-            + f". This signal additionally failed {', '.join(disallowed)}."
+        return _block(
+            "filter_failure_outside_trial",
+            (
+                f"A-trial only tolerates soft misses in {allowed_list}; disallowed failures: {', '.join(disallowed)}."
+            ),
+            {
+                "type": "filter",
+                "allowed_failed_filters": settings["allowed_failed_filters"],
+                "max_allowed_failed_filters": max_allowed,
+                "disallowed_filters": disallowed,
+            },
         )
-        return result
-    if len(failed_filters) > max_allowed:
-        result["reason_code"] = "filter_failure_limit_reached"
-        result["reason"] = (
-            f"A-grade trial allows up to {max_allowed} allowed misses, "
-            f"but this signal failed {len(failed_filters)} filters ({', '.join(failed_filters)})."
-        )
-        return result
 
     z_abs = abs(float(opp.get("z_score") or 0.0))
     if z_abs < settings["min_z_abs"]:
-        result["reason_code"] = "z_too_small"
-        result["reason"] = f"|z| {z_abs:.2f} is below trial minimum {settings['min_z_abs']:.2f}."
-        return result
+        return _block(
+            "z_too_small",
+            f"|z| {z_abs:.2f} is below trial minimum {settings['min_z_abs']:.2f}.",
+            {
+                "type": "threshold",
+                "field": "z_score",
+                "current": z_abs,
+                "required": settings["min_z_abs"],
+            },
+        )
 
     half_life = float(opp.get("half_life") or 0.0)
     if half_life <= 0 or half_life > settings["max_half_life"]:
-        result["reason_code"] = "half_life_too_slow"
-        result["reason"] = f"Half-life {half_life:.1f} exceeds trial cap {settings['max_half_life']:.1f}."
-        return result
+        return _block(
+            "half_life_too_slow",
+            f"Half-life {half_life:.1f} exceeds trial cap {settings['max_half_life']:.1f}.",
+            {
+                "type": "threshold",
+                "field": "half_life",
+                "current": half_life,
+                "max_allowed": settings["max_half_life"],
+            },
+        )
 
     liquidity = float(opp.get("liquidity") or 0.0)
     if liquidity < settings["min_liquidity"]:
-        result["reason_code"] = "liquidity_too_low"
-        result["reason"] = (
-            f"Liquidity ${liquidity:,.0f} is below trial minimum ${settings['min_liquidity']:,.0f}."
+        return _block(
+            "liquidity_too_low",
+            (
+                f"Liquidity ${liquidity:,.0f} is below trial minimum ${settings['min_liquidity']:,.0f}."
+            ),
+            {
+                "type": "threshold",
+                "field": "liquidity",
+                "current": liquidity,
+                "required": settings["min_liquidity"],
+            },
         )
-        return result
 
     ev_pct = float((opp.get("ev") or {}).get("ev_pct") or 0.0)
     if ev_pct < settings["min_ev_pct"]:
-        result["reason_code"] = "ev_too_low"
-        result["reason"] = f"EV {ev_pct:.2f}% is below trial minimum {settings['min_ev_pct']:.2f}%."
-        return result
+        return _block(
+            "ev_too_low",
+            f"EV {ev_pct:.2f}% is below trial minimum {settings['min_ev_pct']:.2f}%.",
+            {
+                "type": "threshold",
+                "field": "ev_pct",
+                "current": ev_pct,
+                "required": settings["min_ev_pct"],
+            },
+        )
 
     token_a = opp.get("token_id_a")
     token_b = opp.get("token_id_b")
     if not token_a or not token_b:
-        result["reason_code"] = "missing_token"
-        result["reason"] = "Signal is missing token IDs needed for slippage checks."
-        return result
+        missing = [key for key in ("token_id_a", "token_id_b") if not opp.get(key)]
+        return _block(
+            "missing_token",
+            "Signal is missing token IDs needed for slippage checks.",
+            {
+                "type": "metadata",
+                "missing_tokens": missing,
+            },
+        )
 
     per_leg_size = settings["size_usd"] / 2
     slippage_a = math_engine.check_slippage(
@@ -203,14 +292,28 @@ def evaluate_signal(opp, mode="paper", settings=None):
     result["slippage"] = {"leg_a": slippage_a, "leg_b": slippage_b}
 
     if not slippage_a.get("ok"):
-        result["reason_code"] = "slippage_leg_a"
-        result["reason"] = f"Leg A rejected by slippage guardrail: {slippage_a.get('reason')}"
-        return result
+        return _block(
+            "slippage_leg_a",
+            f"Leg A rejected by slippage guardrail: {slippage_a.get('reason')}",
+            {
+                "type": "slippage",
+                "leg": "A",
+                "slippage": slippage_a,
+                "max_allowed_slippage_pct": settings["max_slippage_pct"],
+            },
+        )
 
     if not slippage_b.get("ok"):
-        result["reason_code"] = "slippage_leg_b"
-        result["reason"] = f"Leg B rejected by slippage guardrail: {slippage_b.get('reason')}"
-        return result
+        return _block(
+            "slippage_leg_b",
+            f"Leg B rejected by slippage guardrail: {slippage_b.get('reason')}",
+            {
+                "type": "slippage",
+                "leg": "B",
+                "slippage": slippage_b,
+                "max_allowed_slippage_pct": settings["max_slippage_pct"],
+            },
+        )
 
     guardrails = {
         "size_usd": round(settings["size_usd"], 2),
@@ -251,6 +354,7 @@ def annotate_opportunity(opp, mode="paper", settings=None):
     opp["experiment_guardrails"] = evaluation["guardrails"]
     opp["trial_slippage"] = evaluation["slippage"]
     opp["trial_recommended_size_usd"] = evaluation["recommended_size_usd"]
-    opp["trial_filters_failed"] = evaluation["filters_failed"]
-    opp["trial_failed_filter_count"] = evaluation.get("failed_filter_count")
+    opp["filters_failed"] = evaluation["filters_failed"]
+    opp["failed_filter_count"] = evaluation["failed_filter_count"]
+    opp["blocker_context"] = evaluation["blocker_context"]
     return evaluation
