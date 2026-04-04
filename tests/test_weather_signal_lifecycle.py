@@ -138,6 +138,7 @@ class WeatherSignalLifecycleTests(unittest.TestCase):
         duplicate_row = next(row for row in self.db.get_weather_signals(limit=None) if row["id"] == duplicate_signal_id)
         self.assertEqual(duplicate_row["status"], "blocked")
         self.assertEqual(duplicate_row["blocking_reason_code"], "token_already_closed")
+        self.assertEqual(duplicate_row["blocked_by_trade_id"], original_trade_id)
         self.assertIsNone(duplicate_row["latest_trade_exit_reason"])
         self.assertIn("do not reopen", duplicate_row["status_detail"])
 

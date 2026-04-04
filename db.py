@@ -3835,9 +3835,17 @@ def get_weather_signals(limit=50, tradeable_only=False):
             latest_trade_status = latest_trade["status"] if latest_trade else None
             item["open_trade_id"] = exact_open_trade_id
             item["has_open_trade"] = exact_open_trade_id is not None
+            blocked_reason_codes = {
+                "signal_already_open",
+                "token_already_open",
+                "signal_already_closed",
+                "token_already_closed",
+                "token_probation_blocked",
+            }
             item["blocked_by_trade_id"] = (
                 decision.get("existing_trade_id")
-                if not decision["ok"] and decision.get("reason_code") in {"signal_already_open", "token_already_open"}
+                if not decision["ok"]
+                and decision.get("reason_code") in blocked_reason_codes
                 and decision.get("existing_trade_id") != exact_open_trade_id
                 else None
             )
