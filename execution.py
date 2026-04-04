@@ -16,6 +16,7 @@ log = logging.getLogger("scanner.execution")
 
 MAX_SLIPPAGE_PCT  = 2.5
 PAPER_BALANCE_USD = 2_000.0
+WHALE_MAX_SLIPPAGE_PCT = 2.0
 
 # Execution mode: "maker" (GTC limit orders, 0% fee) or "taker" (market orders, 2% fee).
 # Default is maker — post inside the spread, pay no fees, capture better prices.
@@ -568,6 +569,194 @@ def execute_weather_trade(signal, size_usd, mode=None):
         "confidence_compare_only": confidence_meta.get("compare_only") if confidence_meta else None,
         "confidence_rollout_state": confidence_meta.get("rollout_state") if confidence_meta else None,
         "quarter_kelly_capped": bool(quarter_kelly_capped),
+    }
+
+
+def execute_whale_trade(alert, size_usd=20, mode=None):
+    """Open a guarded whale trade (paper/live)."""
+    mode = mode or _get_mode()
+    alert = alert or {}
+    alert_id = alert.get("id")
+    size_usd = round(float(size_usd or 0.0), 2)
+
+    if size_usd <= 0:
+        return {
+            "ok": False,
+            "mode": mode,
+            "reason_code": "invalid_size",
+            "error": "Trade size must be greater than zero.",
+            "alert_id": alert_id,
+            "size_usd": size_usd,
+        }
+
+    token_id = api.normalize_token_id(alert.get("token_id"))
+    if not token_id:
+        return {
+            "ok": False,
+            "mode": mode,
+            "reason_code": "token_missing",
+            "error": "Alert lacks a valid token id for order book evaluation.",
+            "alert_id": alert_id,
+            "size_usd": size_usd,
+        }
+
+    balance_info = check_balance(mode=mode)
+    if not balance_info.get("ok"):
+        return {
+            "ok": False,
+            "mode": mode,
+            "reason_code": "balance_error",
+            "error": f"Balance check failed: {balance_info.get(error)}",
+            "alert_id": alert_id,
+            "size_usd": size_usd,
+            "balance": balance_info,
+        }
+
+    size_before_cap = size_usd
+    size_usd, quarter_kelly_capped = _cap_quarter_kelly(size_usd, balance_info["balance_usd"])
+    if size_usd <= 0:
+        return {
+            "ok": False,
+            "mode": mode,
+            "reason_code": "insufficient_balance",
+            "error": "Post-Kelly size would be zero; not enough capital.",
+            "alert_id": alert_id,
+            "size_usd": size_before_cap,
+            "balance": balance_info,
+        }
+
+    if balance_info["balance_usd"] < size_usd:
+        return {
+            "ok": False,
+            "mode": mode,
+            "reason_code": "insufficient_balance",
+            "error": "Not enough balance after cap.",
+            "alert_id": alert_id,
+            "size_usd": size_usd,
+            "balance": balance_info,
+        }
+
+    slippage = math_engine.check_slippage(
+        token_id,
+        trade_size_usd=size_usd,
+        max_slippage_pct=WHALE_MAX_SLIPPAGE_PCT,
+    )
+    if not slippage.get("ok"):
+        return {
+            "ok": False,
+            "mode": mode,
+            "reason_code": "slippage_block",
+            "error": slippage.get("reason"),
+            "alert_id": alert_id,
+            "size_usd": size_usd,
+            "slippage": slippage,
+            "balance": balance_info,
+        }
+
+    decision = db.inspect_whale_trade_open(alert_id, size_usd=size_usd, mode=mode)
+    if not decision.get("ok"):
+        return {
+            "ok": False,
+            "mode": mode,
+            "reason_code": decision.get("reason_code"),
+            "error": decision.get("reason"),
+            "alert_id": alert_id,
+            "size_usd": size_usd,
+            "token_id": token_id,
+            "slippage": slippage,
+            "balance": balance_info,
+            "decision": decision,
+        }
+
+    current_price = alert.get("current_price")
+    try:
+        if current_price is not None:
+            current_price = float(current_price)
+    except (TypeError, ValueError):
+        current_price = None
+    current_price = current_price if current_price is not None else 0.5
+
+    dominant_side = (alert.get("dominant_side") or "").upper()
+    if dominant_side == "BID":
+        action = "BUY_YES"
+        entry_price = current_price
+    elif dominant_side == "ASK":
+        action = "BUY_NO"
+        entry_price = 1.0 - current_price
+    else:
+        action = "BUY_YES"
+        entry_price = current_price
+
+    if entry_price is None or not (0 <= entry_price <= 1):
+        entry_price = 0.5
+
+    note_parts = []
+    analysis = alert.get("analysis")
+    if analysis:
+        note_parts.append(analysis)
+    suspicion = alert.get("suspicion_score")
+    if suspicion is not None:
+        note_parts.append(f"Suspicion: {float(suspicion):.0f}/100")
+    volume_ratio = alert.get("volume_ratio")
+    if volume_ratio is not None:
+        note_parts.append(f"Vol ratio: {volume_ratio}x")
+    notes = " | ".join(note_parts) if note_parts else None
+
+    trade_data = {
+        "trade_type": "whale",
+        "opened_at": time.time(),
+        "side_a": action,
+        "side_b": "",
+        "entry_price_a": entry_price,
+        "entry_price_b": 0,
+        "token_id_a": token_id,
+        "size_usd": size_usd,
+        "status": "open",
+        "whale_alert_id": alert_id,
+        "event": alert.get("event"),
+        "market_a": alert.get("market"),
+        "analysis": analysis,
+        "suspicion_score": alert.get("suspicion_score"),
+        "notes": notes or f"Suspicion: {suspicion or 0}/100",
+        "strategy_name": alert.get("strategy_name") or "whale",
+        "trade_state_mode": db.TRADE_STATE_PAPER,
+        "reconciliation_mode": db.RECONCILIATION_INTERNAL,
+    }
+
+    trade_id = db.open_whale_trade(trade_data)
+    if not trade_id:
+        return {
+            "ok": False,
+            "mode": mode,
+            "reason_code": "open_failed",
+            "error": "Database insert failed for whale trade.",
+            "alert_id": alert_id,
+            "size_usd": size_usd,
+            "balance": balance_info,
+            "slippage": slippage,
+            "decision": decision,
+        }
+
+    log.info(
+        "Whale trade %s created for alert %s (%s) size=$%.2f entry=%.3f",
+        trade_id,
+        alert_id,
+        action,
+        size_usd,
+        entry_price,
+    )
+
+    return {
+        "ok": True,
+        "mode": mode,
+        "trade_id": trade_id,
+        "alert_id": alert_id,
+        "size_usd": size_usd,
+        "token_id": token_id,
+        "slippage": slippage,
+        "quarter_kelly_capped": bool(quarter_kelly_capped),
+        "balance": balance_info,
+        "decision": decision,
     }
 
 

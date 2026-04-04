@@ -18,6 +18,7 @@ import time
 import api
 import brain
 import db
+import execution
 
 log = logging.getLogger("scanner.whale")
 
@@ -332,70 +333,21 @@ def should_trade_whale_alert(alert, ai_analysis=None):
     return True, "High suspicion with strong indicators"
 
 
-def create_whale_trade(alert, size_usd=20):
-    """Create a paper trade from a whale alert."""
+def create_whale_trade(alert, size_usd=20, mode="paper"):
+    """Create a whale trade using the execution layer (paper by default)."""
     try:
-        current_price = alert.get("current_price")
-        if current_price is None:
-            current_price = 0.5
-        token_id = api.normalize_token_id(alert.get("token_id"))
-
-        # Determine trade direction based on analysis
-        # If there's a large buy order (dominant_side='BID'), price may go up -> BUY_YES
-        # If there's a large sell order (dominant_side='ASK'), price may go down -> BUY_NO
-        if alert.get('dominant_side') == 'BID':
-            action = 'BUY_YES'
-            entry_price = current_price
-        elif alert.get('dominant_side') == 'ASK':
-            action = 'BUY_NO'
-            entry_price = 1.0 - current_price
-        else:
-            # Default to BUY_YES for high suspicion
-            action = 'BUY_YES'
-            entry_price = current_price
-        
-        # Validate entry_price is reasonable
-        if entry_price is None or not (0 <= entry_price <= 1):
-            entry_price = 0.5  # fallback
-
-        notes = [f"Suspicion: {alert.get('suspicion_score', 0)}/100"]
-        if alert.get("token_id") and not token_id:
-            notes.append("Tracker: whale alert token_id was invalid; trade cannot be auto-priced until corrected.")
-
-        # Create trade record
-        trade_data = {
-            'trade_type': 'whale',
-            'opened_at': time.time(),
-            'side_a': action,
-            'side_b': '',  # Single leg trade
-            'entry_price_a': entry_price,
-            'entry_price_b': 0,
-            'token_id_a': token_id,
-            'size_usd': size_usd,
-            'status': 'open',
-            'whale_alert_id': alert['id'],
-            'event': alert['event'],
-            'market_a': alert['market'],
-            'analysis': alert['analysis'],
-            'suspicion_score': alert['suspicion_score'],
-            'notes': " ".join(notes),
-        }
-        
-        # Save to database
-        trade_id = db.open_whale_trade(trade_data)
-        if trade_id:
-            log.info("Created whale trade #%d: %s %s @ %.3f size=$%.0f",
-                     trade_id, action, alert.get('market', '')[:40], entry_price, size_usd)
-            return trade_id
-        else:
-            log.error("Failed to create whale trade for alert %s (%s)",
-                      alert.get('id'), alert.get('market'))
-            return None
-            
+        result = execution.execute_whale_trade(alert, size_usd=size_usd, mode=mode)
+        if result.get("ok"):
+            return result.get("trade_id")
+        log.warning(
+            "Whale trade blocked for alert %s: %s",
+            alert.get("id"),
+            result.get("error"),
+        )
+        return None
     except Exception as e:
         log.exception("Error creating whale trade for alert %s: %s", alert.get("id"), e)
         return None
-
 
 def scan(min_score=MIN_SUSPICION_SCORE, max_pages=10, verbose=False, auto_trade=False):
     """Scan all active markets for whale/insider activity.

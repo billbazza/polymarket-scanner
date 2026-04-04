@@ -2661,6 +2661,93 @@ def inspect_pairs_trade_open(signal_id, size_usd=100, conn=None):
             conn.close()
 
 
+def inspect_whale_trade_open(whale_alert_id, size_usd=20, mode="paper", conn=None):
+    """Return a structured decision for opening a whale trade."""
+    owns_conn = conn is None
+    conn = conn or get_conn()
+    try:
+        requested = max(0.0, float(size_usd or 0.0))
+        if requested <= 0:
+            return {
+                "ok": False,
+                "reason_code": "invalid_size",
+                "reason": "Trade size must be greater than zero.",
+                "requested_size_usd": requested,
+                **_paper_position_policy_dict(),
+            }
+
+        alert_row = conn.execute(
+            "SELECT * FROM whale_alerts WHERE id=?",
+            (whale_alert_id,),
+        ).fetchone()
+        if not alert_row:
+            return {
+                "ok": False,
+                "reason_code": "alert_not_found",
+                "reason": f"Whale alert {whale_alert_id} not found.",
+                "requested_size_usd": requested,
+                **_paper_position_policy_dict(),
+            }
+
+        alert_dict = dict(alert_row)
+        if not alert_dict.get("token_id"):
+            return {
+                "ok": False,
+                "reason_code": "token_missing",
+                "reason": "Whale alert is missing a valid CLOB token id.",
+                "token_id": None,
+                "alert": alert_dict,
+                "requested_size_usd": requested,
+                **_paper_position_policy_dict(),
+            }
+
+        existing = conn.execute(
+            "SELECT id FROM trades WHERE whale_alert_id=? AND status='open'",
+            (whale_alert_id,),
+        ).fetchone()
+        if existing:
+            return {
+                "ok": False,
+                "reason_code": "alert_already_open",
+                "reason": f"Whale alert {whale_alert_id} already has an open trade.",
+                "existing_trade_id": int(existing["id"]),
+                "alert": alert_dict,
+                "token_id": alert_dict.get("token_id"),
+                "requested_size_usd": requested,
+                **_paper_position_policy_dict(),
+            }
+
+        if mode == "paper":
+            account_check = can_open_paper_trade(requested)
+            if not account_check["ok"]:
+                return {
+                    "ok": False,
+                    "reason_code": "insufficient_cash",
+                    "reason": (
+                        f"Insufficient paper cash: ${account_check['available_cash']:.2f} available, "
+                        f"${account_check['requested_size_usd']:.2f} requested."
+                    ),
+                    "available_cash": account_check["available_cash"],
+                    "shortfall_usd": account_check["shortfall_usd"],
+                    "requested_size_usd": requested,
+                    "account": account_check["account"],
+                    **_paper_position_policy_dict(),
+                }
+
+        return {
+            "ok": True,
+            "reason_code": "ready",
+            "reason": "Ready to open whale trade.",
+            "alert": alert_dict,
+            "token_id": alert_dict.get("token_id"),
+            "requested_size_usd": requested,
+            **_paper_position_policy_dict(),
+        }
+    finally:
+        if owns_conn:
+            conn.close()
+
+
 def _wallet_copy_block_decision(
     wallet: str,
     condition_id: str,

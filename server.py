@@ -17,6 +17,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 
 from auth import require_admin, require_operator
 import db
+import execution
 import scanner
 import brain
 import cointegration_trial
@@ -1424,41 +1425,74 @@ async def open_weather_trade(signal_id: int, size_usd: float = 20):
 @app.post("/api/whales/{alert_id}/trade")
 async def open_whale_trade_endpoint(alert_id: int, size_usd: float = 20):
     """Open a paper trade from a whale alert."""
-    log.info("Whale trade request for alert ID: %d", alert_id)
     try:
-        balance_check = db.can_open_paper_trade(size_usd)
-        if not balance_check["ok"]:
-            raise HTTPException(
-                400,
-                f"Insufficient paper cash: ${balance_check['available_cash']:.2f} available, "
-                f"${balance_check['requested_size_usd']:.2f} requested",
-            )
-        import whale_detector
-        # Get alert from DB
-        alerts = db.get_whale_alerts(limit=1000)
-        alert = next((a for a in alerts if a["id"] == alert_id), None)
+        alert = db.get_whale_alert_by_id(alert_id)
         if not alert:
-            log.warning("Whale alert %d not found in last 1000 alerts", alert_id)
+            log.warning("Whale alert %d not found", alert_id)
             raise HTTPException(404, f"Whale alert {alert_id} not found")
 
-        trade_id = whale_detector.create_whale_trade(alert, size_usd=size_usd)
-        if not trade_id:
-            log.error("whale_detector.create_whale_trade returned None for alert %d", alert_id)
-            raise HTTPException(500, "Failed to create whale trade")
+        result = execution.execute_whale_trade(alert, size_usd=size_usd, mode="paper")
+        if not result.get("ok"):
+            decision = result.get("decision") or db.inspect_whale_trade_open(
+                alert_id,
+                size_usd=size_usd,
+                mode="paper",
+            )
+            reason_code = result.get("reason_code") or decision.get("reason_code")
+            reason = result.get("error") or decision.get("reason")
+            _safe_record_paper_trade_attempt(
+                source="manual_api",
+                strategy="whale",
+                outcome="blocked",
+                reason_code=reason_code,
+                reason=reason,
+                event=alert.get("event"),
+                whale_alert_id=alert_id,
+                token_id=alert.get("token_id"),
+                size_usd=size_usd,
+                details={"path": "/api/whales/{alert_id}/trade"},
+            )
+            status_code = 400
+            if reason_code == "alert_not_found":
+                status_code = 404
+            elif reason_code in {"slippage_block", "token_missing", "alert_already_open"}:
+                status_code = 409
+            return JSONResponse(
+                status_code=status_code,
+                content={
+                    "ok": False,
+                    "alert_id": alert_id,
+                    "error": reason,
+                    "reason_code": reason_code,
+                    "balance": result.get("balance"),
+                    "slippage": result.get("slippage"),
+                },
+            )
 
-        log.info("Whale trade opened: ID %d from alert %d", trade_id, alert_id)
+        _safe_record_paper_trade_attempt(
+            source="manual_api",
+            strategy="whale",
+            outcome="allowed",
+            reason_code="opened",
+            reason="Paper whale trade opened.",
+            event=alert.get("event"),
+            whale_alert_id=alert_id,
+            token_id=alert.get("token_id"),
+            trade_id=result.get("trade_id"),
+            size_usd=size_usd,
+            details={"path": "/api/whales/{alert_id}/trade"},
+        )
         return {
             "ok": True,
-            "trade_id": trade_id,
+            "trade_id": result.get("trade_id"),
             "status": "open",
             "paper_account": db.get_paper_account_state(refresh_unrealized=True),
         }
+    except HTTPException:
+        raise
     except Exception as e:
         log.error("Whale trade endpoint error: %s", e)
-        if isinstance(e, HTTPException):
-            raise e
         raise HTTPException(500, str(e))
-
 
 # --- Snapshots ---
 

@@ -1413,10 +1413,11 @@ def run_cycle(state):
 
         # Step 4g: Whale / insider detection
         current_stage = "step 4g whale scan"
+        whale_alerts = []
+        new_whale_ids = []
         try:
             import whale_detector
             whale_alerts, whale_stats = whale_detector.scan(min_score=60, verbose=False)
-            new_whale_ids = []
             for alert in whale_alerts:
                 try:
                     row_id = db.save_whale_alert(alert)
@@ -1438,6 +1439,103 @@ def run_cycle(state):
                 log.debug("Step 4g: Whale scan — %d alerts, none new", len(whale_alerts))
         except Exception as e:
             log.debug("Whale scan step skipped during %s: %s", current_stage, e)
+
+        # Step 4h: Whale execution (9x volume ratio trigger)
+        current_stage = "step 4h whale execution"
+        if config["can_trade"]:
+            try:
+                WHALE_VOLUME_RATIO_THRESHOLD = 9.0
+                WHALE_MIN_SUSPICION_SCORE = 70
+                WHALE_MAX_OPEN_TRADES = 2
+                open_whale_trades = [t for t in open_trades if t.get("trade_type") == "whale"]
+                whale_slots = max(0, WHALE_MAX_OPEN_TRADES - len(open_whale_trades))
+                if whale_slots > 0 and new_whale_ids:
+                    alerts_by_id = {alert.get("id"): alert for alert in whale_alerts if alert.get("id")}
+                    candidates = []
+                    for alert_id in new_whale_ids:
+                        alert = alerts_by_id.get(alert_id)
+                        if not alert:
+                            continue
+                        try:
+                            ratio = float(alert.get("volume_ratio") or 0)
+                        except (TypeError, ValueError):
+                            ratio = 0
+                        score = float(alert.get("suspicion_score") or 0)
+                        if ratio >= WHALE_VOLUME_RATIO_THRESHOLD and score >= WHALE_MIN_SUSPICION_SCORE:
+                            candidates.append(alert)
+                    whale_mode = "paper" if paper_mode else "live"
+                    whale_size = config.get("size_usd") or (3 if not paper_mode else 20)
+                    for alert in candidates:
+                        if whale_slots <= 0:
+                            break
+                        try:
+                            result = execution.execute_whale_trade(
+                                alert,
+                                size_usd=whale_size,
+                                mode=whale_mode,
+                            )
+                        except Exception as exc:
+                            log.warning("Whale execution error: %s", exc)
+                            record_attempt(
+                                level,
+                                "whale",
+                                "error",
+                                "execution_error",
+                                f"Whale execution failed: {exc}",
+                                whale_alert_id=alert.get("id"),
+                                event=alert.get("event"),
+                                phase=current_stage,
+                            )
+                            continue
+                        if result.get("ok"):
+                            whale_slots -= 1
+                            journal({
+                                "action": "whale_trade_opened",
+                                "level": level,
+                                "alert_id": alert.get("id"),
+                                "trade_id": result.get("trade_id"),
+                                "volume_ratio": alert.get("volume_ratio"),
+                                "token_id": result.get("token_id"),
+                            })
+                            log.info(
+                                "Step 4h: Whale trade opened for alert %s (trade=%s) size=$%.2f",
+                                alert.get("id"),
+                                result.get("trade_id"),
+                                whale_size,
+                            )
+                        else:
+                            reason_code = result.get("reason_code") or (result.get("decision") or {}).get("reason_code")
+                            reason = result.get("error") or (result.get("decision") or {}).get("reason")
+                            slippage_pct = (result.get("slippage") or {}).get("slippage_pct")
+                            record_attempt(
+                                level,
+                                "whale",
+                                "blocked",
+                                reason_code or "unknown",
+                                reason or "Whale trade blocked",
+                                event=alert.get("event"),
+                                whale_alert_id=alert.get("id"),
+                                token_id=alert.get("token_id"),
+                                size_usd=whale_size,
+                                phase=current_stage,
+                                details={
+                                    "volume_ratio": alert.get("volume_ratio"),
+                                    "slippage_pct": slippage_pct,
+                                    "balance": result.get("balance", {}).get("balance_usd"),
+                                },
+                            )
+                    if whale_slots <= 0 and candidates:
+                        log.debug("Whale execution reached max open trades (%d)", WHALE_MAX_OPEN_TRADES)
+            except Exception as exc:
+                log.debug("Whale execution step failed: %s", exc)
+                record_attempt(
+                    level,
+                    "whale",
+                    "error",
+                    "whale_execution_failed",
+                    f"Whale execution step failed: {exc}",
+                    phase=current_stage,
+                )
 
         # Step 5: Check graduation eligibility
         current_stage = "step 5 graduation and state save"

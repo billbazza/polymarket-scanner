@@ -1292,14 +1292,9 @@ def test_whale_trade_invalid_token_is_sanitized_on_open():
     }
 
     trade_id = whale_detector.create_whale_trade(alert, size_usd=20)
-    check("whale trade created with invalid token input", trade_id is not None and trade_id > 0, f"got {trade_id}")
+    check("whale trade blocked when token invalid", trade_id is None, f"got {trade_id}")
 
-    trade = db.get_trade(trade_id)
-    check("whale trade strips invalid token before storage", trade and not trade.get("token_id_a"),
-          f"got token_id_a={trade.get('token_id_a') if trade else None}")
-    check("whale trade stores invalid-token note",
-          trade and "invalid" in (trade.get("notes") or "").lower(),
-          f"got notes={trade.get('notes') if trade else None}")
+
 
 
 def test_single_leg_invalid_token_skips_gamma_lookup():
