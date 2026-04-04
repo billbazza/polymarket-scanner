@@ -1,15 +1,19 @@
 """Paper trading engine — monitors open trades, updates prices, manages P&L."""
+import json
 import logging
 import time
-from datetime import date
+from datetime import date, datetime
+from pathlib import Path
 
 import requests
 
 import api
 import db
+import journal_writer
 
 log = logging.getLogger("scanner.tracker")
 WEATHER_STOP_LOSS_PCT = 0.18
+WEATHER_MAX_HOLD_HOURS = 72
 _WARN_TTL_SECS = 6 * 60 * 60
 _LAST_WARNINGS = {}
 WHALE_MAX_DRAWNDOWN_USD = 15.0
@@ -17,6 +21,7 @@ WHALE_MAX_HOLD_SECS = 48 * 3600
 WHALE_VOLATILITY_DROP_PCT = 0.15
 WHALE_AGGREGATE_ALERT_DRAWDOWN_USD = 50.0
 WHALE_AGGREGATE_ALERT_DRAWDOWN_USD = 50.0
+_STOP_CONTEXTS_FILE = Path(__file__).resolve().parent / "reports" / "diagnostics" / "weather-stop-contexts.jsonl"
 
 
 def refresh_open_trades():
@@ -93,6 +98,34 @@ def _build_weather_stop_context(trade, signal, entry_price, current_price, stop_
         },
     }
     return context
+
+
+def _record_weather_stop_context(trade, context, reason):
+    token_id = trade.get("token_id_a")
+    if not token_id:
+        return
+    payload = {
+        "token_id": token_id,
+        "trade_id": trade.get("id"),
+        "signal_id": trade.get("weather_signal_id"),
+        "reason": reason,
+        "context": context,
+        "logged_at": datetime.now().isoformat(),
+    }
+    try:
+        _STOP_CONTEXTS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with open(_STOP_CONTEXTS_FILE, "a") as f:
+            f.write(json.dumps(payload) + "\n")
+    except Exception as exc:
+        log.warning("Failed to persist weather stop context for %s: %s", token_id, exc)
+    journal_writer.append_entry({
+        "action": "weather_stop_loss",
+        "token_id": token_id,
+        "trade_id": trade.get("id"),
+        "signal_id": trade.get("weather_signal_id"),
+        "reason": reason,
+        "context": context,
+    })
 
 
 def _trade_label(trade):
@@ -517,6 +550,27 @@ def _auto_close_weather(trade):
             log.info(
                 "AUTO-CLOSE weather: trade=%d %s pnl=$%.2f event=%s context=%s",
                 trade_id, reason, pnl_usd, event_label, context,
+            )
+            _record_weather_stop_context(trade, context, reason)
+            return {
+                "trade_id": trade_id,
+                "trade_type": "weather",
+                "exit_price_a": current_a,
+                "pnl_usd": round(pnl_usd, 2),
+                "reason": reason,
+            }
+        return None
+
+    age_secs = time.time() - (trade.get("opened_at") or time.time())
+    if age_secs >= WEATHER_MAX_HOLD_HOURS * 3600:
+        hours = age_secs / 3600
+        reason = f"max hold time exceeded ({hours:.1f}h >= {WEATHER_MAX_HOLD_HOURS}h)"
+        pnl_usd = db.close_trade(trade_id, current_a, notes=f"Auto-closed: {reason}")
+        if pnl_usd is not None:
+            event_label = (trade.get("event") or "?")[:40]
+            log.info(
+                "AUTO-CLOSE weather: trade=%d %s pnl=$%.2f event=%s",
+                trade_id, reason, pnl_usd, event_label,
             )
             return {
                 "trade_id": trade_id,

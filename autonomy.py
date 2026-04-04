@@ -49,6 +49,7 @@ import cointegration_trial
 import paper_sizing
 import trade_monitor
 import perplexity
+import journal_writer
 
 # --- Configuration ---
 
@@ -161,11 +162,12 @@ def save_state(state):
 
 def journal(entry):
     """Append a decision to the journal (append-only log)."""
-    entry["timestamp"] = datetime.now().isoformat()
-    JOURNAL_FILE.parent.mkdir(exist_ok=True)
-    with open(JOURNAL_FILE, "a") as f:
-        f.write(json.dumps(entry) + "\n")
-    log.info("JOURNAL: %s — %s", entry.get("action", "?"), entry.get("reason", "")[:80])
+    final_entry = journal_writer.append_entry(entry)
+    log.info(
+        "JOURNAL: %s — %s",
+        final_entry.get("action", "?"),
+        final_entry.get("reason", "")[:80],
+    )
 
 
 def _safe_record_paper_trade_attempt(**kwargs):
@@ -910,6 +912,7 @@ def run_cycle(state):
                             w_id,
                             size_usd=trade_size,
                             max_total_open=max_open,
+                            mode=level,
                         )
                         if not decision["ok"]:
                             record_attempt(

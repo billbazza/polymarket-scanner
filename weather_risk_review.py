@@ -137,6 +137,7 @@ def get_review_for_signal(signal: dict[str, Any], mode: str | None = None) -> di
             "relax_noise_guard": bool(entry.get("relax_noise_guard")),
             "relax_token_guard": bool(entry.get("relax_token_guard", True)),
             "allow_modes": allow_modes,
+            "probation_limit": entry.get("probation_limit"),
             "mode": mode,
         }
     return None

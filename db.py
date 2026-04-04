@@ -8,6 +8,8 @@ import threading
 import time
 from pathlib import Path
 
+import weather_risk_review
+
 DB_PATH = Path(os.environ.get("SCANNER_DB_PATH", Path(__file__).parent / "scanner.db"))
 _INIT_LOCK = threading.Lock()
 _DB_INITIALIZED = False
@@ -39,6 +41,8 @@ _WATCHED_WALLET_MONITOR_COLUMNS = [
     ("last_event_status", "TEXT"),
     ("last_event_reason", "TEXT"),
 ]
+
+DEFAULT_WEATHER_REOPEN_PROBATION_LIMIT = 1
 
 
 def _connect():
@@ -877,6 +881,18 @@ def _migration_017_perplexity_metadata(conn):
     _add_column_if_missing(conn, "signals", "perplexity_json", "TEXT")
 
 
+def _migration_018_weather_token_probation(conn):
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS weather_token_probation (
+            token_id TEXT PRIMARY KEY,
+            reopen_count INTEGER DEFAULT 0,
+            last_reopened_at REAL,
+            last_closed_at REAL,
+            last_exit_reason TEXT
+        );
+    """)
+
+
 _MIGRATIONS = [
     ("001_base_schema", _migration_001_base_schema),
     ("002_backfill_columns", _migration_002_backfill_columns),
@@ -895,6 +911,7 @@ _MIGRATIONS = [
     ("015_weather_intraday_correction", _migration_015_weather_intraday_correction),
     ("016_weather_exact_temp_metadata", _migration_016_weather_exact_temp_metadata),
     ("017_perplexity_metadata", _migration_017_perplexity_metadata),
+    ("018_weather_token_probation", _migration_018_weather_token_probation),
 ]
 
 
@@ -2928,7 +2945,109 @@ def count_open_trades() -> int:
     return int(row[0] if row else 0)
 
 
-def inspect_weather_trade_open(weather_signal_id, size_usd=100, max_total_open=None, conn=None):
+def _fetch_weather_token_probation(conn, token_id):
+    if not token_id:
+        return None
+    row = conn.execute(
+        """
+        SELECT token_id, reopen_count, last_reopened_at, last_closed_at, last_exit_reason
+        FROM weather_token_probation
+        WHERE token_id=?
+        """,
+        (token_id,),
+    ).fetchone()
+    return dict(row) if row else None
+
+
+def get_weather_token_probation(token_id, conn=None):
+    owns_conn = conn is None
+    conn = conn or get_conn()
+    try:
+        return _fetch_weather_token_probation(conn, token_id)
+    finally:
+        if owns_conn:
+            conn.close()
+
+
+def _record_weather_token_close(conn, token_id, exit_reason, closed_at=None):
+    if not token_id:
+        return
+    timestamp = closed_at if closed_at is not None else time.time()
+    conn.execute(
+        """
+        INSERT INTO weather_token_probation (token_id, last_closed_at, last_exit_reason)
+        VALUES (?, ?, ?)
+        ON CONFLICT(token_id) DO UPDATE SET
+            last_closed_at=excluded.last_closed_at,
+            last_exit_reason=excluded.last_exit_reason
+        """,
+        (token_id, timestamp, exit_reason),
+    )
+
+
+def record_weather_token_close(token_id, exit_reason):
+    conn = get_conn()
+    _record_weather_token_close(conn, token_id, exit_reason)
+    conn.commit()
+    conn.close()
+
+
+def _record_weather_token_reopen(conn, token_id, reopened_at=None):
+    if not token_id:
+        return 0
+    timestamp = reopened_at if reopened_at is not None else time.time()
+    conn.execute(
+        """
+        INSERT INTO weather_token_probation (token_id, reopen_count, last_reopened_at)
+        VALUES (?, 1, ?)
+        ON CONFLICT(token_id) DO UPDATE SET
+            reopen_count = weather_token_probation.reopen_count + 1,
+            last_reopened_at = excluded.last_reopened_at
+        """,
+        (token_id, timestamp),
+    )
+    row = _fetch_weather_token_probation(conn, token_id)
+    return int(row["reopen_count"] or 0) if row else 0
+
+
+def increment_weather_token_reopen(token_id):
+    conn = get_conn()
+    count = _record_weather_token_reopen(conn, token_id)
+    conn.commit()
+    conn.close()
+    return count
+
+
+def _evaluate_weather_token_reopen(conn, token_id, review):
+    if not token_id or not review or not review.get("relax_token_guard"):
+        return {"allowed": False}
+    try:
+        limit = int(review.get("probation_limit", DEFAULT_WEATHER_REOPEN_PROBATION_LIMIT))
+    except (TypeError, ValueError):
+        limit = DEFAULT_WEATHER_REOPEN_PROBATION_LIMIT
+    probation = _fetch_weather_token_probation(conn, token_id)
+    reopen_count = int(probation.get("reopen_count") or 0) if probation else 0
+    if reopen_count >= limit:
+        return {
+            "allowed": False,
+            "reason_code": "token_probation_blocked",
+            "reason": (
+                f"Weather token {token_id} exhausted probation ({reopen_count}/{limit}) "
+                f"for review {review.get('id') or 'approved'}."
+            ),
+            "reopen_count": reopen_count,
+            "probation_limit": limit,
+        }
+    return {
+        "allowed": True,
+        "reopen_count": reopen_count,
+        "probation_limit": limit,
+        "review_id": review.get("id"),
+        "review_name": review.get("name"),
+    }
+
+
+def inspect_weather_trade_open(weather_signal_id, size_usd=100, max_total_open=None, conn=None, mode=None):
     """Return a structured weather-trade open decision.
 
     This centralizes duplicate suppression, paper cash checks, and optional
@@ -2949,6 +3068,9 @@ def inspect_weather_trade_open(weather_signal_id, size_usd=100, max_total_open=N
                 "reason": f"Weather signal {weather_signal_id} not found.",
                 **_paper_position_policy_dict(),
             }
+
+        signal_row = dict(sig)
+        review = weather_risk_review.get_review_for_signal(signal_row, mode=mode)
 
         action = sig["action"]
         entry_token = sig["yes_token"] if action == "BUY_YES" else sig["no_token"]
@@ -3028,25 +3150,49 @@ def inspect_weather_trade_open(weather_signal_id, size_usd=100, max_total_open=N
                 """,
                 (entry_token,),
             ).fetchone()
+        reopen_context = None
         if closed_token_trade:
             trade_id = int(closed_token_trade["id"])
             other_signal_id = closed_token_trade["weather_signal_id"]
-            detail = f" via signal {other_signal_id}" if other_signal_id else ""
             latest_reason = closed_token_trade["exit_reason"] or "Weather contract already completed."
-            return {
-                "ok": False,
-                "reason_code": "token_already_closed",
-                "reason": (
-                    f"Weather contract already completed as trade #{trade_id}{detail}; "
-                    "do not reopen the same token after exit."
-                ),
+            reopen_decision = _evaluate_weather_token_reopen(conn, entry_token, review)
+            if not reopen_decision["allowed"]:
+                reason_code = reopen_decision.get("reason_code") or "token_already_closed"
+                reason = reopen_decision.get(
+                    "reason",
+                    (
+                        f"Weather contract already completed as trade #{trade_id}"
+                        f"{f' via signal {other_signal_id}' if other_signal_id else ''}; "
+                        "do not reopen the same token after exit."
+                    ),
+                )
+                return {
+                    "ok": False,
+                    "reason_code": reason_code,
+                    "reason": reason,
+                    "existing_trade_id": trade_id,
+                    "existing_signal_id": other_signal_id,
+                    "latest_trade_status": "closed",
+                    "latest_trade_exit_reason": latest_reason,
+                    "entry_token": entry_token,
+                    **_paper_position_policy_dict(),
+                }
+            reopen_context = {
                 "existing_trade_id": trade_id,
                 "existing_signal_id": other_signal_id,
-                "latest_trade_status": "closed",
-                "latest_trade_exit_reason": latest_reason,
-                "entry_token": entry_token,
-                **_paper_position_policy_dict(),
+                "review_id": reopen_decision.get("review_id"),
+                "review_name": reopen_decision.get("review_name"),
+                "reopen_count": reopen_decision.get("reopen_count"),
+                "probation_limit": reopen_decision.get("probation_limit"),
             }
+            log.info(
+                "Weather token %s reopened on probation (%d/%d) review=%s mode=%s",
+                entry_token,
+                reopen_decision.get("reopen_count"),
+                reopen_decision.get("probation_limit"),
+                reopen_decision.get("review_id") or "approved",
+                mode,
+            )
 
         if max_total_open is not None and count_open_trades() >= max_total_open:
             return {
@@ -3078,11 +3224,12 @@ def inspect_weather_trade_open(weather_signal_id, size_usd=100, max_total_open=N
             "ok": True,
             "reason_code": "ready",
             "reason": "Ready to open weather trade.",
-            "signal": dict(sig),
+            "signal": signal_row,
             "entry_token": entry_token,
             "entry_price": entry_price,
             "action": action,
             "requested_size_usd": round(float(size_usd), 2),
+            "reopen_context": reopen_context,
             **_paper_position_policy_dict(),
         }
     finally:
@@ -3173,13 +3320,18 @@ def open_copy_trade(
     return trade_id
 
 
-def open_weather_trade(weather_signal_id, size_usd=100):
+def open_weather_trade(weather_signal_id, size_usd=100, mode=None):
     """Open a single-leg paper trade from a weather signal.
 
     DB-level guard: returns None if an open trade already exists for this signal.
     """
     conn = get_conn()
-    decision = inspect_weather_trade_open(weather_signal_id, size_usd=size_usd, conn=conn)
+    decision = inspect_weather_trade_open(
+        weather_signal_id,
+        size_usd=size_usd,
+        conn=conn,
+        mode=mode,
+    )
     if not decision["ok"]:
         log.info(
             "Paper weather trade blocked for signal %s: %s",
@@ -3214,6 +3366,9 @@ def open_weather_trade(weather_signal_id, size_usd=100):
     ))
     trade_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
     conn.execute("UPDATE weather_signals SET status='traded' WHERE id=?", (weather_signal_id,))
+    reopen_context = decision.get("reopen_context")
+    if reopen_context and token:
+        _record_weather_token_reopen(conn, token)
     conn.commit()
     conn.close()
     return trade_id
@@ -3268,6 +3423,7 @@ def close_trade(trade_id, exit_price_a, exit_price_b=None, notes=""):
             spread_std = signal.get("spread_std", 1) or 1
             closed_z_score = round((spread - spread_mean) / spread_std, 4) if spread_std > 0 else 0.0
 
+    token_id = trade["token_id_a"]
     conn.execute("""
         UPDATE trades SET closed_at=?, exit_price_a=?, exit_price_b=?,
             pnl=?, status='closed', notes=?, exit_reason=?, closed_z_score=?
@@ -3278,6 +3434,8 @@ def close_trade(trade_id, exit_price_a, exit_price_b=None, notes=""):
             "UPDATE weather_signals SET status='closed' WHERE id=?",
             (trade["weather_signal_id"],),
         )
+        if token_id:
+            _record_weather_token_close(conn, token_id, exit_reason)
     conn.commit()
     conn.close()
 

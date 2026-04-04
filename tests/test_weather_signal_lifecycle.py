@@ -5,9 +5,15 @@ import unittest
 from unittest import mock
 
 
-def _weather_opp(city="Atlanta", market="Will Atlanta hit 82F?", yes_token="yes-atl", no_token="no-atl"):
+def _weather_opp(
+    city="Atlanta",
+    market="Will Atlanta hit 82F?",
+    yes_token="yes-atl",
+    no_token="no-atl",
+    target_date="2026-04-03",
+):
     return {
-        "event": f"Highest temperature in {city} on April 3?",
+        "event": f"Highest temperature in {city} on {target_date}?",
         "market": market,
         "market_id": f"market-{yes_token}",
         "yes_token": yes_token,
@@ -15,7 +21,7 @@ def _weather_opp(city="Atlanta", market="Will Atlanta hit 82F?", yes_token="yes-
         "city": city.lower(),
         "lat": 33.7490,
         "lon": -84.3880,
-        "target_date": "2026-04-03",
+        "target_date": target_date,
         "threshold_f": 82.0,
         "direction": "above",
         "market_price": 0.41,
@@ -135,6 +141,54 @@ class WeatherSignalLifecycleTests(unittest.TestCase):
         self.assertIsNone(duplicate_row["latest_trade_exit_reason"])
         self.assertIn("do not reopen", duplicate_row["status_detail"])
 
+    def test_weather_reopen_probation_respected_for_approved_tokens(self):
+        base_token = "yes-la"
+        no_token = "no-la"
+        first_signal_id = self.db.save_weather_signal(
+            _weather_opp(
+                city="Los Angeles",
+                market="Will Los Angeles hit 80F on April 4?",
+                yes_token=base_token,
+                no_token=no_token,
+                target_date="2026-04-04",
+            )
+        )
+        trade_id = self.db.open_weather_trade(first_signal_id, size_usd=20, mode="paper")
+        self.assertIsNotNone(trade_id)
+        self.db.close_trade(trade_id, exit_price_a=0.50, notes="Initial close")
+
+        for attempt in (1, 2):
+            signal_id = self.db.save_weather_signal(
+                _weather_opp(
+                    city="Los Angeles",
+                    market=f"Will Los Angeles hit 80F on April 4 (reopen {attempt})?",
+                    yes_token=base_token,
+                    no_token=no_token,
+                    target_date="2026-04-04",
+                )
+            )
+            decision = self.db.inspect_weather_trade_open(signal_id, size_usd=20, mode="paper")
+            self.assertTrue(decision["ok"], msg=f"Reopen {attempt} should be allowed")
+            reopen_context = decision.get("reopen_context")
+            self.assertIsNotNone(reopen_context)
+            self.assertEqual(reopen_context.get("reopen_count"), attempt - 1)
+            reopened_trade_id = self.db.open_weather_trade(signal_id, size_usd=20, mode="paper")
+            self.assertIsNotNone(reopened_trade_id)
+            self.db.close_trade(reopened_trade_id, exit_price_a=0.45, notes=f"Reopen {attempt} close")
+
+        final_signal_id = self.db.save_weather_signal(
+            _weather_opp(
+                city="Los Angeles",
+                market="Will Los Angeles hit 80F on April 4 (reopen 3)?",
+                yes_token=base_token,
+                no_token=no_token,
+                target_date="2026-04-04",
+            )
+        )
+        final_decision = self.db.inspect_weather_trade_open(final_signal_id, size_usd=20, mode="paper")
+        self.assertFalse(final_decision["ok"])
+        self.assertEqual(final_decision["reason_code"], "token_probation_blocked")
+
     def test_weather_close_trade_uses_single_leg_pnl_and_closes_signal(self):
         signal_id = self.db.save_weather_signal(
             _weather_opp(city="Miami", market="Will Miami hit 87F?", yes_token="yes-mia", no_token="no-mia")
@@ -163,12 +217,13 @@ class WeatherSignalLifecycleTests(unittest.TestCase):
         import tracker
 
         tracker = importlib.reload(tracker)
-        with mock.patch.object(tracker, "_resolve_single_leg_price", return_value={"price": 0.35, "source": "midpoint", "resolved": False}):
+        stop_floor = trade["entry_price_a"] * (1 - tracker.WEATHER_STOP_LOSS_PCT)
+        with mock.patch.object(tracker, "_resolve_single_leg_price", return_value={"price": stop_floor + 0.01, "source": "midpoint", "resolved": False}):
             result = tracker.auto_close_trades()
         self.assertEqual(result, [])
         self.assertEqual(self.db.get_trade(trade_id)["status"], "open")
 
-        with mock.patch.object(tracker, "_resolve_single_leg_price", return_value={"price": 0.34, "source": "midpoint", "resolved": False}):
+        with mock.patch.object(tracker, "_resolve_single_leg_price", return_value={"price": stop_floor - 0.002, "source": "midpoint", "resolved": False}):
             result = tracker.auto_close_trades()
 
         self.assertEqual(len(result), 1)
@@ -176,7 +231,7 @@ class WeatherSignalLifecycleTests(unittest.TestCase):
         self.assertEqual(close["trade_id"], trade_id)
         self.assertIn("stop-loss hit", close["reason"])
         self.assertEqual(self.db.get_trade(trade_id)["status"], "closed")
-        self.assertAlmostEqual(trade["entry_price_a"] * (1 - tracker.WEATHER_STOP_LOSS_PCT), 0.3362, places=4)
+        self.assertAlmostEqual(stop_floor, trade["entry_price_a"] * (1 - tracker.WEATHER_STOP_LOSS_PCT), places=4)
 
 
 if __name__ == "__main__":

@@ -10,6 +10,7 @@ import time
 import api
 import db
 import math_engine
+from weather_scanner import MIN_HOURS_AHEAD_FOR_TRADE
 
 log = logging.getLogger("scanner.execution")
 
@@ -384,6 +385,47 @@ def execute_trade(signal, size_usd, mode=None):
     return _wrap_result(result)
 
 
+def _revalidate_weather_horizon(signal: dict | None):
+    """Re-check how many hours remain before the weather resolution."""
+    if not signal:
+        return {
+            "ok": False,
+            "reason_code": "horizon_unknown",
+            "reason": "Signal data unavailable for horizon check.",
+        }
+    hours_ahead = signal.get("hours_ahead")
+    timestamp = signal.get("timestamp")
+    strategy = (
+        (signal.get("strategy_name") or signal.get("market_family") or "")
+        .strip()
+        .lower()
+    )
+    if strategy.startswith("weather_exact_temp"):
+        return {"ok": True, "remaining_hours": hours_ahead if hours_ahead is not None else 0.0}
+    if hours_ahead is None or timestamp is None:
+        return {
+            "ok": False,
+            "reason_code": "horizon_unknown",
+            "reason": "Signal missing horizon metadata.",
+        }
+    try:
+        age_hours = (time.time() - float(timestamp)) / 3600
+    except (TypeError, ValueError):
+        age_hours = 0.0
+    remaining_hours = hours_ahead - age_hours
+    if remaining_hours < MIN_HOURS_AHEAD_FOR_TRADE:
+        return {
+            "ok": False,
+            "reason_code": "horizon_too_short",
+            "reason": (
+                f"Signal horizon now {remaining_hours:.1f}h, below required "
+                f"{MIN_HOURS_AHEAD_FOR_TRADE}h minimum."
+            ),
+            "remaining_hours": remaining_hours,
+        }
+    return {"ok": True, "remaining_hours": remaining_hours}
+
+
 def execute_weather_trade(signal, size_usd, mode=None):
     """Execute a paper-first weather trade from a saved weather signal."""
     mode = mode or _get_mode()
@@ -438,6 +480,17 @@ def execute_weather_trade(signal, size_usd, mode=None):
             "weather_signal_id": weather_signal_id,
         }
 
+    horizon_check = _revalidate_weather_horizon(signal)
+    if not horizon_check["ok"]:
+        return {
+            "ok": False,
+            "mode": mode,
+            "reason_code": horizon_check.get("reason_code"),
+            "error": horizon_check.get("reason"),
+            "weather_signal_id": weather_signal_id,
+            "remaining_hours": horizon_check.get("remaining_hours"),
+        }
+
     bal = check_balance("paper")
     if not bal["ok"]:
         return {
@@ -467,7 +520,7 @@ def execute_weather_trade(signal, size_usd, mode=None):
             "weather_signal_id": weather_signal_id,
         }
 
-    decision = db.inspect_weather_trade_open(weather_signal_id, size_usd=size_usd)
+    decision = db.inspect_weather_trade_open(weather_signal_id, size_usd=size_usd, mode=mode)
     if not decision["ok"]:
         return {
             "ok": False,
@@ -479,7 +532,7 @@ def execute_weather_trade(signal, size_usd, mode=None):
             "strategy_name": strategy_name,
         }
 
-    trade_id = db.open_weather_trade(weather_signal_id, size_usd=size_usd)
+    trade_id = db.open_weather_trade(weather_signal_id, size_usd=size_usd, mode=mode)
     if not trade_id:
         return {
             "ok": False,

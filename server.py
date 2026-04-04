@@ -1362,7 +1362,11 @@ async def open_weather_trade(signal_id: int, size_usd: float = 20):
     signal = db.get_weather_signal_by_id(signal_id)
     result = execution.execute_weather_trade(signal or {"id": signal_id}, size_usd=size_usd, mode="paper")
     if not result["ok"]:
-        decision = result.get("decision") or db.inspect_weather_trade_open(signal_id, size_usd=size_usd)
+        decision = result.get("decision") or db.inspect_weather_trade_open(
+            signal_id,
+            size_usd=size_usd,
+            mode="paper",
+        )
         _safe_record_paper_trade_attempt(
             source="manual_api",
             strategy="weather",

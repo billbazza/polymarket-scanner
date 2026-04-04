@@ -6,28 +6,24 @@
       "name": "Los Angeles April 4 controlled reopen",
       "market_contains": ["los angeles", "april 4"],
       "target_date": "2026-04-04",
-      "allow_modes": ["paper", "penny"],
-      "relax_noise_guard": true,
-      "relax_token_guard": true,
-      "notes": "Paper/penny proof-of-concept to test noise gating on the LA April 4 token after repeated stop-outs",
       "mode": "paper",
       "allow_modes": ["paper", "penny"],
       "relax_noise_guard": true,
-      "relax_token_guard": true
+      "relax_token_guard": true,
+      "probation_limit": 2,
+      "notes": "Paper/penny proof-of-concept to test noise gating on the LA April 4 token after repeated stop-outs"
     },
     {
       "id": "dallas-apr-2-control",
       "name": "Dallas April 2 controlled reopen",
       "market_contains": ["dallas", "april 2"],
       "target_date": "2026-04-02",
-      "allow_modes": ["paper", "penny"],
-      "relax_noise_guard": true,
-      "relax_token_guard": true,
-      "notes": "Controlled reopen to observe the 5/15 stop comparison under noise guard relaxation",
       "mode": "paper",
       "allow_modes": ["paper", "penny"],
       "relax_noise_guard": true,
-      "relax_token_guard": true
+      "relax_token_guard": true,
+      "probation_limit": 2,
+      "notes": "Controlled reopen to observe the 5/15 stop comparison under noise guard relaxation"
     }
   ]
 }
