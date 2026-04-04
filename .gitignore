@@ -14,3 +14,4 @@ NTHROPIC_API_KEY
 NTHROPIC_AUTH_TOKEN
 NTHROPIC_BASE_URL
 .fuse_hidden*
+perplexity_cache.json
