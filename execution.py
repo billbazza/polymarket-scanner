@@ -442,8 +442,8 @@ def execute_weather_trade(signal, size_usd, mode=None):
             "error": "Weather signal missing id.",
         }
 
-    if not signal.get("id"):
-        signal = db.get_weather_signal_by_id(weather_signal_id) or {}
+    stored_signal = db.get_weather_signal_by_id(weather_signal_id) or {}
+    signal = {**stored_signal, **signal}
     strategy_name = (
         signal.get("strategy_name")
         or signal.get("market_family")

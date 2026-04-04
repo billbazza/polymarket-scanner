@@ -275,10 +275,10 @@ def evaluate_signal(signal):
         }
         _store_result(signal, result)
         log.info(
-            "Perplexity verdict (%s): %s (confidence %.2f) for %s",
+            "Perplexity verdict (%s) (confidence %.2f) for %s",
             "profitable" if candidate else "reject",
-            signal.get("event", "?")[:40],
             result["confidence"],
+            signal.get("event", "?")[:40],
         )
         return result
     except json.JSONDecodeError as exc:
