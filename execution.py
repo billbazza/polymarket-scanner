@@ -67,23 +67,33 @@ def _extract_confidence_decision(signal: dict | None) -> dict | None:
 
 
 def _apply_confidence_sizing(signal: dict | None, size_usd: float) -> tuple[float, dict | None]:
-    """Override size_usd with confidence-recommended sizing when active."""
+    """Override size_usd with confidence-recommended sizing when active and expose gating."""
     decision = _extract_confidence_decision(signal)
-    if not decision or not decision.get("applied"):
+    if not decision:
         return size_usd, None
-    try:
-        recommended = round(float(decision.get("selected_size_usd") or size_usd), 2)
-    except (TypeError, ValueError):
-        recommended = size_usd
-    if recommended <= 0:
-        return size_usd, None
+    size_before_confidence = round(float(size_usd or 0.0), 2)
+    selected_size = round(float(decision.get("selected_size_usd") or size_before_confidence), 2)
+    activation_status = decision.get("activation_status") or {}
     meta = {
         "confidence_score": round(float(decision.get("confidence_score") or 0.0), 4),
         "confidence_policy": decision.get("selected_policy"),
-        "confidence_baseline_size_usd": round(float(decision.get("baseline_size_usd") or 0.0), 2),
-        "confidence_selected_size_usd": recommended,
+        "confidence_requested_policy": decision.get("active_policy"),
+        "confidence_baseline_size_usd": size_before_confidence,
+        "confidence_selected_size_usd": selected_size,
+        "confidence_inputs": decision.get("confidence_inputs"),
+        "confidence_components": decision.get("confidence_components"),
+        "confidence_constraints": decision.get("constraints"),
+        "confidence_applied": bool(decision.get("applied")),
+        "activation_status": activation_status,
+        "rollout_state": decision.get("rollout_state"),
+        "compare_only": bool(decision.get("compare_only")),
+        "gate_blocker_codes": activation_status.get("blocker_codes"),
+        "gate_blockers": activation_status.get("blockers"),
+        "gate_can_apply_confidence": activation_status.get("can_apply_confidence"),
     }
-    return recommended, meta
+    if not decision.get("applied") or selected_size <= 0:
+        return size_usd, meta
+    return selected_size, meta
 
 
 def _cap_quarter_kelly(size_usd: float, balance_usd: float) -> tuple[float, bool]:
@@ -496,6 +506,14 @@ def execute_weather_trade(signal, size_usd, mode=None):
         "confidence_score": confidence_meta.get("confidence_score") if confidence_meta else None,
         "confidence_policy": confidence_meta.get("confidence_policy") if confidence_meta else None,
         "confidence_applied": bool(confidence_meta),
+        "confidence_selected_size_usd": confidence_meta.get("confidence_selected_size_usd") if confidence_meta else None,
+        "confidence_baseline_size_usd": confidence_meta.get("confidence_baseline_size_usd") if confidence_meta else None,
+        "confidence_requested_policy": confidence_meta.get("confidence_requested_policy") if confidence_meta else None,
+        "confidence_gate_blockers": confidence_meta.get("gate_blockers") if confidence_meta else None,
+        "confidence_gate_blocker_codes": confidence_meta.get("gate_blocker_codes") if confidence_meta else None,
+        "confidence_gate_can_apply": confidence_meta.get("gate_can_apply_confidence") if confidence_meta else None,
+        "confidence_compare_only": confidence_meta.get("compare_only") if confidence_meta else None,
+        "confidence_rollout_state": confidence_meta.get("rollout_state") if confidence_meta else None,
         "quarter_kelly_capped": bool(quarter_kelly_capped),
     }
 
@@ -556,6 +574,14 @@ def _execute_paper(signal, size_usd, price_a, price_b,
         "confidence_score": confidence_metadata.get("confidence_score") if confidence_metadata else None,
         "confidence_policy": confidence_metadata.get("confidence_policy") if confidence_metadata else None,
         "confidence_applied": bool(confidence_metadata),
+        "confidence_selected_size_usd": confidence_metadata.get("confidence_selected_size_usd") if confidence_metadata else None,
+        "confidence_baseline_size_usd": confidence_metadata.get("confidence_baseline_size_usd") if confidence_metadata else None,
+        "confidence_requested_policy": confidence_metadata.get("confidence_requested_policy") if confidence_metadata else None,
+        "confidence_gate_blockers": confidence_metadata.get("gate_blockers") if confidence_metadata else None,
+        "confidence_gate_blocker_codes": confidence_metadata.get("gate_blocker_codes") if confidence_metadata else None,
+        "confidence_gate_can_apply": confidence_metadata.get("gate_can_apply_confidence") if confidence_metadata else None,
+        "confidence_compare_only": confidence_metadata.get("compare_only") if confidence_metadata else None,
+        "confidence_rollout_state": confidence_metadata.get("rollout_state") if confidence_metadata else None,
         "quarter_kelly_capped": bool(quarter_kelly_capped),
     }
 
@@ -681,6 +707,14 @@ def _execute_live(signal, size_usd, price_a, price_b,
             "confidence_score": confidence_metadata.get("confidence_score") if confidence_metadata else None,
             "confidence_policy": confidence_metadata.get("confidence_policy") if confidence_metadata else None,
             "confidence_applied": bool(confidence_metadata),
+            "confidence_selected_size_usd": confidence_metadata.get("confidence_selected_size_usd") if confidence_metadata else None,
+            "confidence_baseline_size_usd": confidence_metadata.get("confidence_baseline_size_usd") if confidence_metadata else None,
+            "confidence_requested_policy": confidence_metadata.get("confidence_requested_policy") if confidence_metadata else None,
+            "confidence_gate_blockers": confidence_metadata.get("gate_blockers") if confidence_metadata else None,
+            "confidence_gate_blocker_codes": confidence_metadata.get("gate_blocker_codes") if confidence_metadata else None,
+            "confidence_gate_can_apply": confidence_metadata.get("gate_can_apply_confidence") if confidence_metadata else None,
+            "confidence_compare_only": confidence_metadata.get("compare_only") if confidence_metadata else None,
+            "confidence_rollout_state": confidence_metadata.get("rollout_state") if confidence_metadata else None,
             "quarter_kelly_capped": bool(quarter_kelly_capped),
         }
 
