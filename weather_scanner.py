@@ -47,9 +47,14 @@ MIN_EDGE = 0.06        # 6pp minimum combined edge to surface (for display)
 MIN_TRADE_EDGE = 0.15  # 15pp minimum edge required to mark tradeable
 MIN_TRADE_PRICE = 0.35 # never buy a token below this price (avoids near-wipeout long shots)
 MIN_LIQUIDITY = 200    # minimum event liquidity USD
-MIN_STABLE_LIQUIDITY = 10_000  # avoid ultra-thin weather books
-MIN_HOURS_AHEAD_FOR_TRADE = 60  # require at least ~2.5 days to let noise settle
-MAX_SOURCE_DISAGREEMENT = 0.12  # difference between NOAA/OM probabilities
+
+LEGACY_MIN_STABLE_LIQUIDITY = 10_000  # previous ultra-thin book guard
+LEGACY_MIN_HOURS_AHEAD_FOR_TRADE = 60  # previous horizon guard
+LEGACY_MAX_SOURCE_DISAGREEMENT = 0.12  # previous source consensus guard
+
+MIN_STABLE_LIQUIDITY = 5_000   # relaxed book guard to trade earlier/proportionally
+MIN_HOURS_AHEAD_FOR_TRADE = 48  # reintroduce 2-day guard to restore the 74% win-rate profile
+MAX_SOURCE_DISAGREEMENT = 0.18  # wider consensus window to capture resolving opportunities
 
 _WEATHER_KEYWORDS = [
     "temperature", "°f", "°c", "degrees", "high temp", "low temp",
@@ -466,6 +471,14 @@ def scan(
             source_disagreement = (
                 abs(noaa_prob - om_prob) if noaa_prob is not None and om_prob is not None else None
             )
+            legacy_liquidity_ok = liq >= LEGACY_MIN_STABLE_LIQUIDITY
+            legacy_horizon_ok = hours_ahead >= LEGACY_MIN_HOURS_AHEAD_FOR_TRADE
+            legacy_disagreement_ok = (
+                source_disagreement is not None and source_disagreement <= LEGACY_MAX_SOURCE_DISAGREEMENT
+            )
+            legacy_stable_noise_guard = (
+                legacy_liquidity_ok and legacy_horizon_ok and legacy_disagreement_ok
+            )
             liquidity_ok = liq >= MIN_STABLE_LIQUIDITY
             horizon_ok = hours_ahead >= MIN_HOURS_AHEAD_FOR_TRADE
             disagreement_ok = (
@@ -490,6 +503,14 @@ def scan(
                 and abs(combined_edge) >= MIN_TRADE_EDGE
                 and baseline_price >= MIN_TRADE_PRICE
                 and stable_noise_guard
+            )
+            legacy_tradeable = (
+                sources_agree
+                and ev_pct > 0
+                and kelly_f > 0
+                and abs(combined_edge) >= MIN_TRADE_EDGE
+                and baseline_price >= MIN_TRADE_PRICE
+                and legacy_stable_noise_guard
             )
 
             opp = {
@@ -541,10 +562,12 @@ def scan(
                 "horizon_ok": horizon_ok,
                 "disagreement_ok": disagreement_ok,
                 "stable_noise_guard": stable_noise_guard,
+                "legacy_stable_noise_guard": legacy_stable_noise_guard,
                 "ev_pct": ev_pct,
                 "kelly_fraction": kelly_f,
                 "action": action,
                 "tradeable": tradeable,
+                "legacy_tradeable": legacy_tradeable,
                 "corrected_ev_pct": corrected_metrics.get("ev_pct"),
                 "corrected_kelly_fraction": corrected_metrics.get("kelly_fraction"),
                 "corrected_action": corrected_metrics.get("action"),
@@ -574,11 +597,24 @@ def scan(
 
     duration = round(time.time() - t0, 1)
     tradeable_count = sum(1 for o in opportunities if o["tradeable"])
+    legacy_tradeable_count = sum(1 for o in opportunities if o.get("legacy_tradeable"))
     log.info(
         "Weather scan: %d markets, %d weather, %d opps (%d tradeable) in %.1fs "
         "[noaa_errors=%d om_errors=%d]",
         markets_checked, parsed_count, len(opportunities), tradeable_count, duration,
         fetch_errors["noaa"], fetch_errors["om"],
+    )
+    log.info(
+        "Weather guard relaxation: legacy guard (liq>=%d,hours>=%d,disagree<=%.2f) saw %d tradeable → "
+        "relaxed guard (liq>=%d,hours>=%d,disagree<=%.2f) sees %d tradeable",
+        LEGACY_MIN_STABLE_LIQUIDITY,
+        LEGACY_MIN_HOURS_AHEAD_FOR_TRADE,
+        LEGACY_MAX_SOURCE_DISAGREEMENT,
+        legacy_tradeable_count,
+        MIN_STABLE_LIQUIDITY,
+        MIN_HOURS_AHEAD_FOR_TRADE,
+        MAX_SOURCE_DISAGREEMENT,
+        tradeable_count,
     )
 
     if verbose:
