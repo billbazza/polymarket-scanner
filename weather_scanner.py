@@ -38,6 +38,7 @@ from datetime import date, timedelta
 
 import api
 import weather_correction
+import weather_risk_review
 import weather_sources
 
 log = logging.getLogger("scanner.weather")
