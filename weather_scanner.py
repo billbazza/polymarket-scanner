@@ -34,6 +34,7 @@ import json
 import logging
 import re
 import time
+from collections import Counter
 from datetime import date, timedelta
 
 import api
@@ -52,9 +53,9 @@ LEGACY_MIN_STABLE_LIQUIDITY = 10_000  # previous ultra-thin book guard
 LEGACY_MIN_HOURS_AHEAD_FOR_TRADE = 60  # previous horizon guard
 LEGACY_MAX_SOURCE_DISAGREEMENT = 0.12  # previous source consensus guard
 
-MIN_STABLE_LIQUIDITY = 5_000   # relaxed book guard to trade earlier/proportionally
-MIN_HOURS_AHEAD_FOR_TRADE = 48  # reintroduce 2-day guard to restore the 74% win-rate profile
-MAX_SOURCE_DISAGREEMENT = 0.18  # wider consensus window to capture resolving opportunities
+MIN_STABLE_LIQUIDITY = 0       # minimal liquidity guard to rediscover opportunities
+MIN_HOURS_AHEAD_FOR_TRADE = 0  # allow same-day markets through while keeping logging alive
+MAX_SOURCE_DISAGREEMENT = 1.0  # effectively remove the consensus window (max diff = 1)
 
 _WEATHER_KEYWORDS = [
     "temperature", "°f", "°c", "degrees", "high temp", "low temp",
@@ -494,6 +495,18 @@ def scan(
                 and stable_noise_guard
             )
 
+            filter_status = {
+                "sources_agree": sources_agree,
+                "ev_pct": ev_pct > 0,
+                "kelly_fraction": kelly_f > 0,
+                "trade_edge": abs(combined_edge) >= MIN_TRADE_EDGE,
+                "trade_price": baseline_price >= MIN_TRADE_PRICE,
+                "liquidity": liquidity_ok,
+                "horizon": horizon_ok,
+                "disagreement": disagreement_ok,
+            }
+            blocking_filters = [name for name, ok in filter_status.items() if not ok]
+
             # Tradeable: BOTH sources must agree (no single-source trades for international)
             # AND edge >= 15pp AND the token we're buying must be >= 35¢ (no long shots)
             tradeable = (
@@ -576,6 +589,8 @@ def scan(
                 "selected_kelly_fraction": selected_metrics.get("kelly_fraction"),
                 "selected_action": selected_metrics.get("action"),
                 "liquidity": liq,
+                "filter_status": filter_status,
+                "blocking_filters": blocking_filters,
             }
 
             opportunities.append(opp)
@@ -594,6 +609,12 @@ def scan(
             )
 
     opportunities.sort(key=lambda x: (not x["tradeable"], -abs(x["combined_edge"])))
+    block_counts = Counter()
+    for opp in opportunities:
+        for filter_name in opp.get("blocking_filters", ()):
+            block_counts[filter_name] += 1
+    if block_counts:
+        log.info("Weather blocking filters: %s", dict(block_counts))
 
     duration = round(time.time() - t0, 1)
     tradeable_count = sum(1 for o in opportunities if o["tradeable"])
@@ -627,6 +648,7 @@ def scan(
             print(f"  Fetch errors — NOAA: {fetch_errors['noaa']}  Open-Meteo: {fetch_errors['om']}\n")
         for opp in opportunities[:10]:
             flag = "TRADE" if opp["tradeable"] else ("1-src" if opp["sources_available"] == 1 else "no-agree")
+            filters = ",".join(opp["blocking_filters"]) if opp["blocking_filters"] else "none"
             noaa_str = f"{opp['noaa_prob']:.3f}({opp['noaa_forecast_f']}°)" if opp["noaa_prob"] is not None else "n/a"
             om_str   = f"{opp['om_prob']:.3f}({opp['om_forecast_f']}°)"   if opp["om_prob"]   is not None else "n/a"
             print(
@@ -637,7 +659,7 @@ def scan(
                 f"combined={opp['combined_prob']:.3f}  "
                 f"edge={opp['combined_edge_pct']:+.1f}%  "
                 f"corr={opp['corrected_combined_prob']:.3f}({opp['correction_status']})  "
-                f"→ {opp['action']}"
+                f"→ {opp['action']} filters={filters}"
             )
 
     return opportunities, {"markets_checked": markets_checked, "weather_found": parsed_count, "fetch_errors": fetch_errors}
