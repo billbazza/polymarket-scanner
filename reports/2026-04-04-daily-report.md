@@ -13,6 +13,7 @@ System is operationally healthy with 68.2% win rate and +$425.48 total equity (+
 - Low capital utilization at 19% keeps risk controlled
 - System stability with 206 successful scans and no critical errors
 - Whale detection actively identifying suspicious volume patterns (9-10x volume/liquidity ratios)
+- [x] Autonomy cron loop now runs cleanly after the rejected-trade journal indentation was corrected (see fix_logs/2026-04-04-autonomy-journal-crash.md)
 
 ## Not Working
 - [ ] Copy strategy losing money despite 57.9% win rate (poor risk/reward ratio)

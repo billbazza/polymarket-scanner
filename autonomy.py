@@ -812,23 +812,23 @@ def run_cycle(state):
                         "reason": opp.get("experiment_reason") or f"Signal admitted, z={opp.get('z_score', 0):+.2f}",
                     })
                 else:
-                        if mode == "paper":
-                            record_attempt(
-                                level,
-                                "pairs",
-                                "blocked",
-                                "execution_rejected",
-                                result.get("error", "Trade execution rejected."),
-                                event=event_name,
-                                signal_id=signal_id,
-                                size_usd=trade_size,
-                                phase=current_stage,
-                                details={
-                                    "grade": opp.get("grade_label"),
-                                    "paper_sizing": sizing_decision,
-                                    **_stage2_details(result),
-                                },
-                            )
+                    if mode == "paper":
+                        record_attempt(
+                            level,
+                            "pairs",
+                            "blocked",
+                            "execution_rejected",
+                            result.get("error", "Trade execution rejected."),
+                            event=event_name,
+                            signal_id=signal_id,
+                            size_usd=trade_size,
+                            phase=current_stage,
+                            details={
+                                "grade": opp.get("grade_label"),
+                                "paper_sizing": sizing_decision,
+                                **_stage2_details(result),
+                            },
+                        )
                     journal({
                         "action": "trade_rejected",
                         "level": level,
