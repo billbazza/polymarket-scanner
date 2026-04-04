@@ -15,18 +15,19 @@ System is operationally healthy with 68.2% win rate and +$425.48 total equity (+
 - Whale detection actively identifying suspicious volume patterns (9-10x volume/liquidity ratios)
 - [x] Autonomy cron loop now runs cleanly after the rejected-trade journal indentation was corrected (see fix_logs/2026-04-04-autonomy-journal-crash.md)
 - [x] Confidence-based paper sizing now emits gate metadata for every fill, making the quarter-Kelly cap traceable (see fix_logs/2026-04-04-paper-sizing-activation.md)
+- [x] Cointegration Grade A trial now lets two approved misses through (kelly/momentum/spread std/ev) and journals each rejection with the failed-filter count before any live push (see fix_logs/2026-04-04-cointegration-trial-guardrails.md)
 
 ## Not Working
 - [ ] Weather trading is losing more trades than it is winning. Investigate what has changed and see what might be the cause. 
 - [ ] Copy strategy losing money despite 57.9% win rate (poor risk/reward ratio) - remove from tests
 - [ ] Whale strategy inactive with zero trades executed - remove from tests
 - [ ] Weather stop-losses triggering frequently (multiple -$4 to -$5 losses)
-- [ ] Cointegration underutilized with only 7 total trades despite 3,407 A-grade signals
+- [ ] Cointegration underutilized with only 7 total trades despite 3,407 A-grade signals (trial guardrails now relax to two approved misses and log filter counts before escalating)
 - [x] Paper sizing decisions mostly in shadow mode (87 of 89 not applied) — confidence sizing now records the gate outcome per fill (see fix_logs/2026-04-04-paper-sizing-activation.md)
 
 ## Top 5 Improvements
 - [ ] Tighten weather strategy stop-losses or improve entry timing to reduce -$5 drawdowns
-- [ ] Increase cointegration trade frequency by relaxing A+ criteria or expanding to A-grade trials
+- [ ] Increase cointegration trade frequency by relaxing A+ criteria or expanding to A-grade trials (new guardrail logging lets us see whether candidates are 7/8 near misses before moving live)
 - [ ] Disable or fix copy strategy which has negative expectancy despite decent win rate
 - [ ] Implement whale strategy execution logic to capitalize on detected anomalies
 - [x] Apply confidence-based position sizing more aggressively (currently 97.8% shadow decisions) — telemetry now confirms the gate outcome per trade (see fix_logs/2026-04-04-paper-sizing-activation.md)

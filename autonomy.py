@@ -384,11 +384,29 @@ def run_cycle(state):
                 phase="step 1 strategy admission",
                 details={
                     "grade_label": opp.get("grade_label"),
+                    "grade": opp.get("grade"),
                     "tradeable": bool(opp.get("tradeable")),
                     "paper_tradeable": bool(opp.get("paper_tradeable")),
                     "admission_path": opp.get("admission_path"),
+                    "failed_filter_count": opp.get("trial_failed_filter_count"),
+                    "filters_failed": opp.get("trial_filters_failed"),
                 },
             )
+            if opp.get("grade_label") == "A":
+                journal({
+                    "action": "cointegration_trial_blocked",
+                    "level": level,
+                    "event": opp.get("event"),
+                    "signal_id": opp.get("id"),
+                    "grade_label": opp.get("grade_label"),
+                    "grade": opp.get("grade"),
+                    "failed_filter_count": opp.get("trial_failed_filter_count"),
+                    "filters_failed": opp.get("trial_filters_failed"),
+                    "admission_path": opp.get("admission_path"),
+                    "reason_code": opp.get("experiment_reason_code"),
+                    "reason": opp.get("experiment_reason"),
+                    "allowed_failed_filters": trial_settings["allowed_failed_filters"],
+                })
 
         stage3_gate_applied = not paper_mode
         stage3_gate_blocked = 0

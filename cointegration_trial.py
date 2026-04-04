@@ -13,12 +13,13 @@ DEFAULT_TRIAL_SETTINGS = {
     "enabled": True,
     "paper_only": True,
     "size_usd": 10.0,
-    "min_z_abs": 1.75,
-    "min_liquidity": 15000.0,
-    "max_slippage_pct": 1.0,
+    "min_z_abs": 1.6,
+    "min_liquidity": 12000.0,
+    "max_slippage_pct": 1.25,
     "max_half_life": 12.0,
-    "min_ev_pct": 0.5,
-    "allowed_failed_filters": ["ev_pass"],
+    "min_ev_pct": 0.35,
+    "allowed_failed_filters": ["ev_pass", "kelly_pass", "momentum_pass", "spread_std_pass"],
+    "max_allowed_failed_filters": 2,
     "reversion_exit_z": 0.35,
     "stop_z_buffer": 0.75,
     "max_hold_hours": 36.0,
@@ -35,10 +36,10 @@ def get_trial_settings():
     settings["paper_only"] = bool(settings.get("paper_only", True))
     settings["size_usd"] = max(1.0, float(settings.get("size_usd", 10.0) or 10.0))
     settings["min_z_abs"] = max(0.0, float(settings.get("min_z_abs", 1.75) or 0.0))
-    settings["min_liquidity"] = max(0.0, float(settings.get("min_liquidity", 15000.0) or 0.0))
-    settings["max_slippage_pct"] = max(0.1, float(settings.get("max_slippage_pct", 1.0) or 1.0))
+    settings["min_liquidity"] = max(0.0, float(settings.get("min_liquidity", 12000.0) or 0.0))
+    settings["max_slippage_pct"] = max(0.1, float(settings.get("max_slippage_pct", 1.25) or 1.25))
     settings["max_half_life"] = max(0.1, float(settings.get("max_half_life", 12.0) or 12.0))
-    settings["min_ev_pct"] = float(settings.get("min_ev_pct", 0.5) or 0.0)
+    settings["min_ev_pct"] = float(settings.get("min_ev_pct", 0.35) or 0.0)
     settings["reversion_exit_z"] = max(0.0, float(settings.get("reversion_exit_z", 0.35) or 0.35))
     settings["stop_z_buffer"] = max(0.1, float(settings.get("stop_z_buffer", 0.75) or 0.75))
     settings["max_hold_hours"] = max(1.0, float(settings.get("max_hold_hours", 36.0) or 36.0))
@@ -48,6 +49,12 @@ def get_trial_settings():
     )
     failed_filters = settings.get("allowed_failed_filters", ["ev_pass"]) or ["ev_pass"]
     settings["allowed_failed_filters"] = [str(item) for item in failed_filters]
+    max_failed = settings.get("max_allowed_failed_filters", 2) or 2
+    try:
+        max_failed = int(float(max_failed))
+    except (TypeError, ValueError):
+        max_failed = 2
+    settings["max_allowed_failed_filters"] = max(1, max_failed)
     settings["setting_key"] = TRIAL_SETTING_KEY
     settings["trial_name"] = TRIAL_NAME
     return settings
@@ -66,6 +73,10 @@ def set_trial_settings(settings):
 def _base_result(opp, settings, mode):
     grade = opp.get("grade_label") or "?"
     ev = opp.get("ev") or {}
+    filters_failed = [
+        name for name, passed in (opp.get("filters") or {}).items()
+        if not passed
+    ]
     return {
         "mode": mode,
         "grade_label": grade,
@@ -81,10 +92,8 @@ def _base_result(opp, settings, mode):
         "recommended_size_usd": None,
         "slippage": {},
         "guardrails": {},
-        "filters_failed": [
-            name for name, passed in (opp.get("filters") or {}).items()
-            if not passed
-        ],
+        "filters_failed": filters_failed,
+        "failed_filter_count": len(filters_failed),
         "ev_pct": ev.get("ev_pct"),
     }
 
@@ -127,13 +136,23 @@ def evaluate_signal(opp, mode="paper", settings=None):
         result["reason"] = "Signal filters are unavailable, so trial guardrails cannot be checked."
         return result
 
-    failed_filters = [name for name, passed in filters.items() if not passed]
+    failed_filters = result["filters_failed"]
     allowed_failed = set(settings["allowed_failed_filters"])
-    if len(failed_filters) != 1 or failed_filters[0] not in allowed_failed:
-        result["reason_code"] = "filter_failure_outside_trial"
+    max_allowed = settings["max_allowed_failed_filters"]
+    disallowed = [name for name in failed_filters if name not in allowed_failed]
+    if disallowed:
+        result["reason_code"] = "filter_failure_disallowed"
         result["reason"] = (
-            "A-grade trial only admits signals with a single allowed filter miss: "
+            "A-grade trial only allows misses from "
             + ", ".join(settings["allowed_failed_filters"])
+            + f". This signal additionally failed {', '.join(disallowed)}."
+        )
+        return result
+    if len(failed_filters) > max_allowed:
+        result["reason_code"] = "filter_failure_limit_reached"
+        result["reason"] = (
+            f"A-grade trial allows up to {max_allowed} allowed misses, "
+            f"but this signal failed {len(failed_filters)} filters ({', '.join(failed_filters)})."
         )
         return result
 
@@ -201,6 +220,8 @@ def evaluate_signal(opp, mode="paper", settings=None):
         "regime_break_threshold": round(z_abs + settings["regime_break_z_buffer"], 4),
         "max_slippage_pct": settings["max_slippage_pct"],
         "min_liquidity": settings["min_liquidity"],
+        "max_allowed_failed_filters": settings["max_allowed_failed_filters"],
+        "allowed_failed_filters": settings["allowed_failed_filters"],
     }
     result.update({
         "admit_trade": True,
@@ -230,4 +251,6 @@ def annotate_opportunity(opp, mode="paper", settings=None):
     opp["experiment_guardrails"] = evaluation["guardrails"]
     opp["trial_slippage"] = evaluation["slippage"]
     opp["trial_recommended_size_usd"] = evaluation["recommended_size_usd"]
+    opp["trial_filters_failed"] = evaluation["filters_failed"]
+    opp["trial_failed_filter_count"] = evaluation.get("failed_filter_count")
     return evaluation
