@@ -107,7 +107,7 @@ class CointegrationAdmissionDbTests(unittest.TestCase):
                 "observed": {"ev_pct": 1.2},
             },
             "experiment_reason_code": "trial_eligible",
-            "experiment_reason": "Eligible for paper trial.",
+            "experiment_reason": "Eligible for runtime-parity A-trial.",
         })
         self.db.save_signal(ev_near_miss)
 

@@ -44,7 +44,7 @@ def _base_signal():
 
 
 class CointegrationTrialLogicTests(unittest.TestCase):
-    def test_a_grade_signal_can_enter_paper_trial(self):
+    def test_a_grade_signal_can_enter_a_trial(self):
         import cointegration_trial
 
         signal = _base_signal()
@@ -59,7 +59,7 @@ class CointegrationTrialLogicTests(unittest.TestCase):
             result = cointegration_trial.evaluate_signal(signal, mode="paper")
 
         self.assertTrue(result["admit_trade"])
-        self.assertEqual(result["admission_path"], "paper_a_trial")
+        self.assertEqual(result["admission_path"], "a_grade_trial")
         self.assertEqual(result["experiment_status"], "eligible")
         self.assertEqual(result["recommended_size_usd"], 6.5)
         self.assertEqual(result["grade_weight"], 0.65)
@@ -68,12 +68,24 @@ class CointegrationTrialLogicTests(unittest.TestCase):
         self.assertAlmostEqual(result["guardrails"]["reversion_exit_z"], 0.35)
         self.assertGreater(result["guardrails"]["stop_z_threshold"], abs(signal["z_score"]))
 
-    def test_a_grade_signal_is_rejected_outside_paper_or_allowed_filters(self):
+    def test_a_grade_signal_can_enter_live_parity_trial(self):
         import cointegration_trial
 
-        live_result = cointegration_trial.evaluate_signal(_base_signal(), mode="live")
-        self.assertFalse(live_result["admit_trade"])
-        self.assertEqual(live_result["reason_code"], "paper_only")
+        with mock.patch.object(
+            cointegration_trial.math_engine,
+            "check_slippage",
+            side_effect=[
+                {"ok": True, "slippage_pct": 0.4, "reason": None},
+                {"ok": True, "slippage_pct": 0.6, "reason": None},
+            ],
+        ):
+            live_result = cointegration_trial.evaluate_signal(_base_signal(), mode="live")
+
+        self.assertTrue(live_result["admit_trade"])
+        self.assertEqual(live_result["admission_path"], "a_grade_trial")
+
+    def test_a_grade_signal_is_rejected_for_disallowed_filters(self):
+        import cointegration_trial
 
         bad_signal = _base_signal()
         bad_signal["filters"]["momentum_pass"] = True
@@ -152,7 +164,7 @@ class CointegrationTrialSummaryTests(unittest.TestCase):
             "paper_tradeable": True,
             "filters": {k: True for k in a_plus["filters"]},
             "admission_path": "standard_a_plus",
-            "experiment_name": "cointegration_a_grade_paper_trial",
+            "experiment_name": "cointegration_a_grade_parity_trial",
             "experiment_status": "control",
         })
         a_plus_id = self.db.save_signal(a_plus)
@@ -163,7 +175,7 @@ class CointegrationTrialSummaryTests(unittest.TestCase):
                 "strategy_name": "cointegration",
                 "entry_grade_label": "A+",
                 "admission_path": "standard_a_plus",
-                "experiment_name": "cointegration_a_grade_paper_trial",
+                "experiment_name": "cointegration_a_grade_parity_trial",
                 "experiment_status": "control",
             },
         )
@@ -173,12 +185,12 @@ class CointegrationTrialSummaryTests(unittest.TestCase):
 
         a_trial = _base_signal()
         a_trial.update({
-            "admission_path": "paper_a_trial",
-            "experiment_name": "cointegration_a_grade_paper_trial",
+            "admission_path": "a_grade_trial",
+            "experiment_name": "cointegration_a_grade_parity_trial",
             "experiment_status": "eligible",
             "paper_tradeable": True,
             "experiment_reason_code": "trial_eligible",
-            "experiment_reason": "Eligible for paper trial.",
+            "experiment_reason": "Eligible for runtime-parity A-trial.",
             "experiment_guardrails": {
                 "reversion_exit_z": 0.35,
                 "stop_z_threshold": 2.67,
@@ -193,8 +205,8 @@ class CointegrationTrialSummaryTests(unittest.TestCase):
             metadata={
                 "strategy_name": "cointegration",
                 "entry_grade_label": "A",
-                "admission_path": "paper_a_trial",
-                "experiment_name": "cointegration_a_grade_paper_trial",
+                "admission_path": "a_grade_trial",
+                "experiment_name": "cointegration_a_grade_parity_trial",
                 "experiment_status": "eligible",
                 "guardrails": a_trial["experiment_guardrails"],
             },
@@ -212,7 +224,7 @@ class CointegrationTrialSummaryTests(unittest.TestCase):
         rejected.update({
             "liquidity": 5000,
             "admission_path": "a_grade_rejected",
-            "experiment_name": "cointegration_a_grade_paper_trial",
+            "experiment_name": "cointegration_a_grade_parity_trial",
             "experiment_status": "rejected",
             "experiment_reason_code": "liquidity_too_low",
             "experiment_reason": "Liquidity too low.",

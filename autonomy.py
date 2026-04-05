@@ -535,8 +535,6 @@ def run_cycle(state):
                 log.warning("Failed to save signal: %s", e)
 
         for opp in opportunities:
-            if not paper_mode:
-                continue
             if opp.get("admit_trade"):
                 continue
             details = {
@@ -625,9 +623,9 @@ def run_cycle(state):
             len(admitted_signals),
         )
         log.info(
-            "Cointegration A-trial status: enabled=%s paper_only=%s candidates=%d eligible=%d rejected=%d",
+            "Cointegration A-trial status: enabled=%s live_parity=%s candidates=%d eligible=%d rejected=%d",
             trial_settings["enabled"],
-            trial_settings["paper_only"],
+            not trial_settings["paper_only"],
             a_trial_candidates,
             a_trial_eligible,
             a_trial_rejected,
@@ -936,7 +934,7 @@ def run_cycle(state):
             else:
                 trade_size = size_usd
 
-            if paper_mode and opp.get("admission_path") == "paper_a_trial":
+            if opp.get("admission_path") in {"a_grade_trial", "paper_a_trial"}:
                 trial_size = opp.get("trial_recommended_size_usd")
                 if trial_size:
                     trade_size = min(trade_size, trial_size) if trade_size else trial_size

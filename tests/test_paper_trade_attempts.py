@@ -32,7 +32,7 @@ def _base_signal():
         "sizing": {"recommended_size": 20.0},
         "filters": {"ev_pass": True},
         "admission_path": "standard_a_plus",
-        "experiment_name": "cointegration_a_grade_paper_trial",
+        "experiment_name": "cointegration_a_grade_parity_trial",
         "experiment_status": "control",
     }
 

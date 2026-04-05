@@ -5603,7 +5603,7 @@ def _latest_pairs_snapshot_rows(conn):
           AND t.strategy_name='cointegration'
           AND (
             t.entry_grade_label='A+'
-            OR (t.entry_grade_label='A' AND t.admission_path='paper_a_trial')
+            OR (t.entry_grade_label='A' AND t.admission_path IN ('a_grade_trial', 'paper_a_trial'))
           )
         ORDER BY t.opened_at ASC, t.id ASC
         """

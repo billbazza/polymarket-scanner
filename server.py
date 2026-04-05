@@ -764,6 +764,7 @@ async def cointegration_trial_status():
         "status": {
             "enabled": settings["enabled"],
             "paper_only": settings["paper_only"],
+            "live_parity_enabled": not settings["paper_only"],
             "recommendation": recommendation,
         },
         "settings": settings,

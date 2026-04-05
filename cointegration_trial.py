@@ -1,4 +1,4 @@
-"""Paper-only A-grade cointegration trial guardrails and admission logic."""
+"""A-grade cointegration trial guardrails and runtime-parity admission logic."""
 import logging
 
 import db
@@ -7,11 +7,11 @@ import math_engine
 log = logging.getLogger("scanner.cointegration_trial")
 
 TRIAL_SETTING_KEY = "cointegration_a_grade_trial"
-TRIAL_NAME = "cointegration_a_grade_paper_trial"
+TRIAL_NAME = "cointegration_a_grade_parity_trial"
 
 DEFAULT_TRIAL_SETTINGS = {
     "enabled": True,
-    "paper_only": True,
+    "paper_only": False,
     "size_usd": 10.0,
     "min_z_abs": 1.45,
     "min_liquidity": 6000.0,
@@ -33,12 +33,14 @@ DEFAULT_TRIAL_SETTINGS = {
 
 
 def get_trial_settings():
-    """Return validated settings for the paper A-grade cointegration trial."""
+    """Return validated settings for the A-grade cointegration trial."""
     raw = db.get_setting(TRIAL_SETTING_KEY, default=None) or {}
     settings = dict(DEFAULT_TRIAL_SETTINGS)
     settings.update(raw)
     settings["enabled"] = bool(settings.get("enabled", True))
-    settings["paper_only"] = bool(settings.get("paper_only", True))
+    # `paper_only` is retained for backward-compatible API/settings payloads but is
+    # now a no-op: penny/book must see the same A-grade admission lane as paper.
+    settings["paper_only"] = False
     settings["size_usd"] = max(1.0, float(settings.get("size_usd", 10.0) or 10.0))
     settings["min_z_abs"] = max(0.0, float(settings.get("min_z_abs", 1.6) or 0.0))
     settings["min_liquidity"] = max(
@@ -85,7 +87,7 @@ def get_trial_settings():
 
 
 def set_trial_settings(settings):
-    """Persist merged settings for the paper A-grade trial."""
+    """Persist merged settings for the A-grade cointegration trial."""
     merged = get_trial_settings()
     merged.update(settings or {})
     merged.pop("setting_key", None)
@@ -135,7 +137,7 @@ def _grade_weight_for_signal(grade_value, settings):
 
 
 def evaluate_signal(opp, mode="paper", settings=None):
-    """Evaluate whether a signal is eligible for the A-grade paper trial."""
+    """Evaluate whether a signal is eligible for the A-grade cointegration trial."""
     settings = settings or get_trial_settings()
     result = _base_result(opp, settings, mode)
     grade = result["grade_label"]
@@ -164,21 +166,14 @@ def evaluate_signal(opp, mode="paper", settings=None):
         "cohort": "A-trial",
         "experiment_status": "rejected",
         "reason_code": "trial_not_admitted",
-        "reason": "A-grade signal did not pass paper trial guardrails.",
+        "reason": "A-grade signal did not pass A-trial guardrails.",
         "admission_path": "a_grade_rejected",
     })
-
-    if settings["paper_only"] and mode != "paper":
-        return _block(
-            "paper_only",
-            "A-grade trial is restricted to paper mode.",
-            {"type": "mode"},
-        )
 
     if not settings["enabled"]:
         return _block(
             "trial_disabled",
-            "A-grade paper trial is disabled.",
+            "A-grade cointegration trial is disabled.",
             {"type": "mode"},
         )
 
@@ -354,11 +349,11 @@ def evaluate_signal(opp, mode="paper", settings=None):
     result.update({
         "admit_trade": True,
         "paper_tradeable": True,
-        "admission_path": "paper_a_trial",
+        "admission_path": "a_grade_trial",
         "experiment_status": "eligible",
         "reason_code": "trial_eligible",
         "reason": (
-            "A-grade signal admitted to the paper trial with weighted high-risk entries "
+            "A-grade signal admitted to the runtime-parity A-trial with weighted high-risk entries "
             f"(${weighted_size_usd:.2f}, weight {weight_base:.2f}) and explicit stop/hold guardrails."
         ),
         "recommended_size_usd": weighted_size_usd,
