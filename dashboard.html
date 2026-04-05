@@ -702,6 +702,16 @@
           <div class="meta" id="runtimeMaxOpenMeta">Waiting for scoped capacity details.</div>
         </div>
         <div class="runtime-scope-metric">
+          <div class="label">Open Penny Trades</div>
+          <div class="value" id="runtimeOpenTradesValue">—</div>
+          <div class="meta" id="runtimeOpenTradesMeta">Waiting for scoped open-trade count.</div>
+        </div>
+        <div class="runtime-scope-metric">
+          <div class="label">Remaining Slots</div>
+          <div class="value" id="runtimeSlotsRemainingValue">—</div>
+          <div class="meta" id="runtimeSlotsRemainingMeta">Waiting for penny remaining-slot status.</div>
+        </div>
+        <div class="runtime-scope-metric">
           <div class="label">Slot Limit State</div>
           <div class="value" id="runtimeSlotLimitValue">—</div>
           <div class="meta" id="runtimeSlotLimitMeta">Waiting for penny slot-limit status.</div>
@@ -717,6 +727,7 @@
           <div class="meta" id="runtimeStateFileMeta">Waiting for scoped state file.</div>
         </div>
       </div>
+      <div class="meta" id="runtimeSlotBlockedReasonMeta" style="margin-top:10px">Waiting for penny slot-blocking reason.</div>
       <div class="meta" id="runtimeSlotConsumersMeta" style="margin-top:10px">Waiting for penny slot-consumer details.</div>
       <div id="runtimeSlotConsumers" class="pill-row" style="margin-top:8px"></div>
     </div>
@@ -1677,10 +1688,14 @@ function renderRuntimeScopePanel(runtimeData, statsData, account) {
           : `No ${scope} autonomy cycle result recorded in this server process yet.`;
   const maxOpenMeta = isPaper
     ? 'Research mode stays cash-limited and intentionally has no hard max-open cap.'
-    : `Active penny max-open setting: ${activeMaxOpen}. ` +
-      `${scopedOpenPositions} open penny trade${scopedOpenPositions === 1 ? '' : 's'} currently count against this scoped live limit. ` +
-      `${slotsRemaining} slot${slotsRemaining === 1 ? '' : 's'} available.` +
+    : `Active penny max-open setting for the shared live weather + cointegration budget.` +
       (runtimeData?.max_open_usage ? ` Usage ${runtimeData.max_open_usage}.` : '');
+  const openTradesMeta = isPaper
+    ? 'Paper research positions do not consume a hard slot budget.'
+    : 'Current penny open-trade count consuming the scoped live slot budget.';
+  const remainingSlotsMeta = isPaper
+    ? 'Paper scope remains uncapped by position count.'
+    : 'Remaining penny slots before max-open blocks new live trades.';
   const slotLimitValue = isPaper
     ? 'UNCAPPED'
     : (slotLimitState?.status === 'blocked'
@@ -1698,10 +1713,19 @@ function renderRuntimeScopePanel(runtimeData, statsData, account) {
   }
   getEl('runtimeLevelValue').textContent = levelName;
   getEl('runtimeLevelMeta').textContent = `Level key ${String(state.level || scope).toUpperCase()} · scope ${String(scope).toUpperCase()}`;
-  getEl('runtimeMaxOpenValue').textContent = runtimeData?.max_open_usage || runtimeData?.max_open_label || '—';
+  getEl('runtimeMaxOpenValue').textContent = runtimeData?.max_open_label || '—';
   getEl('runtimeMaxOpenMeta').textContent = maxOpenMeta;
+  getEl('runtimeOpenTradesValue').textContent = String(scopedOpenPositions);
+  getEl('runtimeOpenTradesMeta').textContent = openTradesMeta;
+  getEl('runtimeSlotsRemainingValue').textContent = isPaper ? 'UNCAPPED' : String(slotsRemaining);
+  getEl('runtimeSlotsRemainingMeta').textContent = remainingSlotsMeta;
   getEl('runtimeSlotLimitValue').textContent = slotLimitValue;
   getEl('runtimeSlotLimitMeta').textContent = slotLimitMeta;
+  getEl('runtimeSlotBlockedReasonMeta').textContent = isPaper
+    ? 'Paper mode has no slot-limit blocker because it stays cash-limited.'
+    : (slotLimitState?.status === 'blocked'
+      ? `Blocked reason: ${slotLimitState?.reason || 'Penny max-open is full.'}`
+      : `Blocked reason: none. New penny trades can still open while ${slotsRemaining} slot${slotsRemaining === 1 ? '' : 's'} remain.`);
   getEl('runtimeCycleValue').textContent = cycleSummary;
   getEl('runtimeCycleMeta').textContent = cycleMeta;
   getEl('runtimeStateFileValue').textContent = scope === 'paper' ? 'autonomy_state.paper.json' : 'autonomy_state.penny.json';

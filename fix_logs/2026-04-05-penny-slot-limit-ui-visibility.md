@@ -12,6 +12,7 @@
   - current penny open-trade count
   - remaining available slots
   - a dedicated slot-limit state card
+  - a dedicated blocked-reason line that says either why new penny trades are blocked or that no slot blocker is active
   - strategy-specific cointegration/weather slot-pressure text
   - the open penny trades currently consuming slot capacity
 
