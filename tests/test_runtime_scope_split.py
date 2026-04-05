@@ -599,12 +599,18 @@ class RuntimeScopeSplitTests(unittest.TestCase):
              patch.object(autonomy, "load_state", return_value={"level": "penny", "runtime_scope": "penny"}), \
              patch.object(autonomy, "run_cycle", return_value={
                  "state": {"level": "penny", "runtime_scope": "penny"},
-                 "cycle_summary": {
-                     "weather_phase": {
-                         "status": "completed",
-                         "reason_code": None,
-                         "reason": None,
-                         "duration_secs": 0.1,
+                "cycle_summary": {
+                    "pairs_phase": {
+                        "status": "blocked",
+                        "reason_code": "max_open_reached",
+                        "reason": "No cointegration slots remain for scope=penny.",
+                        "trade_execution_status": "slots_full",
+                    },
+                    "weather_phase": {
+                        "status": "completed",
+                        "reason_code": None,
+                        "reason": None,
+                        "duration_secs": 0.1,
                          "execution_mode": "live-auto-trade",
                          "result_counts": {"opportunities": 1, "tradeable": 1, "traded": 1},
                      },
@@ -620,6 +626,8 @@ class RuntimeScopeSplitTests(unittest.TestCase):
         self.assertEqual(last_result["signals_found"], 3)
         self.assertEqual(last_result["trades_opened"], 1)
         self.assertEqual(last_result["trades_closed"], 2)
+        self.assertEqual(last_result["pairs_phase"]["reason_code"], "max_open_reached")
+        self.assertEqual(last_result["pairs_phase"]["trade_execution_status"], "slots_full")
         self.assertEqual(last_result["weather_phase"]["status"], "completed")
         self.assertIsNone(last_result["weather_phase"]["reason_code"])
         self.assertEqual(last_result["weather_phase"]["execution_mode"], "live-auto-trade")
@@ -663,6 +671,10 @@ class RuntimeScopeSplitTests(unittest.TestCase):
         self.assertEqual(penny_runtime["slots_remaining"], 3)
         self.assertEqual(penny_runtime["slot_usage"]["open_positions"], 0)
         self.assertEqual(penny_runtime["slot_usage"]["consuming_trades"], [])
+        self.assertEqual(penny_runtime["slot_limit_state"]["status"], "available")
+        self.assertEqual(penny_runtime["slot_limit_state"]["active_max_open"], 3)
+        self.assertEqual(penny_runtime["slot_limit_state"]["strategies"]["cointegration"]["status"], "available")
+        self.assertEqual(penny_runtime["slot_limit_state"]["strategies"]["weather"]["status"], "available")
         self.assertTrue(penny_runtime["running"])
         self.assertTrue(penny_runtime["state_file"].endswith("autonomy_state.penny.json"))
 
@@ -706,6 +718,9 @@ class RuntimeScopeSplitTests(unittest.TestCase):
         self.assertEqual(payload["open_positions"], 2)
         self.assertEqual(payload["max_open_usage"], "2/3")
         self.assertEqual(payload["slots_remaining"], 1)
+        self.assertEqual(payload["slot_limit_state"]["status"], "available")
+        self.assertEqual(payload["slot_limit_state"]["open_positions"], 2)
+        self.assertEqual(payload["slot_limit_state"]["slots_remaining"], 1)
         self.assertEqual(payload["slot_usage"]["consuming_trade_ids"], [live_pairs_id, live_weather_id])
         self.assertEqual(
             [row["trade_id"] for row in payload["slot_usage"]["consuming_trades"]],
@@ -830,12 +845,64 @@ class RuntimeScopeSplitTests(unittest.TestCase):
         self.assertIn("LIVE / POLYGON WALLET BLOCKED", html)
         self.assertIn("Penny mode fails closed", html)
         self.assertIn("runtimeData?.max_open_usage || runtimeData?.max_open_label", html)
+        self.assertIn("runtimeData?.slot_limit_state || {}", html)
+        self.assertIn("Slot Limit State", html)
+        self.assertIn("const strategySummary = ['cointegration', 'weather']", html)
         self.assertIn("acceptance && acceptance.all_passed === false", html)
         self.assertIn("Weather phase: skipped", html)
         self.assertIn("cycle started in background", html)
         self.assertIn("Penny Max Open Trades", html)
         self.assertIn("Changes save immediately to the live penny scope and are appended to the audit journal.", html)
         self.assertIn("const auditAction = data?.audit_entry?.action === 'runtime_controls_update_noop'", html)
+
+    def test_penny_runtime_slot_limit_state_marks_full_budget_as_blocked(self):
+        signal_id = self.db.save_signal(_signal())
+        self.db.open_trade(
+            signal_id,
+            size_usd=3,
+            metadata={
+                "runtime_scope": self.db.RUNTIME_SCOPE_PENNY,
+                "trade_state_mode": self.db.TRADE_STATE_LIVE,
+                "reconciliation_mode": self.db.RECONCILIATION_ORDERS,
+                "strategy_name": "cointegration",
+            },
+        )
+        weather_signal_id = self.db.save_weather_signal(self._weather_signal("blocked-yes", "blocked-no", "Blocked weather"))
+        self.db.open_weather_trade(
+            weather_signal_id,
+            size_usd=4,
+            mode="live",
+            runtime_scope=self.db.RUNTIME_SCOPE_PENNY,
+            metadata={
+                "trade_state_mode": self.db.TRADE_STATE_LIVE,
+                "reconciliation_mode": self.db.RECONCILIATION_ORDERS,
+            },
+        )
+        second_signal = _signal()
+        second_signal["event"] = "Second penny slot"
+        second_signal_id = self.db.save_signal(second_signal)
+        self.db.open_trade(
+            second_signal_id,
+            size_usd=2,
+            metadata={
+                "runtime_scope": self.db.RUNTIME_SCOPE_PENNY,
+                "trade_state_mode": self.db.TRADE_STATE_LIVE,
+                "reconciliation_mode": self.db.RECONCILIATION_ORDERS,
+                "strategy_name": "cointegration",
+            },
+        )
+
+        response = self.client.get("/api/autonomy/runtime?runtime_scope=penny")
+        payload = response.json()
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(payload["open_positions"], 3)
+        self.assertEqual(payload["slots_remaining"], 0)
+        self.assertEqual(payload["slot_limit_state"]["status"], "blocked")
+        self.assertEqual(payload["slot_limit_state"]["reason_code"], "max_open_reached")
+        self.assertIn("New cointegration and weather trades are blocked", payload["slot_limit_state"]["reason"])
+        self.assertEqual(payload["slot_limit_state"]["strategies"]["cointegration"]["status"], "blocked")
+        self.assertEqual(payload["slot_limit_state"]["strategies"]["weather"]["status"], "blocked")
 
     def test_weather_api_annotations_are_runtime_scoped(self):
         paper_signal_id = self.db.save_weather_signal(self._weather_signal("scope-yes", "scope-no", "Paper weather"))

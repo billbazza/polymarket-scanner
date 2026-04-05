@@ -420,6 +420,11 @@ def run_cycle(state):
         "level": level,
         "execution_mode": "synchronous",
         "slot_usage": None,
+        "pairs_phase": {
+            "status": "not_run",
+            "strategy": "cointegration",
+            "runtime_scope": runtime_scope,
+        },
         "weather_phase": {
             "status": "not_run",
             "strategy": "weather",
@@ -789,6 +794,14 @@ def run_cycle(state):
 
         if not config.get("auto_trade_enabled", True):
             log.info("Step 4: Auto-trading disabled for scope=%s level=%s", runtime_scope, level)
+            cycle_summary["pairs_phase"] = {
+                "status": "skipped",
+                "strategy": "cointegration",
+                "runtime_scope": runtime_scope,
+                "trade_execution_status": "scan_only",
+                "reason_code": "runtime_auto_trade_disabled",
+                "reason": f"Cointegration auto-trading is disabled for scope={runtime_scope}.",
+            }
             journal({
                 "action": "auto_trade_disabled",
                 "level": level,
@@ -813,6 +826,17 @@ def run_cycle(state):
         cycle_summary["slot_usage"] = slot_usage
         open_count = slot_usage["open_positions"]
         open_trades = db.get_trades(status="open", limit=None, runtime_scope=runtime_scope)
+        pairs_phase = {
+            "status": "running",
+            "strategy": "cointegration",
+            "runtime_scope": runtime_scope,
+            "slot_usage_at_start": slot_usage,
+            "result_counts": {
+                "admitted": len(admitted_signals),
+                "traded": 0,
+            },
+        }
+        cycle_summary["pairs_phase"] = pairs_phase
 
         if runtime_scope == RUNTIME_SCOPE_PENNY:
             log.info(
@@ -826,6 +850,14 @@ def run_cycle(state):
         if max_open is not None and open_count >= max_open:
             log.info("Step 4: At max positions (%d/%d), skipping new trades",
                      open_count, max_open)
+            pairs_phase.update({
+                "status": "blocked",
+                "trade_execution_status": "slots_full",
+                "reason_code": "max_open_reached",
+                "reason": f"No cointegration slots remain for scope={runtime_scope}.",
+                "blocking_trades": slot_usage.get("consuming_trades") or [],
+                "slot_usage_at_end": slot_usage,
+            })
             journal({"action": "skip_trade", "level": level,
                      "reason": f"At max positions ({open_count}/{max_open})"})
             record_attempt(
@@ -854,6 +886,16 @@ def run_cycle(state):
 
         slots = (max_open - open_count) if max_open is not None else len(admitted_signals)
         traded = 0
+        if max_open is None:
+            pairs_phase["trade_execution_status"] = "enabled"
+        elif slots <= 0:
+            pairs_phase["trade_execution_status"] = "slots_full"
+        elif len(admitted_signals) > slots:
+            pairs_phase["trade_execution_status"] = "limited_by_slots"
+        else:
+            pairs_phase["trade_execution_status"] = "enabled"
+        if pairs_phase.get("trade_execution_status") in {"slots_full", "limited_by_slots"}:
+            pairs_phase["blocking_trades"] = slot_usage.get("consuming_trades") or []
 
         # Build dedup sets from currently open trades — keyed by signal_id and event name
         open_signal_ids = {t.get("signal_id") for t in open_trades if t.get("signal_id")}
@@ -1095,6 +1137,18 @@ def run_cycle(state):
                          "event": event_name[:60], "reason": str(e)})
 
         log.info("Step 4: Opened %d new trades", traded)
+        pairs_phase["status"] = "completed"
+        pairs_phase["result_counts"]["traded"] = traded
+        if pairs_phase.get("trade_execution_status") == "limited_by_slots":
+            pairs_phase["reason_code"] = "limited_by_slots"
+            pairs_phase["reason"] = (
+                f"Cointegration candidates were capped by penny max-open usage "
+                f"({slot_usage.get('max_open_usage')})."
+            )
+        pairs_phase["slot_usage_at_end"] = db.get_runtime_slot_usage(
+            runtime_scope=runtime_scope,
+            max_open=max_open,
+        )
 
         for code, count in sorted(rejection_counts.items(), key=lambda item: (-item[1], item[0])):
             log.info("A-trial rejection summary: %s=%d", code, count)

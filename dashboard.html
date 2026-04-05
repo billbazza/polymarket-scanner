@@ -702,6 +702,11 @@
           <div class="meta" id="runtimeMaxOpenMeta">Waiting for scoped capacity details.</div>
         </div>
         <div class="runtime-scope-metric">
+          <div class="label">Slot Limit State</div>
+          <div class="value" id="runtimeSlotLimitValue">—</div>
+          <div class="meta" id="runtimeSlotLimitMeta">Waiting for penny slot-limit status.</div>
+        </div>
+        <div class="runtime-scope-metric">
           <div class="label">Cycle Status</div>
           <div class="value" id="runtimeCycleValue">—</div>
           <div class="meta" id="runtimeCycleMeta">Waiting for scoped run status.</div>
@@ -1641,11 +1646,14 @@ function renderRuntimeScopePanel(runtimeData, statsData, account) {
   const scope = runtimeData?.runtime_scope || statsData?.runtime_scope || ACTIVE_RUNTIME_SCOPE;
   const isPaper = scope === 'paper';
   const slotUsage = runtimeData?.slot_usage || {};
+  const slotLimitState = runtimeData?.slot_limit_state || {};
   const levelName = levelConfig?.name || String(state.level || 'unknown');
   const running = !!runtimeData?.running;
   const lastResult = runtimeData?.last_result || null;
   const acceptance = statsData?.acceptance_checks || {};
   const scopedOpenPositions = Number(runtimeData?.open_positions ?? (account?.open_positions ?? account?.open_trades ?? 0));
+  const activeMaxOpen = Number(runtimeData?.max_open ?? slotLimitState?.active_max_open ?? 0);
+  const slotsRemaining = Number(runtimeData?.slots_remaining ?? slotUsage?.slots_remaining ?? 0);
   const cycleSummary = running
     ? 'Running'
     : (lastResult?.ok === true
@@ -1660,9 +1668,19 @@ function renderRuntimeScopePanel(runtimeData, statsData, account) {
           : `No ${scope} autonomy cycle result recorded in this server process yet.`;
   const maxOpenMeta = isPaper
     ? 'Research mode stays cash-limited and intentionally has no hard max-open cap.'
-    : `${scopedOpenPositions} open penny position${scopedOpenPositions === 1 ? '' : 's'} currently count against this scoped live limit.` +
-      ` ${Number(runtimeData?.slots_remaining ?? slotUsage?.slots_remaining ?? 0)} slot${Number(runtimeData?.slots_remaining ?? slotUsage?.slots_remaining ?? 0) === 1 ? '' : 's'} available.` +
+    : `Active penny max-open setting: ${activeMaxOpen}. ` +
+      `${scopedOpenPositions} open penny trade${scopedOpenPositions === 1 ? '' : 's'} currently count against this scoped live limit. ` +
+      `${slotsRemaining} slot${slotsRemaining === 1 ? '' : 's'} available.` +
       (runtimeData?.max_open_usage ? ` Usage ${runtimeData.max_open_usage}.` : '');
+  const slotLimitValue = isPaper
+    ? 'UNCAPPED'
+    : (slotLimitState?.status === 'blocked'
+      ? 'BLOCKED'
+      : (slotsRemaining > 0 ? `${slotsRemaining} LEFT` : 'OPEN'));
+  const slotLimitMeta = isPaper
+    ? 'Paper scope is cash-limited, so there is no hard slot cap.'
+    : (slotLimitState?.reason
+      || `Penny weather and cointegration share this live slot budget. Active max-open ${activeMaxOpen}, open ${scopedOpenPositions}, remaining ${slotsRemaining}.`);
   getEl('runtimeScopeMeta').textContent = isPaper
     ? 'Research and penny read different state files, trade totals, and autonomy lanes.'
     : 'Penny view is driven only by live wallet balances, penny-scoped trades, and open-position limits.';
@@ -1673,15 +1691,17 @@ function renderRuntimeScopePanel(runtimeData, statsData, account) {
   getEl('runtimeLevelMeta').textContent = `Level key ${String(state.level || scope).toUpperCase()} · scope ${String(scope).toUpperCase()}`;
   getEl('runtimeMaxOpenValue').textContent = runtimeData?.max_open_usage || runtimeData?.max_open_label || '—';
   getEl('runtimeMaxOpenMeta').textContent = maxOpenMeta;
+  getEl('runtimeSlotLimitValue').textContent = slotLimitValue;
+  getEl('runtimeSlotLimitMeta').textContent = slotLimitMeta;
   getEl('runtimeCycleValue').textContent = cycleSummary;
   getEl('runtimeCycleMeta').textContent = cycleMeta;
   getEl('runtimeStateFileValue').textContent = scope === 'paper' ? 'autonomy_state.paper.json' : 'autonomy_state.penny.json';
   getEl('runtimeStateFileMeta').textContent = runtimeData?.state_file || '—';
-  renderRuntimeSlotConsumers(scope, slotUsage, runtimeData);
+  renderRuntimeSlotConsumers(scope, slotUsage, runtimeData, slotLimitState);
   renderRuntimeControls(runtimeData, scope);
 }
 
-function renderRuntimeSlotConsumers(scope, slotUsage, runtimeData) {
+function renderRuntimeSlotConsumers(scope, slotUsage, runtimeData, slotLimitState) {
   const meta = getEl('runtimeSlotConsumersMeta');
   const box = getEl('runtimeSlotConsumers');
   if (!meta || !box) return;
@@ -1692,9 +1712,19 @@ function renderRuntimeSlotConsumers(scope, slotUsage, runtimeData) {
   }
   const consumers = Array.isArray(slotUsage?.consuming_trades) ? slotUsage.consuming_trades : [];
   const available = runtimeData?.slots_remaining ?? slotUsage?.slots_remaining;
+  const strategyStates = slotLimitState?.strategies || {};
+  const strategySummary = ['cointegration', 'weather']
+    .map(key => {
+      const row = strategyStates[key];
+      if (!row) return null;
+      return `${key}: ${row.status || 'available'}${row.reason ? ` (${row.reason})` : ''}`;
+    })
+    .filter(Boolean)
+    .join(' | ');
   meta.textContent =
     `Penny weather and cointegration intentionally share the same live slot budget. ` +
-    `${consumers.length} open penny trade${consumers.length === 1 ? '' : 's'} consume capacity; ${available ?? 0} slot${available === 1 ? '' : 's'} available.`;
+    `${consumers.length} open penny trade${consumers.length === 1 ? '' : 's'} consume capacity; ${available ?? 0} slot${available === 1 ? '' : 's'} available.` +
+    (strategySummary ? ` ${strategySummary}` : '');
   if (!consumers.length) {
     box.innerHTML = '<span class="pill">No open penny trades are consuming slots.</span>';
     return;

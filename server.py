@@ -1786,6 +1786,100 @@ _autonomy_status = {
 }
 
 
+def _strategy_slot_limit_status(name: str, *, status: str, reason_code: str | None = None, reason: str | None = None):
+    return {
+        "strategy": name,
+        "status": status,
+        "reason_code": reason_code,
+        "reason": reason,
+    }
+
+
+def _build_slot_limit_state(
+    runtime_scope: str,
+    *,
+    max_open: int | None,
+    slot_usage: dict,
+    last_result: dict | None,
+) -> dict:
+    open_positions = int(slot_usage.get("open_positions") or 0)
+    slots_remaining = slot_usage.get("slots_remaining")
+    is_penny = runtime_scope == db.RUNTIME_SCOPE_PENNY
+    current_limit_hit = is_penny and max_open is not None and int(slots_remaining or 0) <= 0
+    state = {
+        "runtime_scope": runtime_scope,
+        "shared_budget": bool(is_penny),
+        "active_max_open": max_open,
+        "open_positions": open_positions,
+        "slots_remaining": slots_remaining,
+        "max_open_usage": slot_usage.get("max_open_usage"),
+        "status": "uncapped" if max_open is None else ("blocked" if current_limit_hit else "available"),
+        "reason_code": None,
+        "reason": None,
+        "blocking_trades": slot_usage.get("consuming_trades") or [],
+        "strategies": {},
+    }
+    if not is_penny:
+        return state
+
+    state["strategies"] = {
+        "cointegration": _strategy_slot_limit_status("cointegration", status="available"),
+        "weather": _strategy_slot_limit_status("weather", status="available"),
+    }
+
+    if current_limit_hit:
+        reason = (
+            f"Penny max-open is full at {open_positions}/{max_open}. "
+            "New cointegration and weather trades are blocked until a live penny trade closes or the operator raises the limit."
+        )
+        state["reason_code"] = "max_open_reached"
+        state["reason"] = reason
+        state["strategies"]["cointegration"] = _strategy_slot_limit_status(
+            "cointegration",
+            status="blocked",
+            reason_code="max_open_reached",
+            reason=reason,
+        )
+        state["strategies"]["weather"] = _strategy_slot_limit_status(
+            "weather",
+            status="blocked",
+            reason_code="max_open_reached",
+            reason=reason,
+        )
+        return state
+
+    pairs_phase = (last_result or {}).get("pairs_phase") or {}
+    weather_phase = (last_result or {}).get("weather_phase") or {}
+    pairs_status = str(pairs_phase.get("trade_execution_status") or "").strip().lower()
+    weather_status = str(weather_phase.get("trade_execution_status") or "").strip().lower()
+
+    if pairs_status == "limited_by_slots":
+        state["strategies"]["cointegration"] = _strategy_slot_limit_status(
+            "cointegration",
+            status="limited",
+            reason_code=pairs_phase.get("reason_code") or "limited_by_slots",
+            reason=pairs_phase.get("reason") or "Cointegration candidates were capped by the penny max-open budget in the last cycle.",
+        )
+    if weather_status in {"limited_by_slots", "slots_full"}:
+        state["strategies"]["weather"] = _strategy_slot_limit_status(
+            "weather",
+            status="blocked" if weather_status == "slots_full" else "limited",
+            reason_code=weather_phase.get("reason_code") or weather_status,
+            reason=weather_phase.get("reason") or "Weather candidates were capped by the penny max-open budget in the last cycle.",
+        )
+    if any(item.get("status") in {"blocked", "limited"} for item in state["strategies"].values()):
+        state["status"] = "attention"
+        strategy_reasons = [
+            f"{item['strategy']}: {item.get('reason')}"
+            for item in state["strategies"].values()
+            if item.get("status") in {"blocked", "limited"} and item.get("reason")
+        ]
+        if strategy_reasons:
+            state["reason"] = " ".join(strategy_reasons)
+            state["reason_code"] = "strategy_slot_pressure"
+    return state
+
+
 def _run_autonomy_background(runtime_scope: str):
     """Run autonomy cycle in background thread."""
     import autonomy
@@ -1808,6 +1902,7 @@ def _run_autonomy_background(runtime_scope: str):
             "trades_opened": stats_after.get("open_trades", 0) - stats_before.get("open_trades", 0),
             "trades_closed": stats_after.get("closed_trades", 0) - stats_before.get("closed_trades", 0),
             "phases": cycle_summary.get("phases", []),
+            "pairs_phase": cycle_summary.get("pairs_phase"),
             "weather_phase": cycle_summary.get("weather_phase"),
         }
         log.info("Autonomy cycle complete in %.1fs for scope=%s", duration, runtime_scope)
@@ -1868,6 +1963,7 @@ async def autonomy_runtime(runtime_scope: str | None = None):
     level_config = autonomy.get_level_config(level_key, runtime_scope)
     max_open = level_config.get("max_open")
     slot_usage = db.get_runtime_slot_usage(runtime_scope=runtime_scope, max_open=max_open)
+    last_result = _autonomy_status[runtime_scope]["last_result"]
     return {
         "runtime_scope": runtime_scope,
         "state": state,
@@ -1878,9 +1974,15 @@ async def autonomy_runtime(runtime_scope: str | None = None):
         "max_open_usage": slot_usage["max_open_usage"],
         "slots_remaining": slot_usage["slots_remaining"],
         "slot_usage": slot_usage,
+        "slot_limit_state": _build_slot_limit_state(
+            runtime_scope,
+            max_open=max_open,
+            slot_usage=slot_usage,
+            last_result=last_result,
+        ),
         "state_file": str(autonomy.state_file_for_scope(runtime_scope)),
         "running": _autonomy_status[runtime_scope]["running"],
-        "last_result": _autonomy_status[runtime_scope]["last_result"],
+        "last_result": last_result,
         "runtime_controls": level_config.get("runtime_controls"),
         "auto_trade_enabled": bool(level_config.get("auto_trade_enabled")),
     }
