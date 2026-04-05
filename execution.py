@@ -5,8 +5,12 @@ from __future__ import annotations
 Paper mode (default): simulates orders against current midpoint prices.
 Live mode: uses py-clob-client for real orders on Polymarket (requires POLYMARKET_PRIVATE_KEY).
 """
+import importlib.util
 import logging
+import site
+import sys
 import time
+from importlib.metadata import PackageNotFoundError, version
 
 import api
 import db
@@ -29,6 +33,9 @@ MAKER_AGGRESSION = 0.5
 
 # GTC orders expire and are cancelled after this many hours if unfilled.
 ORDER_TTL_HOURS = 4
+
+LIVE_CLOB_HOST = "https://clob.polymarket.com"
+LIVE_CHAIN_ID = 137
 
 
 def _stage2_enabled():
@@ -285,6 +292,142 @@ def _failure_result(mode: str, reason_code: str, error: str, **extra) -> dict:
         payload["blocker_source"] = blocker_source
     payload.update(extra)
     return payload
+
+
+def _package_health(import_name: str, dist_name: str | None = None) -> dict:
+    spec = importlib.util.find_spec(import_name)
+    package = {
+        "import_name": import_name,
+        "distribution": dist_name or import_name,
+        "available": bool(spec),
+        "origin": getattr(spec, "origin", None) if spec else None,
+        "version": None,
+    }
+    if not spec:
+        return package
+    try:
+        package["version"] = version(dist_name or import_name)
+    except PackageNotFoundError:
+        package["version"] = None
+    return package
+
+
+def live_execution_dependency_status() -> dict:
+    """Return operator-facing health for the current live execution runtime."""
+    packages = {
+        "py_clob_client": _package_health("py_clob_client", "py-clob-client"),
+        "web3": _package_health("web3", "web3"),
+        "httpx": _package_health("httpx", "httpx"),
+    }
+    missing_packages = [
+        pkg["distribution"]
+        for pkg in packages.values()
+        if not pkg.get("available")
+    ]
+    reason_code = None
+    reason = "Live execution dependencies available."
+    if missing_packages:
+        reason_code = "clob_client_unavailable"
+        joined = ", ".join(missing_packages)
+        reason = (
+            f"Live execution client unavailable in server runtime {sys.executable}: "
+            f"missing {joined}. Install with '{sys.executable} -m pip install -r requirements.txt'."
+        )
+    return {
+        "ok": not missing_packages,
+        "reason_code": reason_code,
+        "reason": reason,
+        "python_executable": sys.executable,
+        "python_version": sys.version.split()[0],
+        "user_site": site.getusersitepackages(),
+        "private_key_configured": bool(runtime_config.get("POLYMARKET_PRIVATE_KEY")),
+        "clob_host": LIVE_CLOB_HOST,
+        "chain_id": LIVE_CHAIN_ID,
+        "packages": packages,
+        "missing_packages": missing_packages,
+    }
+
+
+def log_live_execution_dependency_status(context: str) -> dict:
+    """Log the live execution runtime health for operator auditability."""
+    status = live_execution_dependency_status()
+    if status["ok"]:
+        log.info(
+            "Live execution runtime (%s): ok python=%s py-clob-client=%s web3=%s",
+            context,
+            status["python_executable"],
+            (status["packages"]["py_clob_client"].get("version") or "unknown"),
+            (status["packages"]["web3"].get("version") or "unknown"),
+        )
+    else:
+        log.error(
+            "Live execution runtime (%s): unavailable python=%s missing=%s",
+            context,
+            status["python_executable"],
+            ",".join(status["missing_packages"]) or "unknown",
+        )
+    return status
+
+
+def _live_client_failure(
+    runtime_scope: str,
+    *,
+    reason_code: str,
+    error: str,
+    blocker_source: str,
+    **extra,
+) -> dict:
+    return _failure_result(
+        "live",
+        reason_code,
+        error,
+        runtime_scope=runtime_scope,
+        blocker_source=blocker_source,
+        live_execution=live_execution_dependency_status(),
+        **extra,
+    )
+
+
+def _create_live_clob_client(runtime_scope: str, *, blocker_source: str):
+    """Create a live CLOB client or return a structured failure payload."""
+    dependency_status = live_execution_dependency_status()
+    if not dependency_status["ok"]:
+        return None, _live_client_failure(
+            runtime_scope,
+            reason_code=dependency_status["reason_code"] or "clob_client_unavailable",
+            error=dependency_status["reason"],
+            blocker_source=blocker_source,
+        )
+
+    private_key = runtime_config.get("POLYMARKET_PRIVATE_KEY")
+    if not private_key:
+        return None, _live_client_failure(
+            runtime_scope,
+            reason_code="private_key_missing",
+            error="POLYMARKET_PRIVATE_KEY not set",
+            blocker_source=blocker_source,
+        )
+
+    try:
+        from py_clob_client.client import ClobClient
+    except ImportError as exc:
+        return None, _live_client_failure(
+            runtime_scope,
+            reason_code="clob_client_unavailable",
+            error=f"Live execution client import failed in {sys.executable}: {exc}",
+            blocker_source=blocker_source,
+        )
+
+    try:
+        client = ClobClient(host=LIVE_CLOB_HOST, key=private_key, chain_id=LIVE_CHAIN_ID)
+    except Exception as exc:
+        return None, _live_client_failure(
+            runtime_scope,
+            reason_code="clob_client_init_failed",
+            error=f"Live execution client failed to initialize: {exc}",
+            blocker_source=blocker_source,
+        )
+    return client, None
 
 
 def execute_trade(signal, size_usd, mode=None, runtime_scope: str | None = None):
@@ -719,17 +862,22 @@ def execute_weather_trade(signal, size_usd, mode=None, runtime_scope: str | None
             "blocker_source": "shared-external",
         }
 
-    try:
-        from py_clob_client.client import ClobClient
-    except ImportError:
-        return _blocked("clob_client_unavailable", "py-clob-client not installed")
+    client, client_error = _create_live_clob_client(
+        runtime_scope,
+        blocker_source=f"{runtime_scope}-execution",
+    )
+    if client_error:
+        return {
+            **_blocked(
+                client_error.get("reason_code") or "clob_client_unavailable",
+                client_error.get("error") or "Live execution client unavailable.",
+                live_execution=client_error.get("live_execution"),
+            ),
+            "blocker_source": client_error.get("blocker_source"),
+            "blocker_runtime_scope": client_error.get("blocker_runtime_scope"),
+        }
 
-    private_key = runtime_config.get("POLYMARKET_PRIVATE_KEY")
-    if not private_key:
-        return _blocked("private_key_missing", "POLYMARKET_PRIVATE_KEY not set")
-
     try:
-        client = ClobClient(host="https://clob.polymarket.com", key=private_key, chain_id=137)
         side = "BUY"
         exec_mode = EXECUTION_MODE
         price = _get_single_leg_price(entry_token, side, exec_mode=exec_mode)
@@ -1176,17 +1324,16 @@ def close_live_trade(trade: dict, notes: str = "") -> dict:
     if not trade_id:
         return {"ok": False, "error": "Trade missing id.", "mode": "live"}
 
-    try:
-        from py_clob_client.client import ClobClient
-    except ImportError:
-        return {"ok": False, "error": "py-clob-client not installed", "mode": "live"}
+    runtime_scope = db.normalize_runtime_scope(trade.get("runtime_scope"))
+    client, client_error = _create_live_clob_client(
+        runtime_scope,
+        blocker_source=f"{runtime_scope}-execution",
+    )
+    if client_error:
+        client_error["trade_id"] = trade_id
+        return client_error
 
-    private_key = runtime_config.get("POLYMARKET_PRIVATE_KEY")
-    if not private_key:
-        return {"ok": False, "error": "POLYMARKET_PRIVATE_KEY not set", "mode": "live"}
-
     try:
-        client = ClobClient(host="https://clob.polymarket.com", key=private_key, chain_id=137)
         trade_type = trade.get("trade_type") or "pairs"
         close_time = time.time()
         exit_execution = {
@@ -1333,36 +1480,15 @@ def _execute_live(signal, size_usd, price_a, price_b,
     crosses our price. Pending until filled or expired.
     Taker mode: market-style orders that fill immediately at ask/bid.
     """
-    try:
-        from py_clob_client.client import ClobClient
-    except ImportError:
-        log.error("py-clob-client not installed. Run: pip install py-clob-client")
-        return _failure_result(
-            "live",
-            "clob_client_missing",
-            "py-clob-client not installed",
-            runtime_scope=runtime_scope,
-            blocker_source=f"{runtime_scope}-execution",
-        )
-
-    private_key = runtime_config.get("POLYMARKET_PRIVATE_KEY")
-    if not private_key:
-        log.error("POLYMARKET_PRIVATE_KEY not set")
-        return _failure_result(
-            "live",
-            "private_key_missing",
-            "POLYMARKET_PRIVATE_KEY not set",
-            runtime_scope=runtime_scope,
-            blocker_source=f"{runtime_scope}-execution",
-        )
+    client, client_error = _create_live_clob_client(
+        runtime_scope,
+        blocker_source=f"{runtime_scope}-execution",
+    )
+    if client_error:
+        log.error("Live execution bootstrap failed: %s", client_error.get("error"))
+        return client_error
 
     try:
-        client = ClobClient(
-            host="https://clob.polymarket.com",
-            key=private_key,
-            chain_id=137,
-        )
-
         half_size = size_usd / 2
         token_a = signal.get("token_id_a") or signal["market_a"]
         token_b = signal.get("token_id_b") or signal["market_b"]
@@ -1550,21 +1676,15 @@ def place_gtc_order(token_id, side, price, size_shares, mode=None):
         }
 
     # Live mode
-    try:
-        from py_clob_client.client import ClobClient
-    except ImportError:
-        return {"ok": False, "error": "py-clob-client not installed", "mode": "live"}
+    runtime_scope = db.RUNTIME_SCOPE_PENNY
+    client, client_error = _create_live_clob_client(
+        runtime_scope,
+        blocker_source=f"{runtime_scope}-execution",
+    )
+    if client_error:
+        return client_error
 
-    private_key = runtime_config.get("POLYMARKET_PRIVATE_KEY")
-    if not private_key:
-        return {"ok": False, "error": "POLYMARKET_PRIVATE_KEY not set", "mode": "live"}
-
     try:
-        client = ClobClient(
-            host="https://clob.polymarket.com",
-            key=private_key,
-            chain_id=137,
-        )
         result = client.create_and_post_order({
             "tokenID": token_id,
             "price": price,
@@ -1606,21 +1726,15 @@ def cancel_order(order_id, mode=None):
         return {"ok": True, "mode": "paper", "order_id": order_id, "status": "cancelled"}
 
     # Live mode
-    try:
-        from py_clob_client.client import ClobClient
-    except ImportError:
-        return {"ok": False, "error": "py-clob-client not installed", "mode": "live"}
+    runtime_scope = db.RUNTIME_SCOPE_PENNY
+    client, client_error = _create_live_clob_client(
+        runtime_scope,
+        blocker_source=f"{runtime_scope}-execution",
+    )
+    if client_error:
+        return client_error
 
-    private_key = runtime_config.get("POLYMARKET_PRIVATE_KEY")
-    if not private_key:
-        return {"ok": False, "error": "POLYMARKET_PRIVATE_KEY not set", "mode": "live"}
-
     try:
-        client = ClobClient(
-            host="https://clob.polymarket.com",
-            key=private_key,
-            chain_id=137,
-        )
         result = client.cancel(order_id)
         log.info("LIVE CANCEL: order=%s result=%s", order_id, result)
         return {"ok": True, "mode": "live", "order_id": order_id, "status": "cancelled",
@@ -1675,10 +1789,17 @@ def manage_open_orders():
 
         else:  # live mode — query exchange for fill status
             try:
-                from py_clob_client.client import ClobClient
-                private_key = runtime_config.get("POLYMARKET_PRIVATE_KEY")
-                client = ClobClient("https://clob.polymarket.com",
-                                    key=private_key, chain_id=137)
+                client, client_error = _create_live_clob_client(
+                    db.RUNTIME_SCOPE_PENNY,
+                    blocker_source=f"{db.RUNTIME_SCOPE_PENNY}-execution",
+                )
+                if client_error:
+                    log.warning(
+                        "Live order status check blocked for %s: %s",
+                        order["order_id"],
+                        client_error.get("error"),
+                    )
+                    continue
                 order_data = client.get_order(order["order_id"])
                 status = (order_data or {}).get("status", "")
                 if status in ("MATCHED", "FILLED"):

@@ -29,6 +29,7 @@ from log_setup import init_logging
 init_logging()
 log = logging.getLogger("scanner.server")
 runtime_config.log_runtime_status("server.py")
+execution.log_live_execution_dependency_status("server.py startup")
 
 
 @asynccontextmanager
@@ -652,12 +653,28 @@ async def runtime_account(runtime_scope: str | None = None):
     overview["max_open_usage"] = slot_usage.get("max_open_usage")
     overview["slots_remaining"] = slot_usage.get("slots_remaining")
     overview["slot_usage"] = slot_usage
+    overview["live_execution"] = execution.live_execution_dependency_status()
     overview["slot_limit_state"] = _build_slot_limit_state(
         runtime_scope,
         max_open=max_open,
         slot_usage=slot_usage,
         last_result=_autonomy_status[runtime_scope]["last_result"],
     )
+    if runtime_scope == db.RUNTIME_SCOPE_PENNY and not overview["live_execution"].get("ok"):
+        log.error(
+            "Penny runtime account blocked: live execution unavailable reason=%s python=%s",
+            overview["live_execution"].get("reason"),
+            overview["live_execution"].get("python_executable"),
+        )
+        return JSONResponse(
+            status_code=503,
+            content={
+                **overview,
+                "ok": False,
+                "error": overview["live_execution"].get("reason"),
+                "message": "Penny mode is blocked until the Polymarket live execution client is available in the server runtime.",
+            },
+        )
     if runtime_scope == db.RUNTIME_SCOPE_PENNY and not overview.get("verified_live_ledger"):
         log.error(
             "Penny runtime account blocked: verification_status=%s error=%s wallet=%s",
@@ -681,6 +698,16 @@ async def runtime_account(runtime_scope: str | None = None):
 async def paper_account(runtime_scope: str | None = None):
     """Backward-compatible alias for the runtime-aware account overview."""
     return await runtime_account(runtime_scope=runtime_scope)
+
+
+@app.get("/api/runtime/dependencies")
+async def runtime_dependencies():
+    """Return dependency/runtime verification for the active server interpreter."""
+    return {
+        "ok": True,
+        "live_execution": execution.live_execution_dependency_status(),
+        "runtime_config": runtime_config.runtime_status(),
+    }
 
 
 @app.get("/api/paper-sizing")
@@ -1556,6 +1583,11 @@ async def create_trade(signal_id: int, size_usd: float = 100, runtime_scope: str
             "private_key_missing",
             "clob_client_missing",
         } else 409
+        if (result.get("reason_code") or "") in {
+            "clob_client_unavailable",
+            "clob_client_init_failed",
+        }:
+            status_code = 503
         return JSONResponse(
             status_code=status_code,
             content={
@@ -1565,6 +1597,7 @@ async def create_trade(signal_id: int, size_usd: float = 100, runtime_scope: str
                 "reason_code": result.get("reason_code") or "open_failed",
                 "blocking_source": result.get("blocker_source"),
                 "blocking_runtime_scope": result.get("blocker_runtime_scope"),
+                "live_execution": result.get("live_execution"),
             },
         )
     _safe_record_paper_trade_attempt(
@@ -1675,6 +1708,12 @@ async def open_weather_trade(signal_id: int, size_usd: float = 20, runtime_scope
         status_code = 404 if decision["reason_code"] == "signal_not_found" else 409
         if decision["reason_code"] == "insufficient_cash":
             status_code = 400
+        if (result.get("reason_code") or decision.get("reason_code")) in {
+            "clob_client_unavailable",
+            "clob_client_init_failed",
+            "private_key_missing",
+        }:
+            status_code = 503
         return JSONResponse(
             status_code=status_code,
             content={
@@ -1682,10 +1721,11 @@ async def open_weather_trade(signal_id: int, size_usd: float = 20, runtime_scope
                 "error": result.get("error") or decision["reason"],
                 "reason": result.get("error") or decision["reason"],
                 "reason_code": result.get("reason_code") or decision["reason_code"],
-                "blocking_source": decision.get("blocker_source"),
-                "blocking_runtime_scope": decision.get("blocker_runtime_scope"),
+                "blocking_source": result.get("blocker_source") or decision.get("blocker_source"),
+                "blocking_runtime_scope": result.get("blocker_runtime_scope") or decision.get("blocker_runtime_scope"),
                 "blocking_strategy": decision.get("blocker_strategy"),
                 "paper_account": decision.get("account"),
+                "live_execution": result.get("live_execution"),
                 "policy": {
                     "position_policy": decision.get("position_policy"),
                     "label": decision.get("position_policy_label"),
@@ -2057,6 +2097,7 @@ async def autonomy_runtime(runtime_scope: str | None = None):
         "last_result": last_result,
         "runtime_controls": level_config.get("runtime_controls"),
         "auto_trade_enabled": bool(level_config.get("auto_trade_enabled")),
+        "live_execution": execution.live_execution_dependency_status(),
     }
 
 
