@@ -141,6 +141,32 @@ class RuntimeScopeSplitTests(unittest.TestCase):
         self.assertEqual(penny_stats["paper_account"]["runtime_scope"], "penny")
         self.assertEqual(penny_stats["paper_account"]["committed_capital"], 3.0)
 
+    def test_closed_trade_history_api_is_runtime_scoped(self):
+        signal_id = self.db.save_signal(_signal())
+        paper_trade_id = self.db.open_trade(
+            signal_id,
+            size_usd=25,
+            metadata={"runtime_scope": self.db.RUNTIME_SCOPE_PAPER},
+        )
+        penny_trade_id = self.db.open_trade(
+            signal_id,
+            size_usd=3,
+            metadata={
+                "runtime_scope": self.db.RUNTIME_SCOPE_PENNY,
+                "trade_state_mode": self.db.TRADE_STATE_LIVE,
+                "reconciliation_mode": self.db.RECONCILIATION_ORDERS,
+            },
+        )
+        self.db.close_trade(paper_trade_id, 0.55, 0.45, "paper close")
+        self.db.close_trade(penny_trade_id, 0.60, 0.40, "penny close")
+
+        paper_history = self.client.get("/api/trades?status=closed&runtime_scope=paper").json()
+        penny_history = self.client.get("/api/trades?status=closed&runtime_scope=penny").json()
+        self.assertEqual([row["id"] for row in paper_history], [paper_trade_id])
+        self.assertEqual([row["id"] for row in penny_history], [penny_trade_id])
+        self.assertEqual(paper_history[0]["runtime_scope"], "paper")
+        self.assertEqual(penny_history[0]["runtime_scope"], "penny")
+
     def test_autonomy_state_is_split_per_runtime_scope(self):
         import autonomy
 
@@ -169,6 +195,50 @@ class RuntimeScopeSplitTests(unittest.TestCase):
             migrated = autonomy.load_state("penny")
             self.assertEqual(migrated["runtime_scope"], "penny")
             self.assertTrue((tmp_path / "logs" / "autonomy_state.penny.json").exists())
+
+    def test_autonomy_runtime_api_returns_scoped_state_and_limits(self):
+        import autonomy
+
+        autonomy = importlib.reload(autonomy)
+        tmp_path = Path(self.tmpdir.name)
+        with patch.object(autonomy, "STATE_DIR", tmp_path / "logs"), \
+             patch.object(autonomy, "STATE_FILE", tmp_path / "logs" / "autonomy_state.json"), \
+             patch.object(autonomy, "LEGACY_STATE_FILE", tmp_path / "autonomy_state.json"), \
+             patch.object(self.server, "_autonomy_status", {
+                 self.db.RUNTIME_SCOPE_PAPER: {"running": False, "last_result": {"ok": True, "runtime_scope": "paper", "trades_opened": 2, "trades_closed": 1, "duration_secs": 10.5}},
+                 self.db.RUNTIME_SCOPE_PENNY: {"running": True, "last_result": {"ok": True, "runtime_scope": "penny", "trades_opened": 1, "trades_closed": 0, "duration_secs": 4.2}},
+             }):
+            paper_state = autonomy.default_state("paper")
+            penny_state = autonomy.default_state("penny")
+            penny_state["level"] = "penny"
+            autonomy.save_state(paper_state, runtime_scope="paper")
+            autonomy.save_state(penny_state, runtime_scope="penny")
+
+            paper_runtime = self.client.get("/api/autonomy/runtime?runtime_scope=paper").json()
+            penny_runtime = self.client.get("/api/autonomy/runtime?runtime_scope=penny").json()
+
+        self.assertEqual(paper_runtime["runtime_scope"], "paper")
+        self.assertEqual(paper_runtime["state"]["runtime_scope"], "paper")
+        self.assertEqual(paper_runtime["state"]["level"], "paper")
+        self.assertEqual(paper_runtime["max_open"], None)
+        self.assertEqual(paper_runtime["max_open_label"], "No hard cap (cash-limited)")
+        self.assertTrue(paper_runtime["state_file"].endswith("autonomy_state.paper.json"))
+
+        self.assertEqual(penny_runtime["runtime_scope"], "penny")
+        self.assertEqual(penny_runtime["state"]["runtime_scope"], "penny")
+        self.assertEqual(penny_runtime["state"]["level"], "penny")
+        self.assertEqual(penny_runtime["level_config"]["max_open"], 3)
+        self.assertEqual(penny_runtime["max_open"], 3)
+        self.assertEqual(penny_runtime["max_open_label"], "3")
+        self.assertTrue(penny_runtime["running"])
+        self.assertTrue(penny_runtime["state_file"].endswith("autonomy_state.penny.json"))
+
+    def test_dashboard_uses_runtime_scoped_history_and_runtime_fetches(self):
+        html = Path(self.server.DASHBOARD_PATH).read_text()
+        self.assertIn("runtimeScopedUrl('/api/trades', { status: 'closed', limit: 500 }, scope)", html)
+        self.assertIn("fetch(API + runtimeScopedUrl('/api/autonomy/runtime', {}, scope))", html)
+        self.assertIn("if (requestId !== SCOPE_REQUEST_SEQ.history || scope !== ACTIVE_RUNTIME_SCOPE) return;", html)
+        self.assertIn("if (requestId !== SCOPE_REQUEST_SEQ.stats || scope !== ACTIVE_RUNTIME_SCOPE) return;", html)
 
 
 if __name__ == "__main__":

@@ -1681,6 +1681,28 @@ async def autonomy_status(runtime_scope: str | None = None):
     }
 
 
+@app.get("/api/autonomy/runtime")
+async def autonomy_runtime(runtime_scope: str | None = None):
+    """Return the scoped autonomy state/config used by the dashboard."""
+    import autonomy
+
+    runtime_scope = _runtime_scope_param(runtime_scope)
+    state = autonomy.load_state(runtime_scope=runtime_scope)
+    level_key = str((state or {}).get("level") or "").strip().lower()
+    level_config = autonomy.LEVELS.get(level_key, autonomy.LEVELS["scout"])
+    max_open = level_config.get("max_open")
+    return {
+        "runtime_scope": runtime_scope,
+        "state": state,
+        "level_config": level_config,
+        "max_open": max_open,
+        "max_open_label": "No hard cap (cash-limited)" if max_open is None else str(max_open),
+        "state_file": str(autonomy.state_file_for_scope(runtime_scope)),
+        "running": _autonomy_status[runtime_scope]["running"],
+        "last_result": _autonomy_status[runtime_scope]["last_result"],
+    }
+
+
 # ── Copy Trader ───────────────────────────────────────────────────────────────
 
 @app.get("/api/copy/monitor")

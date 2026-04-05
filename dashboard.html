@@ -111,6 +111,59 @@
     line-height: 1.55;
   }
   .account-explainer strong { color: var(--text); }
+  .runtime-scope-panel {
+    margin-top: 12px;
+    padding: 14px;
+    border-radius: 12px;
+    background: rgba(15, 23, 42, 0.56);
+    border: 1px solid rgba(71, 85, 105, 0.38);
+  }
+  .runtime-scope-head {
+    display: flex;
+    justify-content: space-between;
+    gap: 12px;
+    align-items: center;
+    flex-wrap: wrap;
+    margin-bottom: 10px;
+  }
+  .runtime-scope-head strong {
+    font-size: 12px;
+    text-transform: uppercase;
+    letter-spacing: 0.6px;
+  }
+  .runtime-scope-head span {
+    color: var(--text2);
+    font-size: 12px;
+  }
+  .runtime-scope-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+    gap: 10px;
+  }
+  .runtime-scope-metric {
+    border-radius: 10px;
+    border: 1px solid rgba(71, 85, 105, 0.32);
+    background: rgba(15, 23, 42, 0.72);
+    padding: 12px;
+  }
+  .runtime-scope-metric .label {
+    color: var(--text2);
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.6px;
+  }
+  .runtime-scope-metric .value {
+    margin-top: 6px;
+    font-size: 18px;
+    font-weight: 700;
+  }
+  .runtime-scope-metric .meta {
+    margin-top: 6px;
+    color: var(--text2);
+    font-size: 11px;
+    line-height: 1.45;
+    word-break: break-word;
+  }
   .strategy-panel {
     margin-top: 14px;
     border: 1px solid rgba(71, 85, 105, 0.38);
@@ -579,6 +632,35 @@
       <strong>Accounting rule:</strong> opening a paper trade immediately deducts its size from available cash and classifies it as committed capital until the trade closes.
     </div>
 
+    <div class="runtime-scope-panel">
+      <div class="runtime-scope-head">
+        <strong>Scoped Runtime</strong>
+        <span id="runtimeScopeMeta">Loading scoped autonomy state…</span>
+      </div>
+      <div class="runtime-scope-grid">
+        <div class="runtime-scope-metric">
+          <div class="label">Autonomy Level</div>
+          <div class="value" id="runtimeLevelValue">—</div>
+          <div class="meta" id="runtimeLevelMeta">Waiting for scoped level details.</div>
+        </div>
+        <div class="runtime-scope-metric">
+          <div class="label">Max Open</div>
+          <div class="value" id="runtimeMaxOpenValue">—</div>
+          <div class="meta" id="runtimeMaxOpenMeta">Waiting for scoped capacity details.</div>
+        </div>
+        <div class="runtime-scope-metric">
+          <div class="label">Cycle Status</div>
+          <div class="value" id="runtimeCycleValue">—</div>
+          <div class="meta" id="runtimeCycleMeta">Waiting for scoped run status.</div>
+        </div>
+        <div class="runtime-scope-metric">
+          <div class="label">Runtime State File</div>
+          <div class="value" id="runtimeStateFileValue">—</div>
+          <div class="meta" id="runtimeStateFileMeta">Waiting for scoped state file.</div>
+        </div>
+      </div>
+    </div>
+
     <div class="strategy-panel">
       <div class="strategy-panel-head">
         <strong>Strategy Breakdown</strong>
@@ -957,6 +1039,12 @@ const ALL_PANELS = ['signals','locked','weather','whales','copy','paper-attempts
 const UI_PREFS_KEY = 'polymarket-scanner-ui-prefs-v1';
 let latestDailyReportFilename = null;
 let ACTIVE_RUNTIME_SCOPE = 'paper';
+const SCOPE_REQUEST_SEQ = {
+  stats: 0,
+  trades: 0,
+  history: 0,
+  paperAttempts: 0,
+};
 
 // ── Utilities ──────────────────────────────────────────────────────────────
 
@@ -978,9 +1066,9 @@ function fmtClock(ts) {
 
 function getEl(id) { return document.getElementById(id); }
 
-function runtimeScopedUrl(path, params = {}) {
+function runtimeScopedUrl(path, params = {}, runtimeScope = ACTIVE_RUNTIME_SCOPE) {
   const url = new URL(path, window.location.origin);
-  url.searchParams.set('runtime_scope', ACTIVE_RUNTIME_SCOPE);
+  url.searchParams.set('runtime_scope', runtimeScope === 'penny' ? 'penny' : 'paper');
   Object.entries(params || {}).forEach(([key, value]) => {
     if (value == null) return;
     url.searchParams.set(key, value);
@@ -1014,6 +1102,7 @@ function setRuntimeScope(scope) {
   updateRuntimeScopeUi();
   loadStats();
   loadTrades();
+  loadHistory();
   loadPaperAttempts();
 }
 
@@ -1266,13 +1355,18 @@ function switchTab(name) {
 // ── Stats ──────────────────────────────────────────────────────────────────
 
 async function loadStats() {
+  const scope = ACTIVE_RUNTIME_SCOPE;
+  const requestId = ++SCOPE_REQUEST_SEQ.stats;
   try {
-    const [statsR, sizingR] = await Promise.all([
-      fetch(API + runtimeScopedUrl('/api/stats')),
+    const [statsR, sizingR, runtimeR] = await Promise.all([
+      fetch(API + runtimeScopedUrl('/api/stats', {}, scope)),
       fetch(API + '/api/paper-sizing?limit=20'),
+      fetch(API + runtimeScopedUrl('/api/autonomy/runtime', {}, scope)),
     ]);
     const s = await statsR.json();
     const sizingData = await sizingR.json();
+    const runtimeData = await runtimeR.json();
+    if (requestId !== SCOPE_REQUEST_SEQ.stats || scope !== ACTIVE_RUNTIME_SCOPE) return;
     const account = s.paper_account || {};
     const isPaper = (s.runtime_scope || ACTIVE_RUNTIME_SCOPE) === 'paper';
     const strategyBreakdown = (s.strategy_breakdown || account.strategy_breakdown || {});
@@ -1328,6 +1422,7 @@ async function loadStats() {
     document.getElementById('statClosed').textContent = s.closed_trades;
     document.getElementById('statSignals').textContent = s.total_signals;
     document.getElementById('statScans').textContent = s.total_scans;
+    renderRuntimeScopePanel(runtimeData, s, account);
 
     const strategies = strategyBreakdown.strategies || [];
     const body = document.getElementById('strategyBreakdownBody');
@@ -1367,6 +1462,42 @@ async function loadStats() {
 
     drawPnlChart(s.pnl_series);
   } catch(e) {}
+}
+
+function renderRuntimeScopePanel(runtimeData, statsData, account) {
+  const state = runtimeData?.state || {};
+  const levelConfig = runtimeData?.level_config || {};
+  const scope = runtimeData?.runtime_scope || statsData?.runtime_scope || ACTIVE_RUNTIME_SCOPE;
+  const isPaper = scope === 'paper';
+  const levelName = levelConfig?.name || String(state.level || 'unknown');
+  const running = !!runtimeData?.running;
+  const lastResult = runtimeData?.last_result || null;
+  const cycleSummary = running
+    ? 'Running'
+    : (lastResult?.ok === true
+      ? 'Idle'
+      : (lastResult?.ok === false ? 'Error' : 'Idle'));
+  const cycleMeta = running
+    ? `A ${scope} autonomy cycle is currently running.`
+    : lastResult?.ok === true
+      ? `Last ${scope} cycle: ${lastResult.trades_opened || 0} opened, ${lastResult.trades_closed || 0} closed in ${lastResult.duration_secs || 0}s.`
+      : lastResult?.error
+        ? `Last ${scope} cycle failed: ${lastResult.error}`
+        : `No ${scope} autonomy cycle result recorded in this server process yet.`;
+  const maxOpenMeta = isPaper
+    ? 'Paper mode stays cash-limited and intentionally has no hard max-open cap.'
+    : `${account?.open_trades || 0} open penny trade${(account?.open_trades || 0) === 1 ? '' : 's'} currently count against this scoped limit.`;
+  getEl('runtimeScopeMeta').textContent = isPaper
+    ? 'Paper and penny read different state files, trade totals, and autonomy lanes.'
+    : 'Penny view is driven only by penny-scoped state, balances, and open-trade limits.';
+  getEl('runtimeLevelValue').textContent = levelName;
+  getEl('runtimeLevelMeta').textContent = `Level key ${String(state.level || scope).toUpperCase()} · scope ${String(scope).toUpperCase()}`;
+  getEl('runtimeMaxOpenValue').textContent = runtimeData?.max_open_label || '—';
+  getEl('runtimeMaxOpenMeta').textContent = maxOpenMeta;
+  getEl('runtimeCycleValue').textContent = cycleSummary;
+  getEl('runtimeCycleMeta').textContent = cycleMeta;
+  getEl('runtimeStateFileValue').textContent = scope === 'paper' ? 'autonomy_state.paper.json' : 'autonomy_state.penny.json';
+  getEl('runtimeStateFileMeta').textContent = runtimeData?.state_file || '—';
 }
 
 function renderPaperSizingControls(settings) {
@@ -1440,9 +1571,12 @@ function formatAttemptRef(row) {
 }
 
 async function loadPaperAttempts() {
+  const scope = ACTIVE_RUNTIME_SCOPE;
+  const requestId = ++SCOPE_REQUEST_SEQ.paperAttempts;
   try {
-    const r = await fetch(API + runtimeScopedUrl('/api/paper-trade-attempts', { limit: 60 }));
+    const r = await fetch(API + runtimeScopedUrl('/api/paper-trade-attempts', { limit: 60 }, scope));
     const data = await r.json();
+    if (requestId !== SCOPE_REQUEST_SEQ.paperAttempts || scope !== ACTIVE_RUNTIME_SCOPE) return;
     const rows = data.attempts || [];
     const summary = data.summary || {};
     const available = data.available !== false && summary.available !== false;
@@ -1765,13 +1899,16 @@ async function loadWeather() {
 // ── Trades ─────────────────────────────────────────────────────────────────
 
 async function loadTrades() {
+  const scope = ACTIVE_RUNTIME_SCOPE;
+  const requestId = ++SCOPE_REQUEST_SEQ.trades;
   try {
     const [r, monResp] = await Promise.all([
-      fetch(API + runtimeScopedUrl('/api/trades', { status: 'open', limit: 500 })),
-      fetch(API + runtimeScopedUrl('/api/trades/monitor')),
+      fetch(API + runtimeScopedUrl('/api/trades', { status: 'open', limit: 500 }, scope)),
+      fetch(API + runtimeScopedUrl('/api/trades/monitor', {}, scope)),
     ]);
     const trades = await r.json();
     const monitor = monResp.ok ? await monResp.json() : {summary:{available:false}, trades:[]};
+    if (requestId !== SCOPE_REQUEST_SEQ.trades || scope !== ACTIVE_RUNTIME_SCOPE) return;
     const body = document.getElementById('tradesBody');
     const monBox = document.getElementById('tradeMonitorBox');
     const monInfo = document.getElementById('tradeMonitorInfo');
@@ -1874,9 +2011,12 @@ async function loadTrades() {
 }
 
 async function loadHistory() {
+  const scope = ACTIVE_RUNTIME_SCOPE;
+  const requestId = ++SCOPE_REQUEST_SEQ.history;
   try {
-    const r = await fetch(API + '/api/trades?status=closed');
+    const r = await fetch(API + runtimeScopedUrl('/api/trades', { status: 'closed', limit: 500 }, scope));
     const trades = await r.json();
+    if (requestId !== SCOPE_REQUEST_SEQ.history || scope !== ACTIVE_RUNTIME_SCOPE) return;
     const body = document.getElementById('historyBody');
     if (!trades.length) {
       body.innerHTML = '<tr><td colspan="7" class="empty"><div class="icon">◻</div>No closed trades yet.</td></tr>';
