@@ -389,6 +389,31 @@ def run_cycle(state):
     state["runtime_label"] = runtime_tag
     config = get_level_config(level, runtime_scope)
     current_stage = "initializing"
+    cycle_started = time.time()
+    cycle_summary = {
+        "runtime_scope": runtime_scope,
+        "runtime_label": runtime_tag,
+        "level": level,
+        "execution_mode": "synchronous",
+        "weather_phase": {
+            "status": "not_run",
+            "strategy": "weather",
+            "runtime_scope": runtime_scope,
+        },
+        "phases": [],
+    }
+    closed_count = 0
+
+    def _finish_cycle():
+        cycle_summary["duration_secs"] = round(time.time() - cycle_started, 1)
+        cycle_summary["trade_counts"] = {
+            "opened": traded if "traded" in locals() else 0,
+            "closed": closed_count,
+        }
+        return {
+            "state": state,
+            "cycle_summary": cycle_summary,
+        }
 
     try:
         log.info(
@@ -435,7 +460,7 @@ def run_cycle(state):
                     event="Autonomy scan",
                     phase=current_stage,
                 )
-                return state
+                return _finish_cycle()
 
         opportunities = scan_result["opportunities"]
         scan_duration = round(time.time() - scan_started, 1)
@@ -691,6 +716,7 @@ def run_cycle(state):
         log.info("Step 3: Checking for auto-closes...")
         try:
             closed = tracker.auto_close_trades(z_threshold=0.5, runtime_scope=runtime_scope)
+            closed_count = len(closed)
             for c in closed:
                 pnl = c["pnl_usd"]
                 state["trades_at_level"] += 1
@@ -736,7 +762,7 @@ def run_cycle(state):
             journal({"action": "scout_only", "level": level,
                      "reason": "Level does not permit trading"})
             save_state(state)
-            return state
+            return _finish_cycle()
 
         if not config.get("auto_trade_enabled", True):
             log.info("Step 4: Auto-trading disabled for scope=%s level=%s", runtime_scope, level)
@@ -757,7 +783,7 @@ def run_cycle(state):
                 details={"runtime_controls": config.get("runtime_controls")},
             )
             save_state(state)
-            return state
+            return _finish_cycle()
 
         open_trades = db.get_trades(status="open", limit=None, runtime_scope=runtime_scope)
         open_count = len(open_trades)
@@ -779,7 +805,7 @@ def run_cycle(state):
                 details={"open_count": open_count, "max_open": max_open},
             )
             save_state(state)
-            return state
+            return _finish_cycle()
 
         # Determine trade size
         if level == "book":
@@ -1034,8 +1060,40 @@ def run_cycle(state):
         open_count = len(open_trades)
         slots_remaining = (max_open - open_count) if max_open is not None else None
 
+        weather_phase_started = time.time()
+        weather_phase = {
+            "name": "weather_scan",
+            "strategy": "weather",
+            "runtime_scope": runtime_scope,
+            "status": "running",
+            "started_at": weather_phase_started,
+            "result_counts": {
+                "opportunities": 0,
+                "tradeable": 0,
+                "saved": 0,
+                "traded": 0,
+                "exact_temp_opportunities": 0,
+            },
+        }
+        cycle_summary["phases"].append(weather_phase)
+        cycle_summary["weather_phase"] = weather_phase
+        log.info(
+            "Step 4b: Weather phase start scope=%s mode=%s",
+            runtime_scope,
+            "paper-scan" if paper_only_runtime(runtime_scope) else "skip-paper-only",
+        )
+
         if not paper_only_runtime(runtime_scope):
-            log.info("Step 4b: Skipping paper-only weather strategy for scope=%s", runtime_scope)
+            weather_phase["status"] = "skipped"
+            weather_phase["reason_code"] = "paper_only_scope_disabled"
+            weather_phase["reason"] = f"Weather auto-trading is paper-only and is disabled for scope={runtime_scope}."
+            weather_phase["duration_secs"] = round(time.time() - weather_phase_started, 1)
+            log.info(
+                "Step 4b: Weather phase complete scope=%s status=skipped duration=%.1fs opportunities=0 tradeable=0 traded=0 reason=%s",
+                runtime_scope,
+                weather_phase["duration_secs"],
+                weather_phase["reason_code"],
+            )
             journal({
                 "action": "paper_only_step_skipped",
                 "level": level,
@@ -1056,6 +1114,8 @@ def run_cycle(state):
                     include_exact_temp=include_exact_temp,
                 )
                 tradeable_weather = [o for o in weather_opps if o.get("tradeable")]
+                weather_phase["result_counts"]["opportunities"] = len(weather_opps)
+                weather_phase["result_counts"]["tradeable"] = len(tradeable_weather)
                 if include_exact_temp and not exact_temp_autotrade:
                     tradeable_weather = [
                         o for o in tradeable_weather
@@ -1066,6 +1126,7 @@ def run_cycle(state):
                 for w_opp in candidates:
                     try:
                         w_id = db.save_weather_signal(w_opp)
+                        weather_phase["result_counts"]["saved"] += 1
                         trade_size = size_usd if level != "book" else 20
                         sizing_decision = paper_sizing.build_paper_sizing_decision(
                             "weather",
@@ -1132,6 +1193,7 @@ def run_cycle(state):
                                 details={"paper_sizing": sizing_decision},
                             )
                             weather_traded += 1
+                            weather_phase["result_counts"]["traded"] = weather_traded
                             journal({
                                 "action": "trade_opened",
                                 "level": level,
@@ -1176,9 +1238,30 @@ def run_cycle(state):
                             event=w_opp.get("event", w_opp.get("market", "")),
                             phase=current_stage,
                         )
+                weather_phase["status"] = "completed"
+                weather_phase["duration_secs"] = round(time.time() - weather_phase_started, 1)
+                weather_phase["exact_temp_enabled"] = bool(include_exact_temp)
+                weather_phase["exact_temp_autotrade_enabled"] = bool(exact_temp_autotrade)
+                weather_phase["result_counts"]["exact_temp_opportunities"] = sum(
+                    1
+                    for opp in weather_opps
+                    if (opp.get("strategy_name") or opp.get("market_family")) == "weather_exact_temp"
+                )
                 if weather_traded:
                     log.info("Step 4b: Opened %d weather trades", weather_traded)
+                log.info(
+                    "Step 4b: Weather phase complete scope=%s status=completed duration=%.1fs opportunities=%d tradeable=%d traded=%d",
+                    runtime_scope,
+                    weather_phase["duration_secs"],
+                    weather_phase["result_counts"]["opportunities"],
+                    weather_phase["result_counts"]["tradeable"],
+                    weather_phase["result_counts"]["traded"],
+                )
             except Exception as e:
+                weather_phase["status"] = "error"
+                weather_phase["reason_code"] = "weather_scan_failed"
+                weather_phase["reason"] = str(e)
+                weather_phase["duration_secs"] = round(time.time() - weather_phase_started, 1)
                 log.debug("Weather scan skipped during %s: %s", current_stage, e)
                 record_attempt(
                     level,
@@ -1189,6 +1272,26 @@ def run_cycle(state):
                     event="Weather scan",
                     phase=current_stage,
                 )
+                log.info(
+                    "Step 4b: Weather phase complete scope=%s status=error duration=%.1fs opportunities=%d tradeable=%d traded=%d reason=%s",
+                    runtime_scope,
+                    weather_phase["duration_secs"],
+                    weather_phase["result_counts"]["opportunities"],
+                    weather_phase["result_counts"]["tradeable"],
+                    weather_phase["result_counts"]["traded"],
+                    weather_phase["reason_code"],
+                )
+        else:
+            weather_phase["status"] = "skipped"
+            weather_phase["reason_code"] = "max_open_reached_before_weather"
+            weather_phase["reason"] = f"No weather slots remain for scope={runtime_scope}."
+            weather_phase["duration_secs"] = round(time.time() - weather_phase_started, 1)
+            log.info(
+                "Step 4b: Weather phase complete scope=%s status=skipped duration=%.1fs opportunities=0 tradeable=0 traded=0 reason=%s",
+                runtime_scope,
+                weather_phase["duration_secs"],
+                weather_phase["reason_code"],
+            )
 
         # Step 4c: Longshot bias scanner (scan for NO maker opportunities on 3–15¢ markets)
         current_stage = "step 4c longshot scan"
@@ -1729,7 +1832,7 @@ def run_cycle(state):
             open_count + traded,
             perf["total_pnl"],
         )
-        return state
+        return _finish_cycle()
     except Exception:
         log.exception("Autonomy cycle failed during %s", current_stage)
         record_attempt(

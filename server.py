@@ -1679,16 +1679,21 @@ def _run_autonomy_background(runtime_scope: str):
     try:
         stats_before = db.get_stats(runtime_scope=runtime_scope)
         state = autonomy.load_state(runtime_scope=runtime_scope)
-        autonomy.run_cycle(state)
+        cycle_run = autonomy.run_cycle(state) or {}
+        cycle_summary = cycle_run.get("cycle_summary") or {}
         stats_after = db.get_stats(runtime_scope=runtime_scope)
         duration = round(time.time() - t0, 1)
         _autonomy_status[runtime_scope]["last_result"] = {
             "ok": True,
             "runtime_scope": runtime_scope,
             "duration_secs": duration,
+            "execution_mode": "background",
+            "all_enabled_phases_completed": True,
             "signals_found": stats_after.get("total_signals", 0) - stats_before.get("total_signals", 0),
             "trades_opened": stats_after.get("open_trades", 0) - stats_before.get("open_trades", 0),
             "trades_closed": stats_after.get("closed_trades", 0) - stats_before.get("closed_trades", 0),
+            "phases": cycle_summary.get("phases", []),
+            "weather_phase": cycle_summary.get("weather_phase"),
         }
         log.info("Autonomy cycle complete in %.1fs for scope=%s", duration, runtime_scope)
     except Exception as e:
@@ -1718,7 +1723,12 @@ async def run_autonomy(runtime_scope: str | None = None):
     thread = threading.Thread(target=_run_autonomy_background, args=(runtime_scope,), daemon=True)
     thread.start()
     log.info("Autonomy cycle triggered from dashboard (background) scope=%s", runtime_scope)
-    return {"ok": True, "message": "Autonomy cycle started — watch Console tab for progress", "runtime_scope": runtime_scope}
+    return {
+        "ok": True,
+        "message": "Autonomy cycle started in background; the dashboard will poll until all enabled phases finish.",
+        "runtime_scope": runtime_scope,
+        "execution_mode": "background",
+    }
 
 
 @app.get("/api/autonomy/status")

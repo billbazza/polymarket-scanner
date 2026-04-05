@@ -466,6 +466,14 @@ class RuntimeScopeSplitTests(unittest.TestCase):
             "pairs_tested": 0,
             "pairs_cointegrated": 0,
         }), \
+             patch.object(autonomy, "get_level_config", return_value={
+                 "name": "Penny Trader",
+                 "can_trade": True,
+                 "auto_trade_enabled": True,
+                 "max_open": 3,
+                 "size_usd": 3,
+                 "runtime_controls": {"auto_trade_enabled": True},
+             }), \
              patch.object(autonomy.db, "save_scan_run"), \
              patch.object(autonomy.tracker, "refresh_open_trades", return_value=[]), \
              patch.object(autonomy.execution, "manage_open_orders", return_value={"filled": 0, "cancelled": 0}), \
@@ -483,7 +491,7 @@ class RuntimeScopeSplitTests(unittest.TestCase):
                  "near_certainty_scanner": fake_near_certainty,
                  "whale_detector": fake_whale,
              }, clear=False):
-            autonomy.run_cycle(state)
+            result = autonomy.run_cycle(state)
 
         skipped = [entry for entry in journal_entries if entry.get("action") == "paper_only_step_skipped"]
         self.assertEqual(
@@ -491,6 +499,43 @@ class RuntimeScopeSplitTests(unittest.TestCase):
             {"weather", "copy", "wallet_discovery"},
         )
         self.assertTrue(all(entry.get("runtime_scope") == "penny" for entry in skipped))
+        weather_phase = (result or {}).get("cycle_summary", {}).get("weather_phase", {})
+        self.assertEqual(weather_phase.get("status"), "skipped")
+        self.assertEqual(weather_phase.get("reason_code"), "paper_only_scope_disabled")
+
+    def test_autonomy_background_status_includes_weather_phase_summary(self):
+        import autonomy
+
+        autonomy = importlib.reload(autonomy)
+        with patch.object(self.server.db, "get_stats", side_effect=[
+            {"total_signals": 5, "open_trades": 2, "closed_trades": 7},
+            {"total_signals": 8, "open_trades": 3, "closed_trades": 9},
+        ]), \
+             patch.object(autonomy, "load_state", return_value={"level": "penny", "runtime_scope": "penny"}), \
+             patch.object(autonomy, "run_cycle", return_value={
+                 "state": {"level": "penny", "runtime_scope": "penny"},
+                 "cycle_summary": {
+                     "weather_phase": {
+                         "status": "skipped",
+                         "reason_code": "paper_only_scope_disabled",
+                         "reason": "Weather auto-trading is paper-only and is disabled for scope=penny.",
+                         "duration_secs": 0.0,
+                         "result_counts": {"opportunities": 0, "tradeable": 0, "traded": 0},
+                     },
+                     "phases": [{"name": "weather_scan", "status": "skipped"}],
+                 },
+             }):
+            self.server._run_autonomy_background("penny")
+
+        last_result = self.server._autonomy_status["penny"]["last_result"]
+        self.assertTrue(last_result["ok"])
+        self.assertEqual(last_result["execution_mode"], "background")
+        self.assertTrue(last_result["all_enabled_phases_completed"])
+        self.assertEqual(last_result["signals_found"], 3)
+        self.assertEqual(last_result["trades_opened"], 1)
+        self.assertEqual(last_result["trades_closed"], 2)
+        self.assertEqual(last_result["weather_phase"]["status"], "skipped")
+        self.assertEqual(last_result["weather_phase"]["reason_code"], "paper_only_scope_disabled")
 
     def test_autonomy_runtime_api_returns_scoped_state_and_limits(self):
         import autonomy
@@ -544,6 +589,8 @@ class RuntimeScopeSplitTests(unittest.TestCase):
         self.assertIn("Penny mode fails closed", html)
         self.assertIn("runtimeData?.max_open_usage || runtimeData?.max_open_label", html)
         self.assertIn("acceptance && acceptance.all_passed === false", html)
+        self.assertIn("Weather phase: skipped", html)
+        self.assertIn("cycle started in background", html)
 
 
 if __name__ == "__main__":

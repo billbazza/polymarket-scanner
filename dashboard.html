@@ -1610,6 +1610,26 @@ function renderBlockedPennyAccount(account, runtimeData, statsData) {
   renderRuntimeScopePanel(runtimeData, statsData, account);
 }
 
+function formatWeatherPhaseStatus(lastResult, scope) {
+  const weather = lastResult?.weather_phase;
+  if (!weather) return `Weather phase: no ${scope} cycle weather status recorded yet.`;
+  const duration = Number(weather.duration_secs || 0).toFixed(1);
+  const counts = weather.result_counts || {};
+  const opportunities = Number(counts.opportunities || 0);
+  const tradeable = Number(counts.tradeable || 0);
+  const traded = Number(counts.traded || 0);
+  if (weather.status === 'completed') {
+    return `Weather phase: completed in ${duration}s with ${opportunities} opportunities, ${tradeable} tradeable, ${traded} traded.`;
+  }
+  if (weather.status === 'skipped') {
+    return `Weather phase: skipped in ${duration}s. ${weather.reason || 'Disabled for this runtime scope.'}`;
+  }
+  if (weather.status === 'error') {
+    return `Weather phase: failed in ${duration}s. ${weather.reason || weather.reason_code || 'Unknown error.'}`;
+  }
+  return `Weather phase: ${String(weather.status || 'not_run')}.`;
+}
+
 function renderRuntimeScopePanel(runtimeData, statsData, account) {
   const state = runtimeData?.state || {};
   const levelConfig = runtimeData?.level_config || {};
@@ -1626,9 +1646,9 @@ function renderRuntimeScopePanel(runtimeData, statsData, account) {
       ? 'Idle'
       : (lastResult?.ok === false ? 'Error' : 'Idle'));
   const cycleMeta = running
-    ? `A ${scope} autonomy cycle is currently running.`
+    ? `A ${scope} autonomy cycle is currently running in background; this panel updates after all enabled phases finish.`
     : lastResult?.ok === true
-        ? `Last ${scope} cycle: ${lastResult.trades_opened || 0} opened, ${lastResult.trades_closed || 0} closed in ${lastResult.duration_secs || 0}s.`
+        ? `Last ${scope} cycle: ${lastResult.trades_opened || 0} opened, ${lastResult.trades_closed || 0} closed in ${lastResult.duration_secs || 0}s. ${formatWeatherPhaseStatus(lastResult, scope)}`
         : lastResult?.error
           ? `Last ${scope} cycle failed: ${lastResult.error}`
           : `No ${scope} autonomy cycle result recorded in this server process yet.`;
@@ -2400,7 +2420,7 @@ async function runAutoTrade() {
       toast('Auto trade: ' + data.error);
       btn.disabled = false; updateRuntimeScopeUi(); return;
     }
-    toast(`${ACTIVE_RUNTIME_SCOPE === 'paper' ? 'Paper' : 'Penny'} cycle started — watch Console tab...`);
+    toast(`${ACTIVE_RUNTIME_SCOPE === 'paper' ? 'Paper' : 'Penny'} cycle started in background — dashboard waits for all enabled phases.`);
     const poll = setInterval(async () => {
       try {
         const sr = await fetch(API + runtimeScopedUrl('/api/autonomy/status'));
@@ -2410,7 +2430,7 @@ async function runAutoTrade() {
           btn.disabled = false; updateRuntimeScopeUi();
           const res = status.last_result;
           if (res && res.ok)
-            toast(`Done: ${res.signals_found} signals, ${res.trades_opened} opened, ${res.trades_closed} closed (${res.duration_secs}s)`);
+            toast(`Done: ${res.signals_found} signals, ${res.trades_opened} opened, ${res.trades_closed} closed (${res.duration_secs}s). ${formatWeatherPhaseStatus(res, ACTIVE_RUNTIME_SCOPE)}`);
           loadStats(); loadSignals(); loadTrades(); loadWeather(); loadPaperAttempts();
         }
       } catch(e) { clearInterval(poll); btn.disabled = false; updateRuntimeScopeUi(); }

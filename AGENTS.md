@@ -46,6 +46,7 @@ Monitoring:    log_setup.py → logs/scanner.log + logs/journal.jsonl (trade aud
 
 ### Autonomy Loop (every 30 min via launchd)
 `autonomy.py` levels: `scout` (scan only) → `paper` (auto paper-trade A+ signals) → `penny` (real $1-5) → `book` (Kelly-sized). Paper and penny now persist isolated runtime state and scoped trade/accounting views, so paper experiments can stay open without consuming penny `max_open` capacity. Unattended launchd runs must use explicit scope selection via `AUTONOMY_BACKGROUND_SCOPES`; the default is paper-only, concurrent paper+penny loops are opt-in, and every cycle must log its `scope`/`runtime_label`. Paper-only strategy steps (weather auto-trading, copy mirroring, wallet discovery, wallet monitor) must stay disabled outside the paper runtime unless intentionally redesigned for a separate penny-safe lane. Each cycle: scan pairs → scan weather → refresh open trades → auto-close reverted/resolved trades → open new trades up to the scoped `max_open`.
+Manual dashboard-triggered autonomy runs (`POST /api/autonomy`) execute in a background thread, so runtime status/UI must clearly label that background execution and only report completion after all enabled phases finish. For penny/book scopes, the weather phase must be logged explicitly as `skipped` with timing/reason metadata because weather auto-trading remains paper-only.
 
 ## Key Conventions
 
@@ -178,6 +179,7 @@ Process environment variables with the same names remain valid as explicit one-s
 - `STAGE2_POLYGON_GATING` — `1`/`true`/`yes` turns on Stage 2 Polygon gating; paper trades log the Polygon block snapshot, chain parity, and dual-leg slippage before execution.
 
 ## Recent Fix Logs
+- `fix_logs/2026-04-05-penny-weather-phase-runtime-visibility.md`: made manual dashboard autonomy runs report their background execution explicitly, added structured weather-phase timing/count telemetry to cycle status, and now log penny/book weather phases as an explicit paper-only skip instead of a silent omission.
 - `fix_logs/2026-04-05-autonomy-runtime-scheduler-isolation.md`: added explicit background-scope configuration for unattended autonomy, labeled every autonomy journal lane with its runtime scope, gated paper-only strategy steps out of the penny runtime, and tied the singleton wallet monitor to the paper background scope so penny operation no longer inherits paper loops unless intentionally configured.
 - `fix_logs/2026-04-05-penny-live-book-controls-and-ledger.md`: added scoped penny auto-trade/max-open controls, routed manual penny entry/close actions through the live execution path, persisted live order/fee metadata on trades, and exposed penny HMRC reporting inputs without mixing paper data.
 - `fix_logs/2026-04-04-weather-guard-state.md`: added a persisted guard-state machine to keep the low-guardrail regime active until repeated stop-loss failures escalate the thresholds, and now log both the current and legacy blockers so we always know which filters would have vetoed the trade.
