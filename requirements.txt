@@ -10,3 +10,4 @@ anthropic
 openai
 xai_sdk
 web3
+py-clob-client
