@@ -20,5 +20,5 @@ System shows strong performance with 70.6% win rate and $396 realized PnL on $20
 
 ## Top 5 Improvements
 - [ ] Activate whale strategy implementation - missing opportunities from 10+ high-suspicion alerts - low bet bids, paper mode only?
-- [ ] Tighten weather stop-losses - recent 18-24% drawdowns suggest stops too wide - i think this is done and set to 15%?
+- [ ] Tighten weather stop-losses - recent 18-24% drawdowns suggest stops too wide - fix-log reference or a clear “unverified”.?
 - [ ] Reduce cointegration rejection threshold - 99.7% rejection rate limiting profitable setups
