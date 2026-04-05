@@ -36,6 +36,9 @@ CONFIG_NAMES = {
     "OPENAI_API_KEY",
     "OPENAI_BASE_URL",
     "PERPLEXITY_API_KEY",
+    "POLYMARKET_CLOB_API_KEY",
+    "POLYMARKET_CLOB_API_PASSPHRASE",
+    "POLYMARKET_CLOB_API_SECRET",
     "POLYMARKET_PRIVATE_KEY",
     "SCANNER_API_KEY",
     "SCANNER_API_KEYS",
@@ -56,6 +59,9 @@ SECRET_NAMES = {
     "ANTHROPIC_API_KEY",
     "OPENAI_API_KEY",
     "PERPLEXITY_API_KEY",
+    "POLYMARKET_CLOB_API_KEY",
+    "POLYMARKET_CLOB_API_PASSPHRASE",
+    "POLYMARKET_CLOB_API_SECRET",
     "POLYMARKET_PRIVATE_KEY",
     "SCANNER_API_KEY",
     "SCANNER_API_KEYS",
@@ -170,6 +176,13 @@ def runtime_status() -> dict:
         "security_cli_available": _security_cli_available(),
         "env_overrides": env_overrides,
         "keychain_entries": keychain_entries,
+        "wallet_configured": bool(get("POLYMARKET_PRIVATE_KEY")),
+        "polygon_rpc_configured": bool(get("ALCHEMY_API_KEY")),
+        "clob_api_credentials_configured": bool(
+            get("POLYMARKET_CLOB_API_KEY")
+            and get("POLYMARKET_CLOB_API_SECRET")
+            and get("POLYMARKET_CLOB_API_PASSPHRASE")
+        ),
         "live_ready": bool(get("POLYMARKET_PRIVATE_KEY") and get("ALCHEMY_API_KEY")),
     }
 
@@ -178,12 +191,15 @@ def log_runtime_status(context: str) -> dict:
     """Emit a startup/runtime audit line without exposing secret values."""
     status = runtime_status()
     log.info(
-        "Runtime config (%s): service=%s keychain_supported=%s env_overrides=%s keychain_entries=%s live_ready=%s",
+        "Runtime config (%s): service=%s keychain_supported=%s env_overrides=%s keychain_entries=%s wallet_configured=%s polygon_rpc_configured=%s clob_api_credentials_configured=%s live_ready=%s",
         context,
         status["service"],
         status["keychain_supported"],
         ",".join(status["env_overrides"]) or "none",
         ",".join(status["keychain_entries"]) or "none",
+        status["wallet_configured"],
+        status["polygon_rpc_configured"],
+        status["clob_api_credentials_configured"],
         status["live_ready"],
     )
     if not status["keychain_supported"]:

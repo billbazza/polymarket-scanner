@@ -33,8 +33,13 @@ security add-generic-password -U -s polymarket-scanner -a TELEGRAM_BOT_TOKEN -w 
 security add-generic-password -U -s polymarket-scanner -a TELEGRAM_CHAT_ID -w '...'
 security add-generic-password -U -s polymarket-scanner -a ALCHEMY_API_KEY -w '...'
 security add-generic-password -U -s polymarket-scanner -a POLYMARKET_PRIVATE_KEY -w '0x...'
+security add-generic-password -U -s polymarket-scanner -a POLYMARKET_CLOB_API_KEY -w '...'
+security add-generic-password -U -s polymarket-scanner -a POLYMARKET_CLOB_API_SECRET -w '...'
+security add-generic-password -U -s polymarket-scanner -a POLYMARKET_CLOB_API_PASSPHRASE -w '...'
 security add-generic-password -U -s polymarket-scanner -a PERPLEXITY_API_KEY -w 'pplx-...'
 ```
+
+The three `POLYMARKET_CLOB_API_*` entries are optional. If all three are absent, the live runtime will create or derive CLOB API credentials from `POLYMARKET_PRIVATE_KEY`. If you set any of them, set all three together; partial overrides now fail closed with an explicit operator-facing auth error.
 
 ## Read Or Delete Entries
 ```bash

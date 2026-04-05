@@ -37,6 +37,11 @@ ORDER_TTL_HOURS = 4
 
 LIVE_CLOB_HOST = "https://clob.polymarket.com"
 LIVE_CHAIN_ID = 137
+POLYMARKET_CLOB_CONFIG_NAMES = (
+    "POLYMARKET_CLOB_API_KEY",
+    "POLYMARKET_CLOB_API_SECRET",
+    "POLYMARKET_CLOB_API_PASSPHRASE",
+)
 
 
 def _stage2_enabled():
@@ -377,8 +382,44 @@ def _package_health(import_name: str, dist_name: str | None = None) -> dict:
     return package
 
 
+def _live_clob_auth_presence() -> dict:
+    explicit_presence = {
+        "api_key": bool(runtime_config.get("POLYMARKET_CLOB_API_KEY")),
+        "api_secret": bool(runtime_config.get("POLYMARKET_CLOB_API_SECRET")),
+        "api_passphrase": bool(runtime_config.get("POLYMARKET_CLOB_API_PASSPHRASE")),
+    }
+    explicit_present_fields = [name for name, present in explicit_presence.items() if present]
+    explicit_missing_fields = [name for name, present in explicit_presence.items() if not present]
+    explicit_complete = not explicit_missing_fields
+    explicit_partial = bool(explicit_present_fields) and not explicit_complete
+    private_key_configured = bool(runtime_config.get("POLYMARKET_PRIVATE_KEY"))
+    return {
+        "private_key_configured": private_key_configured,
+        "explicit_api_key_configured": explicit_presence["api_key"],
+        "explicit_api_secret_configured": explicit_presence["api_secret"],
+        "explicit_api_passphrase_configured": explicit_presence["api_passphrase"],
+        "explicit_api_credentials_configured": explicit_complete,
+        "explicit_api_credentials_partial": explicit_partial,
+        "explicit_present_fields": explicit_present_fields,
+        "explicit_missing_fields": explicit_missing_fields,
+        "can_attempt_credential_derivation": private_key_configured and not explicit_partial,
+        "credential_source": "explicit" if explicit_complete else "derivation_required",
+        "order_submission_ready": explicit_complete,
+    }
+
+
+def _live_execution_status_with_auth(auth_status: dict | None = None) -> dict:
+    status = live_execution_dependency_status()
+    status["auth"] = auth_status or _live_clob_auth_presence()
+    status["order_submission_ready"] = bool(
+        status.get("ok") and status["auth"].get("order_submission_ready")
+    )
+    return status
+
+
 def live_execution_dependency_status() -> dict:
     """Return operator-facing health for the current live execution runtime."""
+    auth = _live_clob_auth_presence()
     packages = {
         "py_clob_client": _package_health("py_clob_client", "py-clob-client"),
         "web3": _package_health("web3", "web3"),
@@ -408,6 +449,8 @@ def live_execution_dependency_status() -> dict:
         "private_key_configured": bool(runtime_config.get("POLYMARKET_PRIVATE_KEY")),
         "clob_host": LIVE_CLOB_HOST,
         "chain_id": LIVE_CHAIN_ID,
+        "auth": auth,
+        "order_submission_ready": bool((not missing_packages) and auth.get("order_submission_ready")),
         "packages": packages,
         "missing_packages": missing_packages,
     }
@@ -431,6 +474,17 @@ def log_live_execution_dependency_status(context: str) -> dict:
             status["python_executable"],
             ",".join(status["missing_packages"]) or "unknown",
         )
+    auth = status.get("auth") or _live_clob_auth_presence()
+    log.info(
+        "Live execution auth (%s): private_key=%s explicit_creds=%s partial_creds=%s missing_fields=%s source=%s order_submission_ready=%s",
+        context,
+        auth.get("private_key_configured"),
+        auth.get("explicit_api_credentials_configured"),
+        auth.get("explicit_api_credentials_partial"),
+        ",".join(auth.get("explicit_missing_fields") or []) or "none",
+        auth.get("credential_source"),
+        auth.get("order_submission_ready"),
+    )
     return status
 
 
@@ -448,9 +502,104 @@ def _live_client_failure(
         error,
         runtime_scope=runtime_scope,
         blocker_source=blocker_source,
-        live_execution=live_execution_dependency_status(),
+        live_execution=_live_execution_status_with_auth(extra.get("auth")),
         **extra,
     )
+
+
+def _explicit_live_clob_api_creds():
+    values = {
+        "api_key": runtime_config.get("POLYMARKET_CLOB_API_KEY"),
+        "api_secret": runtime_config.get("POLYMARKET_CLOB_API_SECRET"),
+        "api_passphrase": runtime_config.get("POLYMARKET_CLOB_API_PASSPHRASE"),
+    }
+    present_fields = [name for name, value in values.items() if value]
+    missing_fields = [name for name, value in values.items() if not value]
+    if not present_fields:
+        return None, {
+            "credential_source": "derivation_required",
+            "explicit_api_credentials_configured": False,
+            "explicit_api_credentials_partial": False,
+            "explicit_present_fields": [],
+            "explicit_missing_fields": missing_fields,
+        }
+    if missing_fields:
+        return None, {
+            "credential_source": "explicit_incomplete",
+            "explicit_api_credentials_configured": False,
+            "explicit_api_credentials_partial": True,
+            "explicit_present_fields": present_fields,
+            "explicit_missing_fields": missing_fields,
+        }
+
+    from py_clob_client.clob_types import ApiCreds
+
+    return ApiCreds(
+        api_key=values["api_key"],
+        api_secret=values["api_secret"],
+        api_passphrase=values["api_passphrase"],
+    ), {
+        "credential_source": "explicit",
+        "explicit_api_credentials_configured": True,
+        "explicit_api_credentials_partial": False,
+        "explicit_present_fields": present_fields,
+        "explicit_missing_fields": [],
+    }
+
+
+def _resolve_live_clob_auth(client) -> tuple[object | None, dict]:
+    auth = _live_clob_auth_presence()
+    creds, explicit_status = _explicit_live_clob_api_creds()
+    auth.update(explicit_status)
+    if creds is not None:
+        auth["order_submission_ready"] = True
+        auth["credential_source"] = "explicit"
+        return creds, auth
+    if auth.get("explicit_api_credentials_partial"):
+        auth["order_submission_ready"] = False
+        auth["error"] = (
+            "Incomplete explicit Polymarket CLOB API credentials in the server runtime. "
+            "Set POLYMARKET_CLOB_API_KEY, POLYMARKET_CLOB_API_SECRET, and "
+            "POLYMARKET_CLOB_API_PASSPHRASE together or remove the partial override "
+            "so the runtime can derive credentials from POLYMARKET_PRIVATE_KEY."
+        )
+        return None, auth
+
+    derive_error = None
+    try:
+        creds = client.derive_api_key()
+    except Exception as exc:
+        derive_error = str(exc)
+        creds = None
+
+    if creds is None:
+        try:
+            creds = client.create_api_key()
+        except Exception as exc:
+            auth["credential_source"] = "derivation_failed"
+            auth["order_submission_ready"] = False
+            auth["derivation_error"] = derive_error or str(exc)
+            auth["error"] = (
+                "Polymarket order submission credentials are unavailable in the server runtime. "
+                "The runtime has the wallet key but could not derive an existing CLOB API key "
+                "or create a new one. "
+                f"derive_error={derive_error or 'none'} create_error={exc}"
+            )
+            return None, auth
+
+    if not creds or not getattr(creds, "api_key", None) or not getattr(creds, "api_secret", None) or not getattr(creds, "api_passphrase", None):
+        auth["credential_source"] = "derivation_failed"
+        auth["order_submission_ready"] = False
+        auth["derivation_error"] = "SDK returned empty CLOB API credentials"
+        auth["error"] = (
+            "Polymarket order submission credentials are unavailable in the server runtime. "
+            "The SDK returned empty CLOB API credentials during create/derive."
+        )
+        return None, auth
+
+    auth["credential_source"] = "derived"
+    auth["order_submission_ready"] = True
+    return creds, auth
 
 
 def _create_live_clob_client(runtime_scope: str, *, blocker_source: str):
@@ -492,6 +641,36 @@ def _create_live_clob_client(runtime_scope: str, *, blocker_source: str):
             error=f"Live execution client failed to initialize: {exc}",
             blocker_source=blocker_source,
         )
+    creds, auth = _resolve_live_clob_auth(client)
+    if not creds:
+        return None, _live_client_failure(
+            runtime_scope,
+            reason_code="clob_api_auth_unavailable",
+            error=auth.get("error") or "Polymarket order submission credentials unavailable.",
+            blocker_source=blocker_source,
+            auth=auth,
+        )
+    try:
+        client.set_api_creds(creds)
+    except Exception as exc:
+        auth["credential_source"] = auth.get("credential_source") or "unknown"
+        auth["order_submission_ready"] = False
+        auth["error"] = f"Failed to load Polymarket CLOB API credentials into the live client: {exc}"
+        return None, _live_client_failure(
+            runtime_scope,
+            reason_code="clob_api_auth_unavailable",
+            error=auth["error"],
+            blocker_source=blocker_source,
+            auth=auth,
+        )
+    auth["order_submission_ready"] = True
+    log.info(
+        "Live CLOB auth ready runtime_scope=%s blocker_source=%s source=%s explicit_creds=%s",
+        runtime_scope,
+        blocker_source,
+        auth.get("credential_source"),
+        auth.get("explicit_api_credentials_configured"),
+    )
     return client, None
 
 

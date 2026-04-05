@@ -1586,6 +1586,7 @@ async def create_trade(signal_id: int, size_usd: float = 100, runtime_scope: str
         if (result.get("reason_code") or "") in {
             "clob_client_unavailable",
             "clob_client_init_failed",
+            "clob_api_auth_unavailable",
         }:
             status_code = 503
         return JSONResponse(
@@ -1711,6 +1712,7 @@ async def open_weather_trade(signal_id: int, size_usd: float = 20, runtime_scope
         if (result.get("reason_code") or decision.get("reason_code")) in {
             "clob_client_unavailable",
             "clob_client_init_failed",
+            "clob_api_auth_unavailable",
             "private_key_missing",
         }:
             status_code = 503
