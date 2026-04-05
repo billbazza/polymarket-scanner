@@ -6,6 +6,7 @@ Paper mode (default): simulates orders against current midpoint prices.
 Live mode: uses py-clob-client for real orders on Polymarket (requires POLYMARKET_PRIVATE_KEY).
 """
 import importlib.util
+import json
 import logging
 import site
 import sys
@@ -274,6 +275,56 @@ def _extract_tx_hash(order_payload):
 def _estimate_leg_fee_usd(exec_mode: str, notional_usd: float) -> float:
     fee_rate = 0.02 if exec_mode == "taker" else 0.0
     return round(float(notional_usd or 0.0) * fee_rate, 2)
+
+
+def _build_live_order_request(token_id, side, price, size_shares) -> dict:
+    """Build a normalized live order payload for logging and typed client args."""
+    normalized_token = api.normalize_token_id(token_id)
+    return {
+        "token_id": normalized_token,
+        "side": str(side or "").upper(),
+        "price": round(float(price or 0.0), 6),
+        "size_shares": round(float(size_shares or 0.0), 6),
+    }
+
+
+def _build_live_order_args(token_id, side, price, size_shares):
+    """Construct the typed py-clob-client order args object expected by create_and_post_order."""
+    order_request = _build_live_order_request(token_id, side, price, size_shares)
+    if not order_request["token_id"]:
+        raise ValueError(f"Live order is missing a valid token_id: {token_id!r}")
+    if order_request["price"] <= 0:
+        raise ValueError(f"Live order price must be > 0: {order_request['price']}")
+    if order_request["size_shares"] <= 0:
+        raise ValueError(f"Live order size must be > 0: {order_request['size_shares']}")
+    from py_clob_client.clob_types import OrderArgs
+
+    return OrderArgs(
+        token_id=order_request["token_id"],
+        price=order_request["price"],
+        size=order_request["size_shares"],
+        side=order_request["side"],
+    )
+
+
+def _weather_error_context(signal: dict | None, decision: dict | None = None, order_request: dict | None = None, size_usd: float | None = None) -> dict:
+    """Return compact weather context for live execution failure logs."""
+    signal = dict(signal or {})
+    decision = dict(decision or {})
+    return {
+        "weather_signal_id": signal.get("id") or signal.get("weather_signal_id"),
+        "strategy_name": signal.get("strategy_name") or signal.get("market_family"),
+        "event": signal.get("event"),
+        "market": signal.get("market"),
+        "market_id": signal.get("market_id"),
+        "action": signal.get("action"),
+        "yes_token": signal.get("yes_token"),
+        "no_token": signal.get("no_token"),
+        "entry_token": decision.get("entry_token") if decision else None,
+        "entry_price": decision.get("entry_price") if decision else None,
+        "requested_size_usd": round(float(size_usd or 0.0), 2) if size_usd is not None else None,
+        "order_request": order_request,
+    }
 
 
 def _failure_result(mode: str, reason_code: str, error: str, **extra) -> dict:
@@ -882,13 +933,10 @@ def execute_weather_trade(signal, size_usd, mode=None, runtime_scope: str | None
         exec_mode = EXECUTION_MODE
         price = _get_single_leg_price(entry_token, side, exec_mode=exec_mode)
         shares = round(size_usd / max(price, 0.0001), 4)
-        raw_order = client.create_and_post_order({
-            "tokenID": entry_token,
-            "price": price,
-            "size": shares,
-            "side": side,
-            "type": "GTC",
-        })
+        order_request = _build_live_order_request(entry_token, side, price, shares)
+        raw_order = client.create_and_post_order(
+            _build_live_order_args(entry_token, side, price, shares)
+        )
         order_payload = _order_response_dict(raw_order)
         order_id = _extract_order_id(order_payload) or str(raw_order)
 
@@ -913,7 +961,7 @@ def execute_weather_trade(signal, size_usd, mode=None, runtime_scope: str | None
                 "a": {
                     "order_id": order_id,
                     "tx_hash": _extract_tx_hash(order_payload),
-                    "token_id": entry_token,
+                    "token_id": order_request["token_id"],
                     "side": side,
                     "price": price,
                     "size_shares": shares,
@@ -955,7 +1003,7 @@ def execute_weather_trade(signal, size_usd, mode=None, runtime_scope: str | None
             "order_id": order_id,
             "trade_id": trade_id,
             "signal_id": None,
-            "token_id": entry_token,
+            "token_id": order_request["token_id"],
             "side": side,
             "leg": "a",
             "limit_price": price,
@@ -1013,7 +1061,18 @@ def execute_weather_trade(signal, size_usd, mode=None, runtime_scope: str | None
             "quarter_kelly_capped": bool(quarter_kelly_capped),
         }
     except Exception as exc:
-        log.error("Live weather execution failed for signal %s: %s", weather_signal_id, exc)
+        error_context = _weather_error_context(
+            signal,
+            decision=decision,
+            order_request=locals().get("order_request"),
+            size_usd=size_usd,
+        )
+        log.exception(
+            "Live weather execution failed for signal %s runtime_scope=%s context=%s",
+            weather_signal_id,
+            runtime_scope,
+            json.dumps(error_context, sort_keys=True, default=str),
+        )
         return {
             "ok": False,
             "mode": "live",
@@ -1021,6 +1080,10 @@ def execute_weather_trade(signal, size_usd, mode=None, runtime_scope: str | None
             "error": str(exc),
             "weather_signal_id": weather_signal_id,
             "strategy_name": strategy_name,
+            "runtime_scope": runtime_scope,
+            "blocker_runtime_scope": runtime_scope,
+            "blocker_source": f"{runtime_scope}-execution",
+            "debug_context": error_context,
         }
 
 
@@ -1350,18 +1413,14 @@ def close_live_trade(trade: dict, notes: str = "") -> dict:
             current_a = api.get_midpoint(token_a)
             close_side_a = "SELL" if "BUY" in str(trade.get("side_a") or "").upper() else "BUY"
             shares_a = round((_safe_float(trade.get("size_usd")) / max(_safe_float(trade.get("entry_price_a")), 0.0001)), 4)
-            raw_order_a = client.create_and_post_order({
-                "tokenID": token_a,
-                "price": current_a,
-                "size": shares_a,
-                "side": close_side_a,
-                "type": "GTC",
-            })
+            raw_order_a = client.create_and_post_order(
+                _build_live_order_args(token_a, close_side_a, current_a, shares_a)
+            )
             order_a = _order_response_dict(raw_order_a)
             exit_execution["orders"]["a"] = {
                 "order_id": _extract_order_id(order_a) or str(raw_order_a),
                 "tx_hash": _extract_tx_hash(order_a),
-                "token_id": token_a,
+                "token_id": api.normalize_token_id(token_a),
                 "side": close_side_a,
                 "price": current_a,
                 "size_shares": shares_a,
@@ -1401,27 +1460,19 @@ def close_live_trade(trade: dict, notes: str = "") -> dict:
         half_size = _safe_float(trade.get("size_usd")) / 2
         shares_a = round(half_size / max(_safe_float(trade.get("entry_price_a")), 0.0001), 4)
         shares_b = round(half_size / max(_safe_float(trade.get("entry_price_b")), 0.0001), 4)
-        raw_order_a = client.create_and_post_order({
-            "tokenID": token_a,
-            "price": current_a,
-            "size": shares_a,
-            "side": close_side_a,
-            "type": "GTC",
-        })
-        raw_order_b = client.create_and_post_order({
-            "tokenID": token_b,
-            "price": current_b,
-            "size": shares_b,
-            "side": close_side_b,
-            "type": "GTC",
-        })
+        raw_order_a = client.create_and_post_order(
+            _build_live_order_args(token_a, close_side_a, current_a, shares_a)
+        )
+        raw_order_b = client.create_and_post_order(
+            _build_live_order_args(token_b, close_side_b, current_b, shares_b)
+        )
         order_a = _order_response_dict(raw_order_a)
         order_b = _order_response_dict(raw_order_b)
         exit_execution["orders"] = {
             "a": {
                 "order_id": _extract_order_id(order_a) or str(raw_order_a),
                 "tx_hash": _extract_tx_hash(order_a),
-                "token_id": token_a,
+                "token_id": api.normalize_token_id(token_a),
                 "side": close_side_a,
                 "price": current_a,
                 "size_shares": shares_a,
@@ -1430,7 +1481,7 @@ def close_live_trade(trade: dict, notes: str = "") -> dict:
             "b": {
                 "order_id": _extract_order_id(order_b) or str(raw_order_b),
                 "tx_hash": _extract_tx_hash(order_b),
-                "token_id": token_b,
+                "token_id": api.normalize_token_id(token_b),
                 "side": close_side_b,
                 "price": current_b,
                 "size_shares": shares_b,
@@ -1493,21 +1544,15 @@ def _execute_live(signal, size_usd, price_a, price_b,
         token_a = signal.get("token_id_a") or signal["market_a"]
         token_b = signal.get("token_id_b") or signal["market_b"]
         order_type = "GTC"
+        size_shares_a = round(half_size / price_a, 4) if price_a > 0 else 0
+        size_shares_b = round(half_size / price_b, 4) if price_b > 0 else 0
 
-        raw_order_a = client.create_and_post_order({
-            "tokenID": token_a,
-            "price":   price_a,
-            "size":    round(half_size / price_a, 4) if price_a > 0 else 0,
-            "side":    side_a,
-            "type":    order_type,
-        })
-        raw_order_b = client.create_and_post_order({
-            "tokenID": token_b,
-            "price":   price_b,
-            "size":    round(half_size / price_b, 4) if price_b > 0 else 0,
-            "side":    side_b,
-            "type":    order_type,
-        })
+        raw_order_a = client.create_and_post_order(
+            _build_live_order_args(token_a, side_a, price_a, size_shares_a)
+        )
+        raw_order_b = client.create_and_post_order(
+            _build_live_order_args(token_b, side_b, price_b, size_shares_b)
+        )
         order_a = _order_response_dict(raw_order_a)
         order_b = _order_response_dict(raw_order_b)
         order_id_a = _extract_order_id(order_a) or str(raw_order_a)
@@ -1538,20 +1583,20 @@ def _execute_live(signal, size_usd, price_a, price_b,
                 "a": {
                     "order_id": order_id_a,
                     "tx_hash": _extract_tx_hash(order_a),
-                    "token_id": token_a,
+                    "token_id": api.normalize_token_id(token_a),
                     "side": side_a,
                     "price": price_a,
-                    "size_shares": round(half_size / price_a, 4) if price_a > 0 else 0,
+                    "size_shares": size_shares_a,
                     "size_usd": round(half_size, 2),
                     "response": order_a,
                 },
                 "b": {
                     "order_id": order_id_b,
                     "tx_hash": _extract_tx_hash(order_b),
-                    "token_id": token_b,
+                    "token_id": api.normalize_token_id(token_b),
                     "side": side_b,
                     "price": price_b,
-                    "size_shares": round(half_size / price_b, 4) if price_b > 0 else 0,
+                    "size_shares": size_shares_b,
                     "size_usd": round(half_size, 2),
                     "response": order_b,
                 },
@@ -1582,11 +1627,11 @@ def _execute_live(signal, size_usd, price_a, price_b,
                 "order_id":    order_id,
                 "trade_id":    trade_id,
                 "signal_id":   signal_id,
-                "token_id":    token_id,
+                "token_id":    api.normalize_token_id(token_id),
                 "side":        side,
                 "leg":         leg,
                 "limit_price": price,
-                "size_shares": round(half_size / price, 4) if price > 0 else 0,
+                "size_shares": size_shares_a if leg == "a" else size_shares_b,
                 "size_usd":    half_size,
                 "status":      "pending",
                 "mode":        "live",
@@ -1685,19 +1730,15 @@ def place_gtc_order(token_id, side, price, size_shares, mode=None):
         return client_error
 
     try:
-        result = client.create_and_post_order({
-            "tokenID": token_id,
-            "price": price,
-            "size": size_shares,
-            "side": side,
-            "type": "GTC",
-        })
+        result = client.create_and_post_order(
+            _build_live_order_args(token_id, side, price, size_shares)
+        )
         log.info("LIVE GTC: order=%s placed", result)
         return {
             "ok": True,
             "mode": "live",
             "order_id": result,
-            "token_id": token_id,
+            "token_id": api.normalize_token_id(token_id),
             "side": side,
             "price": price,
             "size_shares": size_shares,

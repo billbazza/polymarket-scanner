@@ -1142,6 +1142,139 @@ def test_weather_trade_lifecycle():
 run("weather_trade_lifecycle", test_weather_trade_lifecycle)
 
 
+def test_live_weather_execution_uses_typed_order_args():
+    import db
+    import execution
+    from py_clob_client.clob_types import OrderArgs
+
+    opp = {
+        "market": "Will Chicago exceed 70°F on 2026-04-06?",
+        "market_id": "mkt_live_weather_order_args",
+        "event": "Chicago temperature April 2026",
+        "city": "chicago",
+        "lat": 41.88,
+        "lon": -87.63,
+        "target_date": "2026-04-06",
+        "threshold_f": 70,
+        "direction": "above",
+        "yes_token": "tok_weather_live_yes",
+        "no_token": "tok_weather_live_no",
+        "market_price": 0.41,
+        "noaa_prob": 0.58,
+        "noaa_forecast_f": 73.0,
+        "noaa_sigma_f": 4.0,
+        "om_prob": 0.61,
+        "om_forecast_f": 74.0,
+        "combined_prob": 0.595,
+        "combined_edge": 0.185,
+        "combined_edge_pct": 18.5,
+        "sources_agree": True,
+        "sources_available": 2,
+        "hours_ahead": 72,
+        "ev_pct": 15.0,
+        "kelly_fraction": 0.09,
+        "action": "BUY_YES",
+        "tradeable": True,
+        "liquidity": 2500,
+    }
+
+    signal_id = db.save_weather_signal(opp)
+    signal = db.get_weather_signal_by_id(signal_id)
+    client = MagicMock()
+    client.create_and_post_order.return_value = {"order_id": "live-weather-order-1"}
+
+    with patch("execution.check_balance", return_value={"ok": True, "balance_usd": 50.0, "mode": "live"}), \
+         patch("math_engine.check_slippage", return_value={"ok": True, "slippage_pct": 0.4}), \
+         patch("execution._get_single_leg_price", return_value=0.40), \
+         patch("execution._create_live_clob_client", return_value=(client, None)):
+        result = execution.execute_weather_trade(signal, size_usd=5, mode="live", runtime_scope="penny")
+
+    check("live weather execution succeeds", result["ok"] is True, f"got {result}")
+    check("live weather trade id persisted", isinstance(result.get("trade_id"), int) and result["trade_id"] > 0,
+          f"got {result.get('trade_id')}")
+    check("live weather client invoked once", client.create_and_post_order.call_count == 1,
+          f"got {client.create_and_post_order.call_count}")
+
+    order_args = client.create_and_post_order.call_args.args[0]
+    check("live weather order uses typed OrderArgs", isinstance(order_args, OrderArgs),
+          f"got {type(order_args)}")
+    check("live weather order uses yes token", getattr(order_args, "token_id", None) == "tok_weather_live_yes",
+          f"got {getattr(order_args, 'token_id', None)}")
+    check("live weather order preserves BUY side", getattr(order_args, "side", None) == "BUY",
+          f"got {getattr(order_args, 'side', None)}")
+
+    trade = db.get_trade(result["trade_id"])
+    check("live weather trade stored normalized token_id_a",
+          trade and trade.get("token_id_a") == "tok_weather_live_yes",
+          f"got {trade.get('token_id_a') if trade else None}")
+
+
+run("live_weather_execution_uses_typed_order_args", test_live_weather_execution_uses_typed_order_args)
+
+
+def test_live_weather_execution_failure_exposes_signal_context():
+    import db
+    import execution
+
+    opp = {
+        "market": "Will Boston exceed 68°F on 2026-04-07?",
+        "market_id": "mkt_live_weather_error_context",
+        "event": "Boston temperature April 2026",
+        "city": "boston",
+        "lat": 42.36,
+        "lon": -71.06,
+        "target_date": "2026-04-07",
+        "threshold_f": 68,
+        "direction": "above",
+        "yes_token": "tok_weather_error_yes",
+        "no_token": "tok_weather_error_no",
+        "market_price": 0.39,
+        "noaa_prob": 0.57,
+        "noaa_forecast_f": 71.0,
+        "noaa_sigma_f": 4.2,
+        "om_prob": 0.59,
+        "om_forecast_f": 72.0,
+        "combined_prob": 0.58,
+        "combined_edge": 0.19,
+        "combined_edge_pct": 19.0,
+        "sources_agree": True,
+        "sources_available": 2,
+        "hours_ahead": 72,
+        "ev_pct": 16.0,
+        "kelly_fraction": 0.09,
+        "action": "BUY_NO",
+        "tradeable": True,
+        "liquidity": 2500,
+    }
+
+    signal_id = db.save_weather_signal(opp)
+    signal = db.get_weather_signal_by_id(signal_id)
+    client = MagicMock()
+    client.create_and_post_order.side_effect = RuntimeError("boom")
+
+    with patch("execution.check_balance", return_value={"ok": True, "balance_usd": 50.0, "mode": "live"}), \
+         patch("math_engine.check_slippage", return_value={"ok": True, "slippage_pct": 0.4}), \
+         patch("execution._get_single_leg_price", return_value=0.25), \
+         patch("execution._create_live_clob_client", return_value=(client, None)):
+        result = execution.execute_weather_trade(signal, size_usd=5, mode="live", runtime_scope="penny")
+
+    debug_context = result.get("debug_context") or {}
+    order_request = debug_context.get("order_request") or {}
+    check("live weather failure returns structured error", result["ok"] is False and result.get("reason_code") == "live_execution_failed",
+          f"got {result}")
+    check("live weather failure keeps weather_signal_id", result.get("weather_signal_id") == signal_id,
+          f"got {result.get('weather_signal_id')}")
+    check("live weather failure debug context includes market_id", debug_context.get("market_id") == "mkt_live_weather_error_context",
+          f"got {debug_context}")
+    check("live weather failure debug context includes BUY_NO token", order_request.get("token_id") == "tok_weather_error_no",
+          f"got {order_request}")
+    check("live weather failure exposes blocker source", result.get("blocker_source") == "penny-execution",
+          f"got {result.get('blocker_source')}")
+
+
+run("live_weather_execution_failure_exposes_signal_context", test_live_weather_execution_failure_exposes_signal_context)
+
+
 section("12. Single-leg tracker fallback on midpoint 404")
 
 def _http_404(*_args, **_kwargs):
