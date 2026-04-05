@@ -65,7 +65,11 @@ SECRET_NAMES = {
 
 def keychain_service_name() -> str:
     """Return the Keychain service namespace used for scanner config."""
-    return (os.environ.get(KEYCHAIN_SERVICE_ENV) or DEFAULT_KEYCHAIN_SERVICE).strip()
+    override = os.environ.get(KEYCHAIN_SERVICE_ENV)
+    if override is None:
+        return DEFAULT_KEYCHAIN_SERVICE
+    normalized = override.strip()
+    return normalized or DEFAULT_KEYCHAIN_SERVICE
 
 
 def _security_cli_available() -> bool:

@@ -3,6 +3,8 @@ import os
 import unittest
 from unittest import mock
 
+import runtime_config
+
 
 class BrainProviderMigrationTests(unittest.TestCase):
     def setUp(self):
@@ -16,7 +18,9 @@ class BrainProviderMigrationTests(unittest.TestCase):
             "BRAIN_XAI_COMPLEX_MODEL": os.environ.get("BRAIN_XAI_COMPLEX_MODEL"),
             "OPENAI_BASE_URL": os.environ.get("OPENAI_BASE_URL"),
             "XAI_BASE_URL": os.environ.get("XAI_BASE_URL"),
+            "SCANNER_KEYCHAIN_SERVICE": os.environ.get("SCANNER_KEYCHAIN_SERVICE"),
         }
+        runtime_config.clear_cache()
 
         import brain
 
@@ -32,6 +36,7 @@ class BrainProviderMigrationTests(unittest.TestCase):
         import brain
 
         importlib.reload(brain)
+        runtime_config.clear_cache()
 
     def test_auto_provider_prefers_anthropic_then_openai(self):
         os.environ["ANTHROPIC_API_KEY"] = "ant-test"
@@ -190,6 +195,41 @@ class BrainProviderMigrationTests(unittest.TestCase):
         should_trade, reasoning = brain.validate_signal({"event": "Pinned provider missing"})
         self.assertTrue(should_trade)
         self.assertIn("defaulting to statistical signal", reasoning)
+
+    def test_blank_keychain_service_override_still_detects_default_service_provider_keys(self):
+        for name in ("ANTHROPIC_API_KEY", "OPENAI_API_KEY", "XAI_API_KEY", "BRAIN_PROVIDER"):
+            os.environ.pop(name, None)
+        os.environ["SCANNER_KEYCHAIN_SERVICE"] = "   "
+
+        def fake_find(service, name):
+            mapping = {
+                (runtime_config.DEFAULT_KEYCHAIN_SERVICE, "ANTHROPIC_API_KEY"): "ant-key",
+                (runtime_config.DEFAULT_KEYCHAIN_SERVICE, "OPENAI_API_KEY"): "openai-key",
+                (runtime_config.DEFAULT_KEYCHAIN_SERVICE, "XAI_API_KEY"): "xai-key",
+            }
+            return mapping.get((service, name))
+
+        with mock.patch.object(runtime_config, "_find_keychain_value", side_effect=fake_find):
+            brain = importlib.reload(self.brain)
+
+            self.assertEqual(
+                brain._available_provider_order(),
+                [brain.PROVIDER_ANTHROPIC, brain.PROVIDER_OPENAI, brain.PROVIDER_XAI],
+            )
+
+            with mock.patch.object(brain, "_get_provider_client", return_value=None), \
+                 mock.patch.object(brain.log, "warning") as warning_log:
+                brain._get_client_candidates()
+
+            warning_messages = [
+                call.args[0] % call.args[1:] if call.args else ""
+                for call in warning_log.call_args_list
+            ]
+            self.assertNotIn("No brain provider configured — brain disabled", warning_messages)
+            self.assertIn(
+                "Brain provider clients unavailable for configured providers anthropic,openai,xai — brain disabled",
+                warning_messages,
+            )
 
 
 if __name__ == "__main__":

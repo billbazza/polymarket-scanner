@@ -32,6 +32,26 @@ class RuntimeConfigTests(unittest.TestCase):
         with mock.patch.object(runtime_config, "_find_keychain_value", return_value="keychain-openai"):
             self.assertEqual(runtime_config.get("OPENAI_API_KEY"), "keychain-openai")
 
+    def test_blank_keychain_service_override_falls_back_to_default(self):
+        os.environ["SCANNER_KEYCHAIN_SERVICE"] = "   "
+
+        self.assertEqual(
+            runtime_config.keychain_service_name(),
+            runtime_config.DEFAULT_KEYCHAIN_SERVICE,
+        )
+
+    def test_get_uses_default_service_when_override_blank(self):
+        os.environ.pop("OPENAI_API_KEY", None)
+        os.environ["SCANNER_KEYCHAIN_SERVICE"] = "   "
+
+        def fake_find(service, name):
+            if service == runtime_config.DEFAULT_KEYCHAIN_SERVICE and name == "OPENAI_API_KEY":
+                return "keychain-openai"
+            return None
+
+        with mock.patch.object(runtime_config, "_find_keychain_value", side_effect=fake_find):
+            self.assertEqual(runtime_config.get("OPENAI_API_KEY"), "keychain-openai")
+
     def test_bool_parser_defaults_when_missing(self):
         os.environ.pop("FEATURE_FLAG", None)
         with mock.patch.object(runtime_config, "_find_keychain_value", return_value=None):
