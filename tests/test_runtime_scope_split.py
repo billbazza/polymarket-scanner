@@ -577,6 +577,44 @@ class RuntimeScopeSplitTests(unittest.TestCase):
         self.assertTrue(penny_runtime["running"])
         self.assertTrue(penny_runtime["state_file"].endswith("autonomy_state.penny.json"))
 
+    def test_penny_runtime_settings_update_is_scoped_and_audit_logged(self):
+        import autonomy
+
+        autonomy = importlib.reload(autonomy)
+        captured = []
+        with patch.object(autonomy.journal_writer, "append_entry", side_effect=lambda entry: captured.append(entry) or entry):
+            response = self.client.post(
+                "/api/autonomy/settings?runtime_scope=penny&auto_trade_enabled=true&max_open_override=5",
+                headers={"X-API-Key": "test-admin-key"},
+            )
+
+        payload = response.json()
+        paper_settings = self.db.get_autonomy_runtime_settings(self.db.RUNTIME_SCOPE_PAPER)
+        penny_settings = self.db.get_autonomy_runtime_settings(self.db.RUNTIME_SCOPE_PENNY)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["runtime_scope"], "penny")
+        self.assertEqual(payload["settings"]["runtime_scope"], "penny")
+        self.assertTrue(payload["settings"]["auto_trade_enabled"])
+        self.assertEqual(payload["settings"]["max_open_override"], 5)
+        self.assertEqual(payload["runtime"]["max_open"], 5)
+        self.assertEqual(payload["runtime"]["max_open_usage"], "0/5")
+        self.assertEqual(paper_settings["runtime_scope"], "paper")
+        self.assertTrue(paper_settings["auto_trade_enabled"])
+        self.assertIsNone(paper_settings["max_open_override"])
+        self.assertTrue(penny_settings["auto_trade_enabled"])
+        self.assertEqual(penny_settings["max_open_override"], 5)
+        self.assertEqual(payload["audit_entry"]["action"], "runtime_controls_updated")
+        self.assertEqual(payload["audit_entry"]["runtime_scope"], "penny")
+        self.assertEqual(payload["audit_entry"]["changed_fields"]["max_open_override"]["old"], None)
+        self.assertEqual(payload["audit_entry"]["changed_fields"]["max_open_override"]["new"], 5)
+        self.assertEqual(payload["audit_entry"]["changed_fields"]["auto_trade_enabled"]["old"], False)
+        self.assertEqual(payload["audit_entry"]["changed_fields"]["auto_trade_enabled"]["new"], True)
+        self.assertEqual(captured[0]["runtime_scope"], "penny")
+        self.assertEqual(captured[0]["runtime_label"], "autonomy:penny")
+        self.assertEqual(captured[0]["action"], "runtime_controls_updated")
+
     def test_dashboard_uses_runtime_scoped_history_and_runtime_fetches(self):
         html = Path(self.server.DASHBOARD_PATH).read_text()
         self.assertIn("runtimeScopedUrl('/api/trades', { status: 'closed', limit: 500 }, scope)", html)
@@ -591,6 +629,9 @@ class RuntimeScopeSplitTests(unittest.TestCase):
         self.assertIn("acceptance && acceptance.all_passed === false", html)
         self.assertIn("Weather phase: skipped", html)
         self.assertIn("cycle started in background", html)
+        self.assertIn("Penny Max Open Trades", html)
+        self.assertIn("Changes save immediately to the live penny scope and are appended to the audit journal.", html)
+        self.assertIn("const auditAction = data?.audit_entry?.action === 'runtime_controls_update_noop'", html)
 
 
 if __name__ == "__main__":

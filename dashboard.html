@@ -683,9 +683,12 @@
           </select>
         </label>
         <label style="display:grid;gap:4px">
-          <span style="font-size:11px;color:var(--text2)">Penny Max Open</span>
+          <span style="font-size:11px;color:var(--text2)">Penny Max Open Trades</span>
           <input id="runtimeMaxOpenInput" type="number" min="1" step="1" value="3" onchange="saveRuntimeControls()" style="background:var(--surface);color:var(--text);border:1px solid var(--border);border-radius:8px;padding:8px">
         </label>
+      </div>
+      <div id="runtimeControlsMeta" class="meta" style="display:none;margin-bottom:10px">
+        Penny runtime controls are isolated from paper settings. Changes save immediately to the live penny scope and are appended to the audit journal.
       </div>
       <div class="runtime-scope-grid">
         <div class="runtime-scope-metric">
@@ -1675,15 +1678,18 @@ function renderRuntimeScopePanel(runtimeData, statsData, account) {
 
 function renderRuntimeControls(runtimeData, scope) {
   const box = getEl('runtimeControlsBox');
+  const meta = getEl('runtimeControlsMeta');
   const autoTrade = getEl('runtimeAutoTradeSelect');
   const maxOpen = getEl('runtimeMaxOpenInput');
-  if (!box || !autoTrade || !maxOpen) return;
+  if (!box || !meta || !autoTrade || !maxOpen) return;
   const isPenny = scope === 'penny';
   box.style.display = isPenny ? 'grid' : 'none';
+  meta.style.display = isPenny ? '' : 'none';
   if (!isPenny) return;
   const controls = runtimeData?.runtime_controls || {};
   autoTrade.value = String(controls.auto_trade_enabled !== false);
   maxOpen.value = String(runtimeData?.max_open || controls.max_open_override || 3);
+  maxOpen.title = `Active penny max-open limit: ${runtimeData?.max_open_label || runtimeData?.max_open || 3}`;
 }
 
 async function saveRuntimeControls() {
@@ -1708,7 +1714,8 @@ async function saveRuntimeControls() {
     if (!r.ok || data?.ok === false) {
       throw new Error(data?.detail || data?.error || 'Failed to save runtime controls');
     }
-    toast(`Penny runtime updated: auto-trading ${autoTrade.value === 'true' ? 'enabled' : 'disabled'}, max open ${parsedMaxOpen}.`);
+    const auditAction = data?.audit_entry?.action === 'runtime_controls_update_noop' ? 'No effective change.' : 'Journal updated.';
+    toast(`Penny runtime updated: auto-trading ${autoTrade.value === 'true' ? 'enabled' : 'disabled'}, max open ${parsedMaxOpen}. ${auditAction}`);
     loadStats();
   } catch (e) {
     toast(`Runtime control save failed: ${e.message || e}`, true);

@@ -121,6 +121,60 @@ def _runtime_scope_param(runtime_scope: str | None) -> str:
     return db.normalize_runtime_scope(runtime_scope)
 
 
+def _request_actor(request: Request | None) -> str:
+    if request is None:
+        return "unknown"
+    cf_email = (request.headers.get("CF-Access-Authenticated-User-Email") or "").strip().lower()
+    if cf_email:
+        return cf_email
+    if request.client and request.client.host:
+        return request.client.host
+    return "unknown"
+
+
+def _log_runtime_settings_change(
+    *,
+    request: Request | None,
+    runtime_scope: str,
+    before: dict,
+    after: dict,
+    requested_updates: dict,
+) -> dict:
+    changed_fields = {}
+    for key in ("auto_trade_enabled", "max_open_override", "size_usd_override"):
+        if before.get(key) != after.get(key):
+            changed_fields[key] = {
+                "old": before.get(key),
+                "new": after.get(key),
+            }
+
+    actor = _request_actor(request)
+    audit_entry = {
+        "action": "runtime_controls_updated",
+        "runtime_scope": runtime_scope,
+        "actor": actor,
+        "requested_updates": requested_updates,
+        "changed_fields": changed_fields,
+        "before": before,
+        "after": after,
+        "reason": f"Operator updated {runtime_scope} runtime controls.",
+    }
+    if not changed_fields:
+        audit_entry["action"] = "runtime_controls_update_noop"
+        audit_entry["reason"] = f"Operator submitted {runtime_scope} runtime controls with no effective change."
+
+    import autonomy
+
+    autonomy.journal(audit_entry)
+    log.info(
+        "Runtime controls updated runtime_scope=%s actor=%s changed_fields=%s",
+        runtime_scope,
+        actor,
+        json.dumps(changed_fields, sort_keys=True),
+    )
+    return audit_entry
+
+
 def _safe_record_paper_trade_attempt(**kwargs) -> bool:
     recorder = getattr(db, "record_paper_trade_attempt", None)
     if not callable(recorder):
@@ -1773,12 +1827,14 @@ async def autonomy_runtime(runtime_scope: str | None = None):
 
 @app.post("/api/autonomy/settings")
 async def update_autonomy_settings(
+    request: Request,
     runtime_scope: str | None = None,
     auto_trade_enabled: bool | None = None,
     max_open_override: int | None = None,
     size_usd_override: float | None = None,
 ):
     scope = _runtime_scope_param(runtime_scope)
+    previous_settings = db.get_autonomy_runtime_settings(scope)
     updates = {}
     if auto_trade_enabled is not None:
         updates["auto_trade_enabled"] = bool(auto_trade_enabled)
@@ -1787,10 +1843,18 @@ async def update_autonomy_settings(
     if size_usd_override is not None:
         updates["size_usd_override"] = round(float(size_usd_override), 2) if float(size_usd_override) > 0 else None
     settings = db.set_autonomy_runtime_settings(scope, updates)
+    audit_entry = _log_runtime_settings_change(
+        request=request,
+        runtime_scope=scope,
+        before=previous_settings,
+        after=settings,
+        requested_updates=updates,
+    )
     return {
         "ok": True,
         "runtime_scope": scope,
         "settings": settings,
+        "audit_entry": audit_entry,
         "runtime": await autonomy_runtime(runtime_scope=scope),
     }
 
