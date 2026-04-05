@@ -10,6 +10,7 @@ import time
 from pathlib import Path
 
 import runtime_config
+import weather_admission
 import weather_guard_state
 import weather_risk_review
 
@@ -3278,17 +3279,23 @@ def evaluate_weather_signal_horizon(signal_row: dict | None) -> dict:
             "reason_code": "horizon_unknown",
             "reason": "Signal horizon metadata is invalid.",
         }
-    guard = weather_guard_state.current_guard()
-    min_hours_required = float(guard["min_hours_ahead"])
-    if remaining_hours < min_hours_required:
+    admission = weather_admission.evaluate_persisted_threshold_signal(
+        signal_row,
+        elapsed_hours=((time.time() - float(timestamp)) / 3600.0),
+        min_trade_edge=weather_admission.DEFAULT_MIN_TRADE_EDGE,
+        min_trade_price=weather_admission.DEFAULT_MIN_TRADE_PRICE,
+    )
+    if not admission["filter_status"].get("horizon"):
         return {
             "ok": False,
-            "reason_code": "horizon_too_short",
-            "reason": (
-                f"Signal horizon now {remaining_hours:.1f}h, below required "
-                f"{min_hours_required:.0f}h minimum."
-            ),
+            "reason_code": admission.get("primary_reason_code") or "horizon_too_short",
+            "reason": admission.get("primary_reason"),
             "remaining_hours": remaining_hours,
+            "remaining_hours_cmp": admission.get("hours_ahead_cmp"),
+            "min_hours_required_cmp": admission.get("min_hours_required_cmp"),
+            "material_state_change": admission.get("material_state_change"),
+            "state_change_reason_code": admission.get("state_change_reason_code"),
+            "state_change_summary": admission.get("state_change_summary"),
         }
     return {"ok": True, "remaining_hours": remaining_hours}
 
@@ -4048,19 +4055,74 @@ def inspect_weather_trade_open(
                 **_paper_position_policy_dict(),
             }
 
-        signal_row = dict(sig)
+        signal_row = _deserialize_weather_signal_row(sig)
         review = weather_risk_review.get_review_for_signal(
             signal_row,
             mode=_weather_review_mode(mode, runtime_scope),
         )
+        admission_check = None
+        if not (
+            (signal_row.get("strategy_name") or signal_row.get("market_family") or "")
+            .strip()
+            .lower()
+            .startswith("weather_exact_temp")
+        ):
+            timestamp = signal_row.get("timestamp")
+            if signal_row.get("hours_ahead") is not None and timestamp is not None:
+                try:
+                    elapsed_hours = (time.time() - float(timestamp)) / 3600.0
+                except (TypeError, ValueError):
+                    elapsed_hours = None
+                if elapsed_hours is not None:
+                    admission_check = weather_admission.evaluate_persisted_threshold_signal(
+                        signal_row,
+                        elapsed_hours=elapsed_hours,
+                        min_trade_edge=weather_admission.DEFAULT_MIN_TRADE_EDGE,
+                        min_trade_price=weather_admission.DEFAULT_MIN_TRADE_PRICE,
+                    )
         horizon_check = evaluate_weather_signal_horizon(signal_row)
-        if not horizon_check["ok"]:
+        if admission_check and not admission_check["tradeable"]:
+            if admission_check.get("stored_tradeable") and not admission_check.get("material_state_change"):
+                log.warning(
+                    "Weather admission retained scan tradeable signal=%s runtime_scope=%s blocker=%s without material change proof "
+                    "[scan_hours=%s current_hours=%s]",
+                    weather_signal_id,
+                    runtime_scope,
+                    admission_check.get("primary_reason_code"),
+                    admission_check.get("stored_hours_ahead_cmp"),
+                    admission_check.get("hours_ahead_cmp"),
+                )
+            else:
+                return {
+                    "ok": False,
+                    "reason_code": admission_check.get("primary_reason_code"),
+                    "reason": admission_check.get("primary_reason"),
+                    "signal": signal_row,
+                    "remaining_hours": horizon_check.get("remaining_hours") if horizon_check else None,
+                    "remaining_hours_cmp": admission_check.get("hours_ahead_cmp"),
+                    "stored_hours_ahead_cmp": admission_check.get("stored_hours_ahead_cmp"),
+                    "min_hours_required_cmp": admission_check.get("min_hours_required_cmp"),
+                    "material_state_change": admission_check.get("material_state_change"),
+                    "state_change_reason_code": admission_check.get("state_change_reason_code"),
+                    "state_change_summary": admission_check.get("state_change_summary"),
+                    "guard_thresholds_changed": admission_check.get("guard_thresholds_changed"),
+                    "stored_tradeable": admission_check.get("stored_tradeable"),
+                    "blocking_filters": admission_check.get("blocking_filters"),
+                    **audit_fields,
+                    **_paper_position_policy_dict(),
+                }
+        elif not horizon_check["ok"]:
             return {
                 "ok": False,
                 "reason_code": horizon_check.get("reason_code"),
                 "reason": horizon_check.get("reason"),
                 "signal": signal_row,
                 "remaining_hours": horizon_check.get("remaining_hours"),
+                "remaining_hours_cmp": horizon_check.get("remaining_hours_cmp"),
+                "min_hours_required_cmp": horizon_check.get("min_hours_required_cmp"),
+                "material_state_change": horizon_check.get("material_state_change"),
+                "state_change_reason_code": horizon_check.get("state_change_reason_code"),
+                "state_change_summary": horizon_check.get("state_change_summary"),
                 **audit_fields,
                 **_paper_position_policy_dict(),
             }
@@ -4249,6 +4311,8 @@ def inspect_weather_trade_open(
             "runtime_scope": runtime_scope,
             "requested_size_usd": round(float(size_usd), 2),
             "remaining_hours": horizon_check.get("remaining_hours"),
+            "remaining_hours_cmp": (admission_check or {}).get("hours_ahead_cmp"),
+            "stored_hours_ahead_cmp": (admission_check or {}).get("stored_hours_ahead_cmp"),
             "reopen_context": reopen_context,
             **audit_fields,
             **_paper_position_policy_dict(),

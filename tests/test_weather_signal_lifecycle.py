@@ -39,12 +39,28 @@ def _weather_opp(
         "sources_agree": True,
         "sources_available": 2,
         "hours_ahead": hours_ahead,
+        "source_disagreement": 0.02,
         "ev_pct": 8.5,
         "kelly_fraction": 0.12,
         "action": "BUY_YES",
         "tradeable": True,
-        "liquidity": 1000,
+        "liquidity": 10000,
         "strategy_name": "weather_threshold",
+        "source_meta": {
+            "threshold_admission": {
+                "tradeable": True,
+                "hours_ahead": hours_ahead,
+                "hours_ahead_cmp": round(float(hours_ahead), 1),
+                "source_disagreement": 0.02,
+                "guard_thresholds": {
+                    "min_liquidity": 0.0,
+                    "min_hours_ahead": 0.0,
+                    "max_disagreement": 1.0,
+                    "guard_name": "scan-fixture",
+                    "guard_tier": 0,
+                },
+            }
+        },
     }
 
 
@@ -472,6 +488,73 @@ class WeatherSignalLifecycleTests(unittest.TestCase):
         self.assertEqual(row["blocking_reason_code"], "horizon_too_short")
         self.assertEqual(row["blocking_source"], "paper-weather")
         self.assertEqual(row["status"], "blocked")
+
+    def test_weather_tradeable_boundary_rounds_consistently_at_48h(self):
+        opp = _weather_opp(
+            city="Bristol",
+            market="Will Bristol hit 72F?",
+            yes_token="yes-bristol",
+            no_token="no-bristol",
+            hours_ahead=48.0,
+        )
+        opp["source_meta"]["threshold_admission"]["guard_thresholds"] = {
+            "min_liquidity": 5000.0,
+            "min_hours_ahead": 48.0,
+            "max_disagreement": 0.18,
+            "guard_name": "relaxed",
+            "guard_tier": 0,
+        }
+        signal_id = self.db.save_weather_signal(opp)
+        conn = self.db.get_conn()
+        conn.execute("UPDATE weather_signals SET timestamp=? WHERE id=?", (1000.0, signal_id))
+        conn.commit()
+        conn.close()
+        with mock.patch.object(self.db.time, "time", return_value=1060.0):
+            with mock.patch.object(
+                self.db.weather_guard_state,
+                "current_guard",
+                return_value={"min_hours_ahead": 48, "name": "relaxed", "tier_index": 0, "max_disagreement": 0.18, "min_liquidity": 5000},
+            ):
+                decision = self.db.inspect_weather_trade_open(signal_id, size_usd=20, mode="paper")
+
+        self.assertTrue(decision["ok"])
+        self.assertEqual(decision["remaining_hours_cmp"], 48.0)
+        self.assertEqual(decision["stored_hours_ahead_cmp"], 48.0)
+
+    def test_weather_tradeable_horizon_block_requires_material_state_change(self):
+        opp = _weather_opp(
+            city="Cardiff",
+            market="Will Cardiff hit 70F?",
+            yes_token="yes-cardiff",
+            no_token="no-cardiff",
+            hours_ahead=48.0,
+        )
+        opp["source_meta"]["threshold_admission"]["guard_thresholds"] = {
+            "min_liquidity": 5000.0,
+            "min_hours_ahead": 48.0,
+            "max_disagreement": 0.18,
+            "guard_name": "relaxed",
+            "guard_tier": 0,
+        }
+        signal_id = self.db.save_weather_signal(opp)
+        conn = self.db.get_conn()
+        conn.execute("UPDATE weather_signals SET timestamp=? WHERE id=?", (1000.0, signal_id))
+        conn.commit()
+        conn.close()
+        with mock.patch.object(self.db.time, "time", return_value=2200.0):
+            with mock.patch.object(
+                self.db.weather_guard_state,
+                "current_guard",
+                return_value={"min_hours_ahead": 48, "name": "relaxed", "tier_index": 0, "max_disagreement": 0.18, "min_liquidity": 5000},
+            ):
+                decision = self.db.inspect_weather_trade_open(signal_id, size_usd=20, mode="paper")
+
+        self.assertFalse(decision["ok"])
+        self.assertEqual(decision["reason_code"], "horizon_too_short")
+        self.assertTrue(decision["material_state_change"])
+        self.assertEqual(decision["state_change_reason_code"], "horizon_aged_below_threshold")
+        self.assertEqual(decision["stored_hours_ahead_cmp"], 48.0)
+        self.assertEqual(decision["remaining_hours_cmp"], 47.7)
 
     def test_weather_close_trade_uses_single_leg_pnl_and_closes_signal(self):
         signal_id = self.db.save_weather_signal(

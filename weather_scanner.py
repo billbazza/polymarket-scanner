@@ -38,6 +38,7 @@ from collections import Counter
 from datetime import date, timedelta
 
 import api
+import weather_admission
 import weather_correction
 import weather_guard_state
 import weather_risk_review
@@ -483,11 +484,22 @@ def scan(
             legacy_stable_noise_guard = (
                 legacy_liquidity_ok and legacy_horizon_ok and legacy_disagreement_ok
             )
-            liquidity_ok = liq >= guard["min_liquidity"]
-            horizon_ok = hours_ahead >= guard["min_hours_ahead"]
-            disagreement_ok = (
-                source_disagreement is not None and source_disagreement <= guard["max_disagreement"]
+            admission = weather_admission.build_threshold_admission(
+                sources_agree=sources_agree,
+                ev_pct=ev_pct,
+                kelly_fraction=kelly_f,
+                combined_edge=combined_edge,
+                baseline_price=baseline_price,
+                liquidity=liq,
+                hours_ahead=hours_ahead,
+                source_disagreement=source_disagreement,
+                min_trade_edge=MIN_TRADE_EDGE,
+                min_trade_price=MIN_TRADE_PRICE,
+                guard=guard,
             )
+            liquidity_ok = admission["filter_status"]["liquidity"]
+            horizon_ok = admission["filter_status"]["horizon"]
+            disagreement_ok = admission["filter_status"]["disagreement"]
             stable_noise_guard = liquidity_ok and horizon_ok and disagreement_ok
             corrected_tradeable = (
                 corrected_sources_agree
@@ -498,17 +510,8 @@ def scan(
                 and stable_noise_guard
             )
 
-            filter_status = {
-                "sources_agree": sources_agree,
-                "ev_pct": ev_pct > 0,
-                "kelly_fraction": kelly_f > 0,
-                "trade_edge": abs(combined_edge) >= MIN_TRADE_EDGE,
-                "trade_price": baseline_price >= MIN_TRADE_PRICE,
-                "liquidity": liquidity_ok,
-                "horizon": horizon_ok,
-                "disagreement": disagreement_ok,
-            }
-            blocking_filters = [name for name, ok in filter_status.items() if not ok]
+            filter_status = admission["filter_status"]
+            blocking_filters = admission["blocking_filters"]
             legacy_filter_status = {
                 "liquidity": legacy_liquidity_ok,
                 "horizon": legacy_horizon_ok,
@@ -520,14 +523,7 @@ def scan(
 
             # Tradeable: BOTH sources must agree (no single-source trades for international)
             # AND edge >= 15pp AND the token we're buying must be >= 35¢ (no long shots)
-            tradeable = (
-                sources_agree
-                and ev_pct > 0
-                and kelly_f > 0
-                and abs(combined_edge) >= MIN_TRADE_EDGE
-                and baseline_price >= MIN_TRADE_PRICE
-                and stable_noise_guard
-            )
+            tradeable = admission["tradeable"]
             legacy_tradeable = (
                 sources_agree
                 and ev_pct > 0
@@ -607,10 +603,14 @@ def scan(
                     "min_hours_ahead": guard["min_hours_ahead"],
                     "max_disagreement": guard["max_disagreement"],
                 },
+                "threshold_admission": admission,
                 "filter_status": filter_status,
                 "blocking_filters": blocking_filters,
                 "legacy_filter_status": legacy_filter_status,
                 "legacy_blocking_filters": legacy_blocking_filters,
+                "source_meta": {
+                    "threshold_admission": admission,
+                },
             }
 
             opportunities.append(opp)
