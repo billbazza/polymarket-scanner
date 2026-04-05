@@ -33,9 +33,21 @@ runtime_config.log_runtime_status("server.py")
 async def lifespan(app: FastAPI):
     db.init_db()
     try:
+        import autonomy
         import wallet_monitor
-        wallet_monitor.start()
-        log.info("Wallet monitor started on server startup")
+        enabled_scopes = autonomy.background_runtime_scopes()
+        if db.RUNTIME_SCOPE_PAPER in enabled_scopes:
+            wallet_monitor.start()
+            log.info(
+                "Wallet monitor started on server startup runtime_scope=%s enabled_scopes=%s",
+                db.RUNTIME_SCOPE_PAPER,
+                ",".join(enabled_scopes),
+            )
+        else:
+            log.info(
+                "Wallet monitor startup skipped; paper runtime is not enabled in AUTONOMY_BACKGROUND_SCOPES=%s",
+                ",".join(enabled_scopes) or "none",
+            )
     except Exception as e:
         log.warning("Wallet monitor failed to start: %s", e)
 

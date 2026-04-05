@@ -58,6 +58,7 @@ STATE_DIR = Path(__file__).parent / "logs"
 STATE_FILE = STATE_DIR / "autonomy_state.json"
 LEGACY_STATE_FILE = Path(__file__).parent / "autonomy_state.json"
 JOURNAL_FILE = Path(__file__).parent / "logs" / "journal.jsonl"
+BACKGROUND_SCOPES_ENV = "AUTONOMY_BACKGROUND_SCOPES"
 
 RUNTIME_SCOPE_PAPER = "paper"
 RUNTIME_SCOPE_PENNY = "penny"
@@ -125,6 +126,47 @@ def runtime_scope_for_level(level: str | None) -> str:
 def state_file_for_scope(runtime_scope: str | None) -> Path:
     scope = normalize_runtime_scope(runtime_scope)
     return STATE_DIR / f"autonomy_state.{scope}.json"
+
+
+def runtime_label(runtime_scope: str | None) -> str:
+    return f"autonomy:{normalize_runtime_scope(runtime_scope)}"
+
+
+def background_runtime_scopes(raw_value: str | None = None) -> list[str]:
+    """Return the explicitly configured unattended autonomy scopes.
+
+    Default behavior remains paper-only so existing launchd setups keep working,
+    but concurrent paper+penny execution now requires explicit configuration.
+    """
+    raw = raw_value if raw_value is not None else runtime_config.get_raw(BACKGROUND_SCOPES_ENV)
+    if raw is None or not str(raw).strip():
+        return [RUNTIME_SCOPE_PAPER]
+
+    normalized_raw = str(raw).strip().lower()
+    if normalized_raw in {"0", "off", "false", "disabled", "none"}:
+        return []
+
+    scopes = []
+    seen = set()
+    for token in str(raw).split(","):
+        candidate = str(token).strip().lower()
+        if candidate not in {RUNTIME_SCOPE_PAPER, RUNTIME_SCOPE_PENNY}:
+            log.warning(
+                "Ignoring unsupported autonomy background scope '%s' from %s=%s",
+                candidate,
+                BACKGROUND_SCOPES_ENV,
+                raw,
+            )
+            continue
+        if candidate in seen:
+            continue
+        scopes.append(candidate)
+        seen.add(candidate)
+    return scopes or [RUNTIME_SCOPE_PAPER]
+
+
+def paper_only_runtime(runtime_scope: str | None) -> bool:
+    return normalize_runtime_scope(runtime_scope) == RUNTIME_SCOPE_PAPER
 
 
 def default_state(runtime_scope: str | None = None):
@@ -201,7 +243,15 @@ def save_state(state, runtime_scope: str | None = None):
 
 def journal(entry):
     """Append a decision to the journal (append-only log)."""
-    final_entry = journal_writer.append_entry(entry)
+    payload = dict(entry or {})
+    scope = payload.get("runtime_scope")
+    if not scope and payload.get("level"):
+        scope = runtime_scope_for_level(payload.get("level"))
+    if scope:
+        normalized_scope = normalize_runtime_scope(scope)
+        payload["runtime_scope"] = normalized_scope
+        payload.setdefault("runtime_label", runtime_label(normalized_scope))
+    final_entry = journal_writer.append_entry(payload)
     log.info(
         "JOURNAL: %s — %s",
         final_entry.get("action", "?"),
@@ -318,12 +368,20 @@ def run_cycle(state):
     level = state["level"]
     level_key = str(level).strip().lower()
     runtime_scope = normalize_runtime_scope(state.get("runtime_scope") or runtime_scope_for_level(level_key))
+    runtime_tag = runtime_label(runtime_scope)
     state["runtime_scope"] = runtime_scope
+    state["runtime_label"] = runtime_tag
     config = LEVELS.get(level, LEVELS.get(level_key, LEVELS["scout"]))
     current_stage = "initializing"
 
     try:
-        log.info("=== Autonomy cycle: level=%s (%s) scope=%s ===", level, config["name"], runtime_scope)
+        log.info(
+            "=== Autonomy cycle: level=%s (%s) scope=%s runtime=%s ===",
+            level,
+            config["name"],
+            runtime_scope,
+            runtime_tag,
+        )
 
         # Step 1: Scan for new signals (use fast async scanner, ~5x faster)
         current_stage = "step 1 scan"
@@ -939,7 +997,16 @@ def run_cycle(state):
         open_count = len(open_trades)
         slots_remaining = (max_open - open_count) if max_open is not None else None
 
-        if slots_remaining is None or slots_remaining > 0:
+        if not paper_only_runtime(runtime_scope):
+            log.info("Step 4b: Skipping paper-only weather strategy for scope=%s", runtime_scope)
+            journal({
+                "action": "paper_only_step_skipped",
+                "level": level,
+                "runtime_scope": runtime_scope,
+                "strategy": "weather",
+                "reason": f"Weather auto-trading is paper-only and is disabled for scope={runtime_scope}.",
+            })
+        elif slots_remaining is None or slots_remaining > 0:
             try:
                 import weather_exact_temp_scanner
                 import weather_strategy
@@ -1143,318 +1210,338 @@ def run_cycle(state):
 
         # Step 4e: Auto-mirror copy trader positions
         current_stage = "step 4e copy trader"
-        try:
-            import copy_scanner
-            copy_trade_settings = db.get_copy_trade_settings()
-            max_copy_wallet_open = copy_trade_settings["per_wallet_cap"] if copy_trade_settings["cap_enabled"] else None
-            max_copy_total_open = copy_trade_settings["total_open_cap"] if copy_trade_settings["cap_enabled"] else None
-            copy_opened = 0
-            copy_closed = 0
-            now_ts = time.time()
+        if not paper_only_runtime(runtime_scope):
+            log.info("Step 4e: Skipping paper-only copy trader for scope=%s", runtime_scope)
+            journal({
+                "action": "paper_only_step_skipped",
+                "level": level,
+                "runtime_scope": runtime_scope,
+                "strategy": "copy",
+                "reason": f"Copy-trader mirroring is paper-only and is disabled for scope={runtime_scope}.",
+            })
+        else:
+            try:
+                import copy_scanner
+                copy_trade_settings = db.get_copy_trade_settings()
+                max_copy_wallet_open = copy_trade_settings["per_wallet_cap"] if copy_trade_settings["cap_enabled"] else None
+                max_copy_total_open = copy_trade_settings["total_open_cap"] if copy_trade_settings["cap_enabled"] else None
+                copy_opened = 0
+                copy_closed = 0
+                now_ts = time.time()
 
-            # Build index of currently open copy trades: (wallet, condition_id) → trade
-            open_copy = {
-                ((t.get("copy_wallet") or "").lower(), db.get_trade_reconciliation_key(t)): t
-                for t in db.get_trades(status="open", limit=None, runtime_scope=runtime_scope)
-                if t.get("trade_type") == "copy" and db.get_trade_reconciliation_key(t) and t.get("copy_wallet")
-            }
-            # Track which (wallet, condition_id) tuples are still held this cycle
-            live_position_keys = set()
+                # Build index of currently open copy trades: (wallet, condition_id) → trade
+                open_copy = {
+                    ((t.get("copy_wallet") or "").lower(), db.get_trade_reconciliation_key(t)): t
+                    for t in db.get_trades(status="open", limit=None, runtime_scope=runtime_scope)
+                    if t.get("trade_type") == "copy" and db.get_trade_reconciliation_key(t) and t.get("copy_wallet")
+                }
+                # Track which (wallet, condition_id) tuples are still held this cycle
+                live_position_keys = set()
 
-            for address, label in {r["address"]: r["label"] for r in db.get_watched_wallets(active_only=True)}.items():
-                try:
-                    positions = copy_scanner.get_positions(address)
-                except Exception as e:
-                    log.warning("Copy: failed to fetch positions for %s: %s", label, e)
-                    record_attempt(
-                        level,
-                        "copy",
-                        "error",
-                        "copy_positions_fetch_failed",
-                        f"Copy positions fetch failed for {label}: {e}",
-                        event=label,
-                        wallet=address,
-                        phase=current_stage,
-                    )
-                    _record_wallet_event(
-                        source="autonomy",
-                        wallet=address,
-                        label=label,
-                        event_type="wallet_polled",
-                        status="fetch_failed",
-                        reason_code="positions_fetch_failed",
-                        reason=f"Positions fetch failed during autonomy cycle: {e}",
+                for address, label in {r["address"]: r["label"] for r in db.get_watched_wallets(active_only=True)}.items():
+                    try:
+                        positions = copy_scanner.get_positions(address)
+                    except Exception as e:
+                        log.warning("Copy: failed to fetch positions for %s: %s", label, e)
+                        record_attempt(
+                            level,
+                            "copy",
+                            "error",
+                            "copy_positions_fetch_failed",
+                            f"Copy positions fetch failed for {label}: {e}",
+                            event=label,
+                            wallet=address,
+                            phase=current_stage,
+                        )
+                        _record_wallet_event(
+                            source="autonomy",
+                            wallet=address,
+                            label=label,
+                            event_type="wallet_polled",
+                            status="fetch_failed",
+                            reason_code="positions_fetch_failed",
+                            reason=f"Positions fetch failed during autonomy cycle: {e}",
+                            checked_at=now_ts,
+                        )
+                        continue
+
+                    db.update_watched_wallet_poll_status(
+                        address,
                         checked_at=now_ts,
+                        positions_count=len([p for p in positions if p.get("conditionId")]),
                     )
-                    continue
 
-                db.update_watched_wallet_poll_status(
-                    address,
-                    checked_at=now_ts,
-                    positions_count=len([p for p in positions if p.get("conditionId")]),
-                )
+                    # Forward-only: on first scan after adding a wallet, snapshot all
+                    # existing positions as baseline and skip them. Only mirror NEW
+                    # positions that appear in subsequent cycles.
+                    baseline = db.get_wallet_baseline(address)
+                    if baseline is None:
+                        # First scan — record current positions as baseline, don't mirror
+                        baseline_ids = sorted({
+                            (db.get_position_identity(p, wallet=address)["canonical_ref"]
+                             or db.get_position_identity(p, wallet=address)["condition_id"])
+                            for p in positions
+                            if p.get("conditionId")
+                        })
+                        db.set_wallet_baseline(address, baseline_ids)
+                        log.info("Step 4e: Baseline set for %s — %d existing positions (skipped)",
+                                 label, len(baseline_ids))
+                        # Still track live IDs for close detection on OTHER wallets
+                        for pos in positions:
+                            identity = db.get_position_identity(pos, wallet=address)
+                            reconciliation_key = identity["canonical_ref"] or identity["condition_id"]
+                            if reconciliation_key:
+                                live_position_keys.add((address.lower(), reconciliation_key))
+                        _record_wallet_event(
+                            source="autonomy",
+                            wallet=address,
+                            label=label,
+                            event_type="baseline_set",
+                            status="baseline_skipped",
+                            reason=f"Baseline set from {len(baseline_ids)} existing positions during autonomy cycle.",
+                            checked_at=now_ts,
+                            positions_count=len(baseline_ids),
+                            details={"baseline_positions": baseline_ids},
+                        )
+                        continue
 
-                # Forward-only: on first scan after adding a wallet, snapshot all
-                # existing positions as baseline and skip them. Only mirror NEW
-                # positions that appear in subsequent cycles.
-                baseline = db.get_wallet_baseline(address)
-                if baseline is None:
-                    # First scan — record current positions as baseline, don't mirror
-                    baseline_ids = sorted({
-                        (db.get_position_identity(p, wallet=address)["canonical_ref"]
-                         or db.get_position_identity(p, wallet=address)["condition_id"])
-                        for p in positions
-                        if p.get("conditionId")
-                    })
-                    db.set_wallet_baseline(address, baseline_ids)
-                    log.info("Step 4e: Baseline set for %s — %d existing positions (skipped)",
-                             label, len(baseline_ids))
-                    # Still track live IDs for close detection on OTHER wallets
+                    wallet_opened = 0
                     for pos in positions:
+                        cid = pos.get("conditionId", "")
+                        if not cid:
+                            continue
                         identity = db.get_position_identity(pos, wallet=address)
                         reconciliation_key = identity["canonical_ref"] or identity["condition_id"]
                         if reconciliation_key:
                             live_position_keys.add((address.lower(), reconciliation_key))
-                    _record_wallet_event(
-                        source="autonomy",
-                        wallet=address,
-                        label=label,
-                        event_type="baseline_set",
-                        status="baseline_skipped",
-                        reason=f"Baseline set from {len(baseline_ids)} existing positions during autonomy cycle.",
-                        checked_at=now_ts,
-                        positions_count=len(baseline_ids),
-                        details={"baseline_positions": baseline_ids},
-                    )
-                    continue
 
-                wallet_opened = 0
-                for pos in positions:
-                    cid = pos.get("conditionId", "")
-                    if not cid:
-                        continue
-                    identity = db.get_position_identity(pos, wallet=address)
-                    reconciliation_key = identity["canonical_ref"] or identity["condition_id"]
-                    if reconciliation_key:
-                        live_position_keys.add((address.lower(), reconciliation_key))
-
-                    # Skip positions that existed before we started watching
-                    if any(
-                        key in baseline
-                        for key in {
-                            identity["canonical_ref"],
-                            identity["external_position_id"],
-                            identity["condition_id"],
-                        }
-                        if key
-                    ):
-                        continue
-
-                    # New position — not yet mirrored
-                    position_key = (address.lower(), reconciliation_key)
-                    if position_key not in open_copy:
-                        decision = db.inspect_copy_trade_open(
-                            address,
-                            pos,
-                            size_usd=20,
-                            max_wallet_open=max_copy_wallet_open,
-                            max_total_open=max_copy_total_open,
-                            runtime_scope=runtime_scope,
-                        )
-                        if not decision["ok"]:
-                            record_attempt(
-                                level,
-                                "copy",
-                                "blocked",
-                                decision["reason_code"],
-                                decision["reason"],
-                                event=f"{label}: {pos.get('title','')}",
-                                token_id=pos.get("asset"),
-                                wallet=address,
-                                condition_id=cid,
-                                size_usd=20,
-                                phase=current_stage,
-                            )
-                            _record_wallet_event(
-                                source="autonomy",
-                                wallet=address,
-                                label=label,
-                                event_type="new_position",
-                                status="blocked",
-                                reason_code=decision["reason_code"],
-                                reason=decision["reason"],
-                                condition_id=cid,
-                                outcome_name=pos.get("outcome"),
-                                market_title=pos.get("title"),
-                                price=pos.get("curPrice"),
-                                position_value_usd=pos.get("currentValue"),
-                                checked_at=now_ts,
-                                positions_count=len([p for p in positions if p.get("conditionId")]),
-                            )
-                            journal({
-                                "action": "skip_trade",
-                                "level": level,
-                                "trade_type": "copy",
-                                "event": f"{label}: {pos.get('title','')[:50]}",
-                                "reason": decision["reason"],
-                            })
-                            log.info("Step 4e: Copy skip for %s — %s", label, decision["reason"])
-                            continue
-                        t_id = db.open_copy_trade(
-                            address,
-                            label,
-                            pos,
-                            size_usd=20,
-                            max_wallet_open=max_copy_wallet_open,
-                            max_total_open=max_copy_total_open,
-                            runtime_scope=runtime_scope,
-                        )
-                        if t_id:
-                            record_attempt(
-                                level,
-                                "copy",
-                                "allowed",
-                                "opened",
-                                "Paper copy trade opened.",
-                                event=f"{label}: {pos.get('title','')}",
-                                trade_id=t_id,
-                                token_id=pos.get("asset"),
-                                wallet=address,
-                                condition_id=cid,
-                                size_usd=20,
-                                phase=current_stage,
-                            )
-                            copy_opened += 1
-                            wallet_opened += 1
-                            open_copy[position_key] = {
-                                "id": t_id,
-                                "copy_wallet": address,
-                                "copy_condition_id": cid,
-                                "copy_label": label,
-                                "copy_outcome": pos.get("outcome"),
-                                "canonical_ref": identity["canonical_ref"],
-                                "external_position_id": identity["external_position_id"],
-                                "entry_price_a": decision.get("entry_price"),
-                                "size_usd": 20,
-                                "event": pos.get("title"),
+                        # Skip positions that existed before we started watching
+                        if any(
+                            key in baseline
+                            for key in {
+                                identity["canonical_ref"],
+                                identity["external_position_id"],
+                                identity["condition_id"],
                             }
-                            journal({
-                                "action": "trade_opened",
-                                "level": level,
-                                "mode": "paper",
-                                "trade_id": t_id,
-                                "trade_type": "copy",
-                                "event": f"{label}: {pos.get('title','')[:50]}",
-                                "size_usd": 20,
-                                "reason": f"Copy {label} — {pos.get('outcome','')} @{pos.get('curPrice',0):.3f}",
-                            })
-                            _record_wallet_event(
-                                source="autonomy",
-                                wallet=address,
-                                label=label,
-                                event_type="new_position",
-                                status="mirrored",
-                                reason_code="opened",
-                                reason=f"Paper copy trade opened as trade #{t_id} during autonomy cycle.",
-                                condition_id=cid,
-                                outcome_name=pos.get("outcome"),
-                                market_title=pos.get("title"),
-                                price=pos.get("curPrice"),
-                                position_value_usd=pos.get("currentValue"),
-                                checked_at=now_ts,
-                                positions_count=len([p for p in positions if p.get("conditionId")]),
-                                details={"trade_id": t_id, "size_usd": 20},
+                            if key
+                        ):
+                            continue
+
+                        # New position — not yet mirrored
+                        position_key = (address.lower(), reconciliation_key)
+                        if position_key not in open_copy:
+                            decision = db.inspect_copy_trade_open(
+                                address,
+                                pos,
+                                size_usd=20,
+                                max_wallet_open=max_copy_wallet_open,
+                                max_total_open=max_copy_total_open,
+                                runtime_scope=runtime_scope,
                             )
-                            log.info("Step 4e: Mirrored %s — %s %s @%.3f",
-                                     label, pos.get("outcome"), pos.get("title","")[:40], pos.get("curPrice", 0))
+                            if not decision["ok"]:
+                                record_attempt(
+                                    level,
+                                    "copy",
+                                    "blocked",
+                                    decision["reason_code"],
+                                    decision["reason"],
+                                    event=f"{label}: {pos.get('title','')}",
+                                    token_id=pos.get("asset"),
+                                    wallet=address,
+                                    condition_id=cid,
+                                    size_usd=20,
+                                    phase=current_stage,
+                                )
+                                _record_wallet_event(
+                                    source="autonomy",
+                                    wallet=address,
+                                    label=label,
+                                    event_type="new_position",
+                                    status="blocked",
+                                    reason_code=decision["reason_code"],
+                                    reason=decision["reason"],
+                                    condition_id=cid,
+                                    outcome_name=pos.get("outcome"),
+                                    market_title=pos.get("title"),
+                                    price=pos.get("curPrice"),
+                                    position_value_usd=pos.get("currentValue"),
+                                    checked_at=now_ts,
+                                    positions_count=len([p for p in positions if p.get("conditionId")]),
+                                )
+                                journal({
+                                    "action": "skip_trade",
+                                    "level": level,
+                                    "trade_type": "copy",
+                                    "event": f"{label}: {pos.get('title','')[:50]}",
+                                    "reason": decision["reason"],
+                                })
+                                log.info("Step 4e: Copy skip for %s — %s", label, decision["reason"])
+                                continue
+                            t_id = db.open_copy_trade(
+                                address,
+                                label,
+                                pos,
+                                size_usd=20,
+                                max_wallet_open=max_copy_wallet_open,
+                                max_total_open=max_copy_total_open,
+                                runtime_scope=runtime_scope,
+                            )
+                            if t_id:
+                                record_attempt(
+                                    level,
+                                    "copy",
+                                    "allowed",
+                                    "opened",
+                                    "Paper copy trade opened.",
+                                    event=f"{label}: {pos.get('title','')}",
+                                    trade_id=t_id,
+                                    token_id=pos.get("asset"),
+                                    wallet=address,
+                                    condition_id=cid,
+                                    size_usd=20,
+                                    phase=current_stage,
+                                )
+                                copy_opened += 1
+                                wallet_opened += 1
+                                open_copy[position_key] = {
+                                    "id": t_id,
+                                    "copy_wallet": address,
+                                    "copy_condition_id": cid,
+                                    "copy_label": label,
+                                    "copy_outcome": pos.get("outcome"),
+                                    "canonical_ref": identity["canonical_ref"],
+                                    "external_position_id": identity["external_position_id"],
+                                    "entry_price_a": decision.get("entry_price"),
+                                    "size_usd": 20,
+                                    "event": pos.get("title"),
+                                }
+                                journal({
+                                    "action": "trade_opened",
+                                    "level": level,
+                                    "mode": "paper",
+                                    "trade_id": t_id,
+                                    "trade_type": "copy",
+                                    "event": f"{label}: {pos.get('title','')[:50]}",
+                                    "size_usd": 20,
+                                    "reason": f"Copy {label} — {pos.get('outcome','')} @{pos.get('curPrice',0):.3f}",
+                                })
+                                _record_wallet_event(
+                                    source="autonomy",
+                                    wallet=address,
+                                    label=label,
+                                    event_type="new_position",
+                                    status="mirrored",
+                                    reason_code="opened",
+                                    reason=f"Paper copy trade opened as trade #{t_id} during autonomy cycle.",
+                                    condition_id=cid,
+                                    outcome_name=pos.get("outcome"),
+                                    market_title=pos.get("title"),
+                                    price=pos.get("curPrice"),
+                                    position_value_usd=pos.get("currentValue"),
+                                    checked_at=now_ts,
+                                    positions_count=len([p for p in positions if p.get("conditionId")]),
+                                    details={"trade_id": t_id, "size_usd": 20},
+                                )
+                                log.info("Step 4e: Mirrored %s — %s %s @%.3f",
+                                         label, pos.get("outcome"), pos.get("title","")[:40], pos.get("curPrice", 0))
 
-                if wallet_opened == 0:
-                    _record_wallet_event(
-                        source="autonomy",
-                        wallet=address,
-                        label=label,
-                        event_type="wallet_polled",
-                        status="no_change",
-                        reason=f"Autonomy poll saw {len([p for p in positions if p.get('conditionId')])} live positions and no new copy actions.",
-                        checked_at=now_ts,
-                        positions_count=len([p for p in positions if p.get("conditionId")]),
-                    )
-                else:
-                    _record_wallet_event(
-                        source="autonomy",
-                        wallet=address,
-                        label=label,
-                        event_type="wallet_polled",
-                        status="changes_seen",
-                        reason=f"Autonomy poll mirrored {wallet_opened} new position(s) from {len([p for p in positions if p.get('conditionId')])} live positions.",
-                        checked_at=now_ts,
-                        positions_count=len([p for p in positions if p.get("conditionId")]),
-                        details={"opened": wallet_opened},
-                    )
+                    if wallet_opened == 0:
+                        _record_wallet_event(
+                            source="autonomy",
+                            wallet=address,
+                            label=label,
+                            event_type="wallet_polled",
+                            status="no_change",
+                            reason=f"Autonomy poll saw {len([p for p in positions if p.get('conditionId')])} live positions and no new copy actions.",
+                            checked_at=now_ts,
+                            positions_count=len([p for p in positions if p.get("conditionId")]),
+                        )
+                    else:
+                        _record_wallet_event(
+                            source="autonomy",
+                            wallet=address,
+                            label=label,
+                            event_type="wallet_polled",
+                            status="changes_seen",
+                            reason=f"Autonomy poll mirrored {wallet_opened} new position(s) from {len([p for p in positions if p.get('conditionId')])} live positions.",
+                            checked_at=now_ts,
+                            positions_count=len([p for p in positions if p.get("conditionId")]),
+                            details={"opened": wallet_opened},
+                        )
 
-            # Watched wallet has exited a position — close our mirror
-            for position_key, trade in open_copy.items():
-                if position_key not in live_position_keys:
-                    # Use entry price as exit (neutral P&L) — market may have resolved
-                    pnl = db.close_trade(trade["id"], exit_price_a=trade["entry_price_a"],
-                                         notes="auto-close: watched wallet exited position")
-                    copy_closed += 1
-                    journal({
-                        "action": "trade_closed",
-                        "trade_id": trade["id"],
-                        "trade_type": "copy",
-                        "pnl": pnl,
-                        "reason": f"Watched wallet {trade.get('copy_label','')} exited position",
-                    })
-                    _record_wallet_event(
-                        source="autonomy",
-                        wallet=trade.get("copy_wallet"),
-                        label=trade.get("copy_label"),
-                        event_type="position_closed",
-                        status="closed",
-                        reason_code="wallet_exited_position",
-                        reason=f"Mirrored trade #{trade['id']} closed because watched wallet exited the position.",
-                        condition_id=trade.get("copy_condition_id"),
-                        outcome_name=trade.get("copy_outcome"),
-                        market_title=trade.get("event"),
-                        position_value_usd=trade.get("size_usd"),
-                        checked_at=now_ts,
-                        details={"trade_id": trade["id"], "pnl": pnl},
-                    )
-                    log.info("Step 4e: Auto-closed copy trade %d (wallet exited) pnl=$%.2f",
-                             trade["id"], pnl or 0)
+                # Watched wallet has exited a position — close our mirror
+                for position_key, trade in open_copy.items():
+                    if position_key not in live_position_keys:
+                        # Use entry price as exit (neutral P&L) — market may have resolved
+                        pnl = db.close_trade(trade["id"], exit_price_a=trade["entry_price_a"],
+                                             notes="auto-close: watched wallet exited position")
+                        copy_closed += 1
+                        journal({
+                            "action": "trade_closed",
+                            "trade_id": trade["id"],
+                            "trade_type": "copy",
+                            "pnl": pnl,
+                            "reason": f"Watched wallet {trade.get('copy_label','')} exited position",
+                        })
+                        _record_wallet_event(
+                            source="autonomy",
+                            wallet=trade.get("copy_wallet"),
+                            label=trade.get("copy_label"),
+                            event_type="position_closed",
+                            status="closed",
+                            reason_code="wallet_exited_position",
+                            reason=f"Mirrored trade #{trade['id']} closed because watched wallet exited the position.",
+                            condition_id=trade.get("copy_condition_id"),
+                            outcome_name=trade.get("copy_outcome"),
+                            market_title=trade.get("event"),
+                            position_value_usd=trade.get("size_usd"),
+                            checked_at=now_ts,
+                            details={"trade_id": trade["id"], "pnl": pnl},
+                        )
+                        log.info("Step 4e: Auto-closed copy trade %d (wallet exited) pnl=$%.2f",
+                                 trade["id"], pnl or 0)
 
-            if copy_opened or copy_closed:
-                log.info("Step 4e: Copy trader — %d opened, %d closed", copy_opened, copy_closed)
-        except Exception as e:
-            log.debug("Copy trader step skipped during %s: %s", current_stage, e)
-            record_attempt(
-                level,
-                "copy",
-                "error",
-                "copy_trader_step_failed",
-                f"Copy trader step failed: {e}",
-                event="Copy trader",
-                phase=current_stage,
-            )
+                if copy_opened or copy_closed:
+                    log.info("Step 4e: Copy trader — %d opened, %d closed", copy_opened, copy_closed)
+            except Exception as e:
+                log.debug("Copy trader step skipped during %s: %s", current_stage, e)
+                record_attempt(
+                    level,
+                    "copy",
+                    "error",
+                    "copy_trader_step_failed",
+                    f"Copy trader step failed: {e}",
+                    event="Copy trader",
+                    phase=current_stage,
+                )
 
         # Step 4f: Wallet discovery (every 6 hours)
         current_stage = "step 4f wallet discovery"
-        try:
-            import wallet_discovery
-            last_discovery = state.get("last_discovery", 0)
-            if time.time() - last_discovery > 6 * 3600:
-                log.info("Step 4f: Running wallet discovery...")
-                result = wallet_discovery.run_discovery(auto_add=True, verbose=False)
-                state["last_discovery"] = time.time()
-                log.info("Step 4f: Discovery — %d candidates, %d auto-added",
-                         result.get("candidates_pending", 0), result.get("auto_added", 0))
-            else:
-                hrs = (time.time() - last_discovery) / 3600
-                log.info("Step 4f: Discovery skipped (ran %.1fh ago, next in %.1fh)",
-                         hrs, 6 - hrs)
-        except Exception as e:
-            log.debug("Wallet discovery step skipped during %s: %s", current_stage, e)
+        if not paper_only_runtime(runtime_scope):
+            log.info("Step 4f: Skipping paper-only wallet discovery for scope=%s", runtime_scope)
+            journal({
+                "action": "paper_only_step_skipped",
+                "level": level,
+                "runtime_scope": runtime_scope,
+                "strategy": "wallet_discovery",
+                "reason": f"Wallet discovery is paper-only and is disabled for scope={runtime_scope}.",
+            })
+        else:
+            try:
+                import wallet_discovery
+                last_discovery = state.get("last_discovery", 0)
+                if time.time() - last_discovery > 6 * 3600:
+                    log.info("Step 4f: Running wallet discovery...")
+                    result = wallet_discovery.run_discovery(auto_add=True, verbose=False)
+                    state["last_discovery"] = time.time()
+                    log.info("Step 4f: Discovery — %d candidates, %d auto-added",
+                             result.get("candidates_pending", 0), result.get("auto_added", 0))
+                else:
+                    hrs = (time.time() - last_discovery) / 3600
+                    log.info("Step 4f: Discovery skipped (ran %.1fh ago, next in %.1fh)",
+                             hrs, 6 - hrs)
+            except Exception as e:
+                log.debug("Wallet discovery step skipped during %s: %s", current_stage, e)
 
         # Step 4g: Whale / insider detection
         current_stage = "step 4g whale scan"
@@ -1596,8 +1683,15 @@ def run_cycle(state):
             })
 
         save_state(state)
-        log.info("=== Cycle complete: level=%s trades=%d open=%d pnl=$%.2f ===",
-                 level, perf["total_trades"], open_count + traded, perf["total_pnl"])
+        log.info(
+            "=== Cycle complete: level=%s scope=%s runtime=%s trades=%d open=%d pnl=$%.2f ===",
+            level,
+            runtime_scope,
+            runtime_tag,
+            perf["total_trades"],
+            open_count + traded,
+            perf["total_pnl"],
+        )
         return state
     except Exception:
         log.exception("Autonomy cycle failed during %s", current_stage)
@@ -1805,9 +1899,8 @@ def main():
                         help="Reset level counters (keeps level)")
     args = parser.parse_args()
 
-    state = load_state(runtime_scope=args.runtime_scope)
-
     # Override level if specified
+    state = load_state(runtime_scope=args.runtime_scope)
     if args.level:
         state["level"] = args.level
         state["runtime_scope"] = runtime_scope_for_level(args.level)
@@ -1837,7 +1930,26 @@ def main():
         return
 
     # Run the autonomous cycle
-    run_cycle(state)
+    if args.runtime_scope:
+        run_cycle(state)
+        return
+
+    scopes = background_runtime_scopes()
+    if not scopes:
+        log.warning(
+            "Autonomy scheduler disabled because %s resolved to no enabled scopes",
+            BACKGROUND_SCOPES_ENV,
+        )
+        return
+
+    log.info(
+        "Autonomy scheduler scopes=%s via %s",
+        ",".join(scopes),
+        BACKGROUND_SCOPES_ENV,
+    )
+    for scope in scopes:
+        scoped_state = load_state(runtime_scope=scope)
+        run_cycle(scoped_state)
 
 
 if __name__ == "__main__":

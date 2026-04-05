@@ -34,6 +34,7 @@ def _get_active_wallets() -> dict:
     return {r["address"]: r["label"] for r in rows}
 
 log = logging.getLogger("scanner.wallet_monitor")
+RUNTIME_SCOPE = db.RUNTIME_SCOPE_PAPER
 
 # ── Config ─────────────────────────────────────────────────────────────────────
 
@@ -806,7 +807,11 @@ def start():
     _ws_thread.start()
 
     _update_running_status()
-    log.info("Wallet monitor started — polling every %ds, WS price feed active", POLL_INTERVAL)
+    log.info(
+        "Wallet monitor started — runtime_scope=%s polling every %ds, WS price feed active",
+        RUNTIME_SCOPE,
+        POLL_INTERVAL,
+    )
 
 
 def stop(join_timeout: float = 5.0):
@@ -829,6 +834,7 @@ def stop(join_timeout: float = 5.0):
 
 def get_status() -> dict:
     return {
+        "runtime_scope": RUNTIME_SCOPE,
         "running": _status["running"],
         "last_poll": _status["last_poll"],
         "last_score": _status["last_score"],

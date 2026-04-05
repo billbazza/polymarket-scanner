@@ -1,7 +1,9 @@
 import importlib
 import json
 import os
+import sys
 import tempfile
+import types
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -232,11 +234,15 @@ class RuntimeScopeSplitTests(unittest.TestCase):
         self.db.close_trade(penny_trade_id, 0.60, 0.40, "penny close")
 
         with patch.object(self.db, "_get_live_wallet_snapshot", return_value={
+            "ok": True,
+            "verified": True,
+            "verification_status": "verified",
             "wallet_connected": True,
             "wallet_address": "0x1234567890abcdef1234567890abcdef12345678",
             "available_balance_usd": 12.0,
             "balance_source": "polygon_wallet",
             "wallet_error": None,
+            "verification_error": None,
         }):
             penny_stats = self.client.get("/api/stats?runtime_scope=penny").json()
             penny_account = self.client.get("/api/runtime/account?runtime_scope=penny").json()
@@ -308,6 +314,89 @@ class RuntimeScopeSplitTests(unittest.TestCase):
             migrated = autonomy.load_state("penny")
             self.assertEqual(migrated["runtime_scope"], "penny")
             self.assertTrue((tmp_path / "logs" / "autonomy_state.penny.json").exists())
+
+    def test_autonomy_background_scopes_require_explicit_configuration_for_concurrency(self):
+        import autonomy
+
+        autonomy = importlib.reload(autonomy)
+        self.assertEqual(autonomy.background_runtime_scopes(None), ["paper"])
+        self.assertEqual(autonomy.background_runtime_scopes("penny"), ["penny"])
+        self.assertEqual(autonomy.background_runtime_scopes("paper,penny"), ["paper", "penny"])
+        self.assertEqual(autonomy.background_runtime_scopes("disabled"), [])
+
+    def test_autonomy_journal_labels_runtime_scope_and_runtime_label(self):
+        import autonomy
+
+        autonomy = importlib.reload(autonomy)
+        captured = []
+        with patch.object(autonomy.journal_writer, "append_entry", side_effect=lambda entry: captured.append(entry) or entry):
+            autonomy.journal({"action": "unit_test", "level": "penny", "reason": "check scope defaults"})
+
+        self.assertEqual(len(captured), 1)
+        self.assertEqual(captured[0]["runtime_scope"], "penny")
+        self.assertEqual(captured[0]["runtime_label"], "autonomy:penny")
+
+    def test_penny_runtime_skips_paper_only_autonomy_steps(self):
+        import autonomy
+
+        autonomy = importlib.reload(autonomy)
+        state = autonomy.default_state("penny")
+        state["level"] = "penny"
+
+        journal_entries = []
+        fake_weather_strategy = types.SimpleNamespace(
+            scan_weather_opportunities=lambda **kwargs: (_ for _ in ()).throw(
+                AssertionError("weather scan should be skipped for penny runtime")
+            )
+        )
+        fake_weather_exact = types.SimpleNamespace(
+            exact_temp_enabled=lambda: False,
+            exact_temp_autotrade_enabled=lambda: False,
+        )
+        fake_copy_scanner = types.SimpleNamespace(
+            get_positions=lambda address: (_ for _ in ()).throw(
+                AssertionError("copy trader should be skipped for penny runtime")
+            )
+        )
+        fake_wallet_discovery = types.SimpleNamespace(
+            run_discovery=lambda **kwargs: (_ for _ in ()).throw(
+                AssertionError("wallet discovery should be skipped for penny runtime")
+            )
+        )
+        fake_longshot = types.SimpleNamespace(scan=lambda **kwargs: ([], {"markets_checked": 0}))
+        fake_near_certainty = types.SimpleNamespace(scan=lambda **kwargs: ([], {"markets_checked": 0}))
+        fake_whale = types.SimpleNamespace(scan=lambda **kwargs: ([], {"markets_checked": 0}))
+
+        with patch.object(autonomy.async_scanner, "scan", return_value={
+            "opportunities": [],
+            "pairs_tested": 0,
+            "pairs_cointegrated": 0,
+        }), \
+             patch.object(autonomy.db, "save_scan_run"), \
+             patch.object(autonomy.tracker, "refresh_open_trades", return_value=[]), \
+             patch.object(autonomy.execution, "manage_open_orders", return_value={"filled": 0, "cancelled": 0}), \
+             patch.object(autonomy.trade_monitor, "reconcile_open_trades", return_value={"counts": {}, "results": [], "auto_closed_trade_ids": []}), \
+             patch.object(autonomy.tracker, "auto_close_trades", return_value=[]), \
+             patch.object(autonomy.db, "get_trades", return_value=[]), \
+             patch.object(autonomy, "save_state"), \
+             patch.object(autonomy, "journal", side_effect=lambda entry: journal_entries.append(entry)), \
+             patch.dict(sys.modules, {
+                 "weather_strategy": fake_weather_strategy,
+                 "weather_exact_temp_scanner": fake_weather_exact,
+                 "copy_scanner": fake_copy_scanner,
+                 "wallet_discovery": fake_wallet_discovery,
+                 "longshot_scanner": fake_longshot,
+                 "near_certainty_scanner": fake_near_certainty,
+                 "whale_detector": fake_whale,
+             }, clear=False):
+            autonomy.run_cycle(state)
+
+        skipped = [entry for entry in journal_entries if entry.get("action") == "paper_only_step_skipped"]
+        self.assertEqual(
+            {entry.get("strategy") for entry in skipped},
+            {"weather", "copy", "wallet_discovery"},
+        )
+        self.assertTrue(all(entry.get("runtime_scope") == "penny" for entry in skipped))
 
     def test_autonomy_runtime_api_returns_scoped_state_and_limits(self):
         import autonomy

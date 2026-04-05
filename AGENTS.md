@@ -45,7 +45,7 @@ Monitoring:    log_setup.py → logs/scanner.log + logs/journal.jsonl (trade aud
 - **weather** (single-leg): `entry_price_a` only, `token_id_a` stored on trade. Auto-closes when price ≥ 0.99 (WIN) or ≤ 0.01 (LOSS). `signal_id=NULL`, `weather_signal_id` foreign key instead.
 
 ### Autonomy Loop (every 30 min via launchd)
-`autonomy.py` levels: `scout` (scan only) → `paper` (auto paper-trade A+ signals) → `penny` (real $1-5) → `book` (Kelly-sized). Paper and penny now persist isolated runtime state and scoped trade/accounting views, so paper experiments can stay open without consuming penny `max_open` capacity. Each cycle: scan pairs → scan weather → refresh open trades → auto-close reverted/resolved trades → open new trades up to the scoped `max_open`.
+`autonomy.py` levels: `scout` (scan only) → `paper` (auto paper-trade A+ signals) → `penny` (real $1-5) → `book` (Kelly-sized). Paper and penny now persist isolated runtime state and scoped trade/accounting views, so paper experiments can stay open without consuming penny `max_open` capacity. Unattended launchd runs must use explicit scope selection via `AUTONOMY_BACKGROUND_SCOPES`; the default is paper-only, concurrent paper+penny loops are opt-in, and every cycle must log its `scope`/`runtime_label`. Paper-only strategy steps (weather auto-trading, copy mirroring, wallet discovery, wallet monitor) must stay disabled outside the paper runtime unless intentionally redesigned for a separate penny-safe lane. Each cycle: scan pairs → scan weather → refresh open trades → auto-close reverted/resolved trades → open new trades up to the scoped `max_open`.
 
 ## Key Conventions
 
@@ -62,6 +62,7 @@ Every opportunity flows: scanner finds pair → `math_engine.score_opportunity()
 
 ### Trading Modes
 - **Paper** (default): simulates against current prices, tracks in SQLite. There are no limits on numbers of trades while in paper mode. Paper-runtime trades, balances, and autonomy state are now isolated from the penny runtime, so open paper experiments do not block penny `max_open` limits or penny dashboard views. Autonomy now derives `mode="paper"` explicitly from the normalized `level` string so paper-level cointegration trades never invoke `brain.validate_signal()`; the system logs a `brain_validation_skipped` journal entry for each admitted A+ cohort signal, making the math-only trade path auditable while still enforcing slippage and balance checks.
+- **Runtime ownership**: unattended autonomy and background wallet-monitor/copy-trader work must never implicitly follow the wrong scope. If penny is the active operational runtime, paper loops must be disabled unless `AUTONOMY_BACKGROUND_SCOPES` explicitly includes `paper`, and concurrent runtimes must remain clearly labeled as separate `autonomy:paper` / `autonomy:penny` audit lanes.
 - **Live**: requires `POLYMARKET_PRIVATE_KEY` in the macOS Keychain (or an explicit per-process env override), uses py-clob-client
 - **Dashboard/runtime semantics**: `/api/runtime/account` is the canonical dashboard account endpoint. Paper scope reports bankroll accounting; penny scope reports verified Polygon wallet-backed cash plus only penny-scoped positions/PnL. Penny mode is fail-closed: if live Polygon wallet data is unavailable, stale, or cannot be verified, the backend must error/block rather than falling back to paper balances, paper PnL, shared aggregate totals, or paper-derived closed-trade history, and the UI must show an explicit `LIVE / POLYGON WALLET` status. `/api/stats`, `/api/runtime/account`, and `/api/autonomy/runtime` must reconcile exactly to the selected scope’s trade ledger and max-open usage.
 
@@ -171,9 +172,11 @@ Process environment variables with the same names remain valid as explicit one-s
 - `TELEGRAM_BOT_TOKEN` + `TELEGRAM_CHAT_ID` — enables Telegram alerts
 - `ALCHEMY_API_KEY` — enables blockchain.py (Polygon RPC)
 - `POLYMARKET_PRIVATE_KEY` — enables live trading (Tier 3)
+- `AUTONOMY_BACKGROUND_SCOPES` — comma-separated unattended autonomy scopes. Default `paper`; set to `penny` for penny-only launchd runs or `paper,penny` only when concurrent background runtimes are intentionally enabled and understood.
 - `STAGE2_POLYGON_GATING` — `1`/`true`/`yes` turns on Stage 2 Polygon gating; paper trades log the Polygon block snapshot, chain parity, and dual-leg slippage before execution.
 
 ## Recent Fix Logs
+- `fix_logs/2026-04-05-autonomy-runtime-scheduler-isolation.md`: added explicit background-scope configuration for unattended autonomy, labeled every autonomy journal lane with its runtime scope, gated paper-only strategy steps out of the penny runtime, and tied the singleton wallet monitor to the paper background scope so penny operation no longer inherits paper loops unless intentionally configured.
 - `fix_logs/2026-04-04-weather-guard-state.md`: added a persisted guard-state machine to keep the low-guardrail regime active until repeated stop-loss failures escalate the thresholds, and now log both the current and legacy blockers so we always know which filters would have vetoed the trade.
 - `fix_logs/2026-04-04-weather-guard-relaxation.md`: relaxed the weather guard (liquidity>=5k / horizon>=48h / disagreement<=18pp) and now log the legacy vs relaxed tradeable counts so the before/after volumes stay auditable.
 - `fix_logs/2026-04-04-weather-guardrail-improvements.md`: enforced the reopen probation counter for approved weather tokens, re-validated the horizon before fills, capped weather holds to ~72h, and logged stop contexts per token so the new diagnostics/journal payloads stay aligned.
