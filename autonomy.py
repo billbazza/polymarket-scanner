@@ -857,34 +857,32 @@ def run_cycle(state):
                 log.info("  Skip: signal %d already has an open trade", signal_id)
                 journal({"action": "skip_trade", "level": level,
                          "reason": f"Signal {signal_id} already open"})
-                if paper_mode:
-                    record_attempt(
-                        level,
-                        "pairs",
-                        "blocked",
-                        "signal_already_open",
-                        f"Signal {signal_id} already has an open trade.",
-                        event=event_name,
-                        signal_id=signal_id,
-                        phase=current_stage,
-                    )
+                record_attempt(
+                    level,
+                    "pairs",
+                    "blocked",
+                    "signal_already_open",
+                    f"Signal {signal_id} already has an open trade.",
+                    event=event_name,
+                    signal_id=signal_id,
+                    phase=current_stage,
+                )
                 continue
 
             if event_name in open_events or event_name in this_cycle_events:
                 log.info("  Skip: already have position in '%s'", event_name[:40])
                 journal({"action": "skip_trade", "level": level,
                          "reason": f"Already trading event: {event_name[:40]}"})
-                if paper_mode:
-                    record_attempt(
-                        level,
-                        "pairs",
-                        "blocked",
-                        "event_already_open",
-                        f"Already trading event: {event_name[:60]}",
-                        event=event_name,
-                        signal_id=signal_id,
-                        phase=current_stage,
-                    )
+                record_attempt(
+                    level,
+                    "pairs",
+                    "blocked",
+                    "event_already_open",
+                    f"Already trading event: {event_name[:60]}",
+                    event=event_name,
+                    signal_id=signal_id,
+                    phase=current_stage,
+                )
                 continue
 
             # Determine size for this trade
@@ -920,18 +918,18 @@ def run_cycle(state):
                             "event": event_name[:60],
                             "reason": brain_reasoning,
                         })
-                        if mode == "paper":
-                            record_attempt(
-                                level,
-                                "pairs",
-                                "blocked",
-                                "brain_rejected",
-                                brain_reasoning,
-                                event=event_name,
-                                signal_id=signal_id,
-                                size_usd=trade_size,
-                                phase="step 4.5 brain validation",
-                            )
+                        record_attempt(
+                            level,
+                            "pairs",
+                            "blocked",
+                            "brain_rejected",
+                            brain_reasoning,
+                            event=event_name,
+                            signal_id=signal_id,
+                            size_usd=trade_size,
+                            phase="step 4.5 brain validation",
+                            details={"live_only_safeguard": mode == "live"},
+                        )
                         continue
                     log.info("  Brain VALIDATED trade: %s", brain_reasoning)
                     opp["brain_reasoning"] = brain_reasoning
@@ -963,26 +961,31 @@ def run_cycle(state):
                     traded += 1
                     this_cycle_signal_ids.add(signal_id)
                     this_cycle_events.add(event_name)
+                    record_attempt(
+                        level,
+                        "pairs",
+                        "allowed",
+                        "opened",
+                        f"{'Paper' if mode == 'paper' else 'Penny'} pairs trade opened.",
+                        event=event_name,
+                        signal_id=signal_id,
+                        trade_id=result.get("trade_id"),
+                        size_usd=trade_size,
+                        phase=current_stage,
+                        details={
+                            "grade": opp.get("grade_label"),
+                            "admission_path": opp.get("admission_path"),
+                            "experiment_status": opp.get("experiment_status"),
+                            "paper_sizing": sizing_decision,
+                            "reason_code": result.get("reason_code"),
+                            "entry_execution": result.get("entry_execution"),
+                            "pending": result.get("pending"),
+                            "order_a": result.get("order_a"),
+                            "order_b": result.get("order_b"),
+                            **_stage2_details(result),
+                        },
+                    )
                     if mode == "paper":
-                        record_attempt(
-                            level,
-                            "pairs",
-                            "allowed",
-                            "opened",
-                            "Paper pairs trade opened.",
-                            event=event_name,
-                            signal_id=signal_id,
-                            trade_id=result.get("trade_id"),
-                            size_usd=trade_size,
-                            phase=current_stage,
-                            details={
-                                "grade": opp.get("grade_label"),
-                                "admission_path": opp.get("admission_path"),
-                                "experiment_status": opp.get("experiment_status"),
-                                "paper_sizing": sizing_decision,
-                                **_stage2_details(result),
-                            },
-                        )
                         journal({
                             "action": "trade_opened",
                             "level": level,
@@ -1007,45 +1010,49 @@ def run_cycle(state):
                             "reason": opp.get("experiment_reason") or f"Signal admitted, z={opp.get('z_score', 0):+.2f}",
                         })
                 else:
-                    if mode == "paper":
-                        record_attempt(
-                            level,
-                            "pairs",
-                            "blocked",
-                            "execution_rejected",
-                            result.get("error", "Trade execution rejected."),
-                            event=event_name,
-                            signal_id=signal_id,
-                            size_usd=trade_size,
-                            phase=current_stage,
-                            details={
-                                "grade": opp.get("grade_label"),
-                                "paper_sizing": sizing_decision,
-                                **_stage2_details(result),
-                            },
-                        )
+                    record_attempt(
+                        level,
+                        "pairs",
+                        "blocked",
+                        result.get("reason_code") or "execution_rejected",
+                        result.get("error", "Trade execution rejected."),
+                        event=event_name,
+                        signal_id=signal_id,
+                        size_usd=trade_size,
+                        phase=current_stage,
+                        details={
+                            "grade": opp.get("grade_label"),
+                            "paper_sizing": sizing_decision,
+                            "mode": mode,
+                            "pending": result.get("pending"),
+                            "slippage": result.get("slippage"),
+                            "balance": result.get("balance"),
+                            **_stage2_details(result),
+                        },
+                    )
                     journal({
                         "action": "trade_rejected",
                         "level": level,
                         "event": event_name[:60],
                         "grade": opp.get("grade_label", "?"),
                         "admission_path": opp.get("admission_path"),
+                        "reason_code": result.get("reason_code"),
                         "reason": result.get("error", "unknown"),
                     })
             except Exception as e:
                 log.error("  Trade execution failed: %s", e)
-                if mode == "paper":
-                    record_attempt(
-                        level,
-                        "pairs",
-                        "error",
-                        "trade_execution_failed",
-                        f"Trade execution failed: {e}",
-                        event=event_name,
-                        signal_id=signal_id,
-                        size_usd=trade_size,
-                        phase=current_stage,
-                    )
+                record_attempt(
+                    level,
+                    "pairs",
+                    "error",
+                    "trade_execution_failed",
+                    f"Trade execution failed: {e}",
+                    event=event_name,
+                    signal_id=signal_id,
+                    size_usd=trade_size,
+                    phase=current_stage,
+                    details={"mode": mode},
+                )
                 journal({"action": "trade_error", "level": level,
                          "event": event_name[:60], "reason": str(e)})
 

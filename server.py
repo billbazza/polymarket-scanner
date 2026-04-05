@@ -963,8 +963,28 @@ async def get_report_item_log(item_id: int):
 # --- Signals ---
 
 @app.get("/api/signals")
-async def list_signals(limit: int = 50, status: str = None, include_rejected: bool = False):
-    return db.get_signals(limit=limit, status=status, include_rejected=include_rejected)
+async def list_signals(
+    limit: int = 50,
+    status: str = None,
+    include_rejected: bool = False,
+    runtime_scope: str | None = None,
+):
+    scope = _runtime_scope_param(runtime_scope)
+    try:
+        import autonomy
+        state = autonomy.load_state(runtime_scope=scope)
+        level_key = state.get("level")
+        level_config = autonomy.get_level_config(level_key, scope)
+        size_usd = level_config.get("size_usd") or 0
+    except Exception:
+        size_usd = 3 if scope == db.RUNTIME_SCOPE_PENNY else 20
+    return db.get_signals(
+        limit=limit,
+        status=status,
+        include_rejected=include_rejected,
+        runtime_scope=scope,
+        size_usd=size_usd,
+    )
 
 
 @app.get("/api/signals/{signal_id}")
@@ -1469,16 +1489,35 @@ async def create_trade(signal_id: int, size_usd: float = 100, runtime_scope: str
             strategy="pairs",
             outcome="error",
             runtime_scope=runtime_scope,
-            reason_code="open_failed",
+            reason_code=result.get("reason_code") or "open_failed",
             reason=result.get("error") or "Trade execution failed after preflight passed.",
             event=((decision.get("signal") or {}).get("event")),
             signal_id=signal_id,
             size_usd=size_usd,
-            details={"path": "/api/trades"},
+            details={
+                "path": "/api/trades",
+                "mode": mode,
+                "slippage": result.get("slippage"),
+                "balance": result.get("balance"),
+            },
         )
+        status_code = 400 if (result.get("reason_code") or "").endswith("_blocked") or result.get("reason_code") in {
+            "balance_check_failed",
+            "insufficient_balance",
+            "invalid_prices",
+            "slippage_block",
+            "hmrc_gate_blocked",
+            "private_key_missing",
+            "clob_client_missing",
+        } else 409
         return JSONResponse(
-            status_code=409,
-            content={"ok": False, "error": result.get("error") or "Pairs trade could not be opened.", "reason_code": "open_failed"},
+            status_code=status_code,
+            content={
+                "ok": False,
+                "error": result.get("error") or "Pairs trade could not be opened.",
+                "reason": result.get("error") or "Pairs trade could not be opened.",
+                "reason_code": result.get("reason_code") or "open_failed",
+            },
         )
     _safe_record_paper_trade_attempt(
         source="manual_api",
@@ -1486,12 +1525,18 @@ async def create_trade(signal_id: int, size_usd: float = 100, runtime_scope: str
         outcome="allowed",
         runtime_scope=runtime_scope,
         reason_code="opened",
-        reason="Paper pairs trade opened.",
+        reason=f"{'Paper' if mode == 'paper' else 'Penny'} pairs trade opened.",
         event=((decision.get("signal") or {}).get("event")),
         signal_id=signal_id,
         trade_id=result.get("trade_id"),
         size_usd=size_usd,
-        details={"path": "/api/trades"},
+        details={
+            "path": "/api/trades",
+            "mode": mode,
+            "pending": result.get("pending"),
+            "order_a": result.get("order_a"),
+            "order_b": result.get("order_b"),
+        },
     )
     return {
         "ok": True,

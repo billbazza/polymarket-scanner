@@ -247,6 +247,17 @@ def _estimate_leg_fee_usd(exec_mode: str, notional_usd: float) -> float:
     return round(float(notional_usd or 0.0) * fee_rate, 2)
 
 
+def _failure_result(mode: str, reason_code: str, error: str, **extra) -> dict:
+    payload = {
+        "ok": False,
+        "mode": mode,
+        "reason_code": reason_code,
+        "error": error,
+    }
+    payload.update(extra)
+    return payload
+
+
 def execute_trade(signal, size_usd, mode=None):
     """Execute a pairs trade from a signal.
 
@@ -298,11 +309,12 @@ def execute_trade(signal, size_usd, mode=None):
     bal = check_balance(mode)
     if not bal["ok"]:
         log.warning("Balance check failed: %s", bal.get("error"))
-        return _wrap_result({
-            "ok": False,
-            "error": f"Balance check failed: {bal.get('error')}",
-            "mode": mode,
-        })
+        return _wrap_result(_failure_result(
+            mode,
+            "balance_check_failed",
+            f"Balance check failed: {bal.get('error')}",
+            balance=bal,
+        ))
 
     quarter_kelly_capped = False
     size_before_cap = size_usd
@@ -316,11 +328,13 @@ def execute_trade(signal, size_usd, mode=None):
         )
     if bal["balance_usd"] < size_usd:
         log.warning("Insufficient balance: $%.2f < $%.2f", bal["balance_usd"], size_usd)
-        return _wrap_result({
-            "ok": False,
-            "error": f"Insufficient balance: ${bal['balance_usd']:.2f} < ${size_usd:.2f}",
-            "mode": mode,
-        })
+        return _wrap_result(_failure_result(
+            mode,
+            "insufficient_balance",
+            f"Insufficient balance: ${bal['balance_usd']:.2f} < ${size_usd:.2f}",
+            balance=bal,
+            requested_size_usd=size_usd,
+        ))
 
     # 2. Determine sides and fetch entry prices
     token_a = signal.get("token_id_a") or signal["market_a"]
@@ -336,22 +350,24 @@ def execute_trade(signal, size_usd, mode=None):
             price_a, price_b = _get_maker_prices(token_a, token_b, side_a, side_b)
         except Exception as e:
             log.error("Failed to compute maker prices: %s", e)
-            return _wrap_result({"ok": False, "error": f"Maker price fetch failed: {e}", "mode": mode})
+            return _wrap_result(_failure_result(mode, "maker_price_fetch_failed", f"Maker price fetch failed: {e}"))
     else:
         try:
             price_a = api.get_midpoint(token_a)
             price_b = api.get_midpoint(token_b)
         except Exception as e:
             log.error("Failed to fetch current prices: %s", e)
-            return _wrap_result({"ok": False, "error": f"Price fetch failed: {e}", "mode": mode})
+            return _wrap_result(_failure_result(mode, "price_fetch_failed", f"Price fetch failed: {e}"))
 
     if price_a <= 0 or price_b <= 0:
         log.warning("Invalid prices: a=%.4f b=%.4f", price_a, price_b)
-        return _wrap_result({
-            "ok": False,
-            "error": f"Invalid prices: a={price_a} b={price_b}",
-            "mode": mode,
-        })
+        return _wrap_result(_failure_result(
+            mode,
+            "invalid_prices",
+            f"Invalid prices: a={price_a} b={price_b}",
+            price_a=price_a,
+            price_b=price_b,
+        ))
 
     half_size = size_usd / 2
 
@@ -367,21 +383,23 @@ def execute_trade(signal, size_usd, mode=None):
         slippage_leg_a = _check(token_a)
         if not slippage_leg_a["ok"]:
             log.warning("Slippage check failed for leg A: %s", slippage_leg_a.get("reason"))
-            return _wrap_result({
-                "ok": False,
-                "error": f"Slippage too high: {slippage_leg_a.get('reason')}",
-                "slippage": slippage_leg_a,
-                "mode": mode,
-            })
+            return _wrap_result(_failure_result(
+                mode,
+                "slippage_block",
+                f"Slippage too high: {slippage_leg_a.get('reason')}",
+                slippage=slippage_leg_a,
+                slippage_leg="a",
+            ))
         slippage_leg_b = _check(token_b)
         if not slippage_leg_b["ok"]:
             log.warning("Slippage check failed for leg B: %s", slippage_leg_b.get("reason"))
-            return _wrap_result({
-                "ok": False,
-                "error": f"Slippage too high on leg B: {slippage_leg_b.get('reason')}",
-                "slippage": slippage_leg_b,
-                "mode": mode,
-            })
+            return _wrap_result(_failure_result(
+                mode,
+                "slippage_block",
+                f"Slippage too high on leg B: {slippage_leg_b.get('reason')}",
+                slippage=slippage_leg_b,
+                slippage_leg="b",
+            ))
     elif mode == "paper":
         slippage_leg_a = _check(token_a)
         log.info(
@@ -413,7 +431,7 @@ def execute_trade(signal, size_usd, mode=None):
             gbp_rate = hmrc.require_gbp_rate()
         except RuntimeError as e:
             log.error("LIVE TRADE BLOCKED — HMRC compliance failure: %s", e)
-            return _wrap_result({"ok": False, "error": str(e), "mode": mode})
+            return _wrap_result(_failure_result(mode, "hmrc_gate_blocked", str(e)))
 
     # 5. Execute based on mode and execution style
     if mode == "paper":
@@ -856,7 +874,7 @@ def _execute_paper(signal, size_usd, price_a, price_b,
     signal_id = signal.get("id")
     if not signal_id:
         log.error("Signal missing 'id' field, cannot record trade")
-        return {"ok": False, "error": "Signal missing id", "mode": "paper"}
+        return _failure_result("paper", "signal_id_missing", "Signal missing id")
 
     trade_id = db.open_trade(
         signal_id,
@@ -880,7 +898,7 @@ def _execute_paper(signal, size_usd, price_a, price_b,
     )
     if not trade_id:
         log.error("Failed to open trade in DB for signal %s", signal_id)
-        return {"ok": False, "error": "DB open_trade failed", "mode": "paper"}
+        return _failure_result("paper", "db_open_trade_failed", "DB open_trade failed")
     account = db.get_paper_account_state(refresh_unrealized=False, runtime_scope=db.RUNTIME_SCOPE_PAPER)
 
     log.info("PAPER %s FILL: trade=%d | A(%s)=%.4f B(%s)=%.4f | $%.2f | bal=$%.2f",
@@ -1096,12 +1114,12 @@ def _execute_live(signal, size_usd, price_a, price_b,
         from py_clob_client.client import ClobClient
     except ImportError:
         log.error("py-clob-client not installed. Run: pip install py-clob-client")
-        return {"ok": False, "error": "py-clob-client not installed", "mode": "live"}
+        return _failure_result("live", "clob_client_missing", "py-clob-client not installed")
 
     private_key = runtime_config.get("POLYMARKET_PRIVATE_KEY")
     if not private_key:
         log.error("POLYMARKET_PRIVATE_KEY not set")
-        return {"ok": False, "error": "POLYMARKET_PRIVATE_KEY not set", "mode": "live"}
+        return _failure_result("live", "private_key_missing", "POLYMARKET_PRIVATE_KEY not set")
 
     try:
         client = ClobClient(
@@ -1253,7 +1271,7 @@ def _execute_live(signal, size_usd, price_a, price_b,
 
     except Exception as e:
         log.error("Live execution failed: %s", e)
-        return {"ok": False, "error": str(e), "mode": "live"}
+        return _failure_result("live", "exchange_order_failed", str(e))
 
 
 def place_gtc_order(token_id, side, price, size_shares, mode=None):

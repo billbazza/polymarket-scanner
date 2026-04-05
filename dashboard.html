@@ -1797,6 +1797,7 @@ async function loadPaperAttempts() {
   const scope = ACTIVE_RUNTIME_SCOPE;
   const requestId = ++SCOPE_REQUEST_SEQ.paperAttempts;
   try {
+    getEl('paperAttemptsTabLabel').textContent = scope === 'paper' ? 'Research Gate' : 'Penny Gate';
     const r = await fetch(API + runtimeScopedUrl('/api/paper-trade-attempts', { limit: 60 }, scope));
     const data = await r.json();
     if (requestId !== SCOPE_REQUEST_SEQ.paperAttempts || scope !== ACTIVE_RUNTIME_SCOPE) return;
@@ -1805,10 +1806,10 @@ async function loadPaperAttempts() {
     const available = data.available !== false && summary.available !== false;
     getEl('cntPaperAttempts').textContent = rows.length;
     getEl('paperAttemptsInfo').textContent = !available
-      ? 'Paper-trade attempt logging is unavailable on this deployment. Recent gate decisions may only exist in scanner.log.'
+      ? `${scope === 'paper' ? 'Research' : 'Penny'} gate logging is unavailable on this deployment. Recent gate decisions may only exist in scanner.log.`
       : rows.length
       ? `${rows.length} recent gate decisions and failures`
-      : 'No recent paper-trade gate decisions recorded.';
+      : `No recent ${scope === 'paper' ? 'research' : 'penny'} gate decisions recorded.`;
     getEl('paperAttemptsSummary').textContent = !available
       ? `Feed unavailable${data.degraded_reason ? ` · ${data.degraded_reason}` : ''}`
       : `${summary.allowed || 0} allowed · ${summary.blocked || 0} blocked · ${summary.errors || 0} errors` +
@@ -1820,8 +1821,8 @@ async function loadPaperAttempts() {
     if (!rows.length) {
       body.innerHTML = `<tr><td colspan="7" class="empty"><div class="icon">⊘</div>${
         available
-          ? 'No recent paper-trade gate decisions.'
-          : 'Paper-trade attempt logging is unavailable.'
+          ? `No recent ${scope === 'paper' ? 'research' : 'penny'} gate decisions.`
+          : `${scope === 'paper' ? 'Research' : 'Penny'} gate logging is unavailable.`
       }</td></tr>`;
       return;
     }
@@ -1925,7 +1926,8 @@ function drawPnlChart(series) {
 
 async function loadSignals() {
   try {
-    const r = await fetch(API + '/api/signals?limit=50');
+    const scope = ACTIVE_RUNTIME_SCOPE;
+    const r = await fetch(API + runtimeScopedUrl('/api/signals', { limit: 50 }, scope));
     const signals = await r.json();
     const hideSports = !!getEl('signalHideSports')?.checked;
     const stage3Only = !!getEl('signalStage3Only')?.checked;
@@ -1956,13 +1958,12 @@ async function loadSignals() {
       const gradeLabelDisplay = gradeScore !== null ? `${gl} (${gradeScore}/8)` : gl;
       const evPct     = s.ev     && s.ev.ev_pct     != null ? s.ev.ev_pct.toFixed(1) + '%' : '-';
       const kellySize = s.sizing && s.sizing.recommended_size != null ? fmtUsd(s.sizing.recommended_size) : '-';
-      const statusLabel = s.tradeable
+      const runtimeStatus = s.runtime_status || (s.tradeable ? 'tradeable' : s.paper_tradeable ? 'paper' : s.monitorable_signal ? 'monitor' : 'rejected');
+      const statusLabel = runtimeStatus === 'ready'
         ? 'tradeable'
-        : s.paper_tradeable
-          ? 'paper'
-          : s.monitorable_signal
-            ? 'monitor'
-            : 'rejected';
+        : runtimeStatus === 'open' || runtimeStatus === 'opened'
+          ? 'open'
+          : runtimeStatus;
       const statusSummary = s.admission_summary || s.admission_reason || '';
       const failedCount = typeof s.failed_filter_count === 'number'
         ? s.failed_filter_count
@@ -1973,11 +1974,13 @@ async function loadSignals() {
       const gradeFailureNote = !s.tradeable && s.grade_label === 'A'
         ? `Grade ${gradeScore ?? '?'} /8 blocked (${failedCount} filter${failedCount===1 ? '' : 's'} failed${filterList})`
         : '';
+      const runtimeDetail = s.runtime_status_detail || '';
+      const runtimeReasonCode = s.runtime_status_reason_code || '';
       const statusTitle = esc(
-        [statusSummary, gradeFailureNote].filter(Boolean).join(' · ')
+        [runtimeDetail, runtimeReasonCode, statusSummary, gradeFailureNote].filter(Boolean).join(' · ')
       );
       const blockerReason = !s.tradeable && (s.admission_reason || s.experiment_reason);
-      const blockerDisplay = gradeFailureNote || blockerReason;
+      const blockerDisplay = runtimeDetail || gradeFailureNote || blockerReason;
       const stage3StatusText = s.profitable_candidate_feature
         ? 'Ready'
         : s.perplexity?.status === 'ok'
@@ -1986,10 +1989,21 @@ async function loadSignals() {
       const stage3Title = s.perplexity?.reason || stage3StatusText;
       const stage3Class = s.profitable_candidate_feature ? 'yes' : 'disagree';
       const stage3Badge = `<span class="badge ${stage3Class}" title="${esc(stage3Title)}">${esc(stage3StatusText)}</span>`;
-      const actionCell = s.status==='new'
-        ? `<button class="btn sm" onclick="paperTrade(${s.id})">Trade</button>
-           <button class="btn sm" onclick="brainValidate(${s.id})" title="Ask AI">Brain</button>`
-        : '';
+      let actionCell = '';
+      if (s.has_open_trade && s.open_trade_id) {
+        actionCell = `<span style="color:var(--green);font-size:11px;font-weight:600" title="${esc(runtimeDetail)}">● open</span>`;
+      } else if (s.manual_can_open_trade) {
+        actionCell = `<button class="btn sm" onclick="paperTrade(${s.id})">Trade</button>
+           <button class="btn sm" onclick="brainValidate(${s.id})" title="Ask AI">Brain</button>`;
+        if (scope === 'penny' && runtimeDetail && ['blocked', 'error', 'opened'].includes(runtimeStatus)) {
+          actionCell += `<div style="color:${runtimeStatus === 'error' ? 'var(--red)' : 'var(--amber)'};font-size:10px;max-width:220px" title="${esc(runtimeDetail)}">${esc(runtimeReasonCode || runtimeStatus)}</div>`;
+        }
+      }
+      const badgeClass = runtimeStatus === 'blocked'
+        ? 'monitor'
+        : runtimeStatus === 'error'
+          ? 'closed'
+          : s.status;
       return `<tr>
         <td>${fmt(s.timestamp)}</td>
         <td class="event-name" title="${esc(s.event)}">${esc(s.event)}</td>
@@ -2001,10 +2015,10 @@ async function loadSignals() {
         <td>${evPct}</td>
         <td>${kellySize}</td>
         <td>${fmtUsd(s.liquidity)}</td>
-        <td><span class="badge ${s.status}" title="${statusTitle}">${statusLabel}</span></td>
+        <td><span class="badge ${badgeClass}" title="${statusTitle}">${statusLabel}</span></td>
         <td>${stage3Badge}</td>
         <td class="actions-col">${actionCell || (blockerDisplay
-          ? `<span style="color:var(--amber);font-size:11px" title="${statusTitle}">${esc(blockerDisplay)}</span>`
+          ? `<span style="color:${runtimeStatus === 'error' ? 'var(--red)' : 'var(--amber)'};font-size:11px" title="${statusTitle}">${esc(blockerDisplay)}</span>`
           : '')}</td>
       </tr>`;
     }).join('');

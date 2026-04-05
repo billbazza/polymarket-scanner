@@ -1238,7 +1238,124 @@ def get_signal_by_id(signal_id):
     return _deserialize_signal_row(row)
 
 
-def get_signals(limit=50, status=None, include_rejected=True):
+def _latest_pairs_trade_attempt(
+    conn,
+    signal_id: int,
+    runtime_scope: str,
+) -> dict | None:
+    if not _table_exists(conn, "paper_trade_attempts"):
+        return None
+    row = conn.execute(
+        """
+        SELECT *
+        FROM paper_trade_attempts
+        WHERE strategy='pairs' AND signal_id=? AND runtime_scope=?
+        ORDER BY timestamp DESC, id DESC
+        LIMIT 1
+        """,
+        (signal_id, runtime_scope),
+    ).fetchone()
+    if not row:
+        return None
+    item = dict(row)
+    item["details"] = json.loads(item["details_json"]) if item.get("details_json") else None
+    item.pop("details_json", None)
+    return item
+
+
+def _attach_pairs_runtime_status(
+    conn,
+    signal: dict,
+    *,
+    runtime_scope: str,
+    size_usd: float,
+) -> dict:
+    signal_id = signal.get("id")
+    if not signal_id:
+        return signal
+
+    runtime_scope = normalize_runtime_scope(runtime_scope)
+    open_trade = conn.execute(
+        """
+        SELECT id, status, opened_at
+        FROM trades
+        WHERE signal_id=? AND status='open' AND runtime_scope=?
+        ORDER BY opened_at DESC, id DESC
+        LIMIT 1
+        """,
+        (signal_id, runtime_scope),
+    ).fetchone()
+    latest_trade = conn.execute(
+        """
+        SELECT id, status, opened_at, closed_at, exit_reason
+        FROM trades
+        WHERE signal_id=? AND runtime_scope=?
+        ORDER BY opened_at DESC, id DESC
+        LIMIT 1
+        """,
+        (signal_id, runtime_scope),
+    ).fetchone()
+    decision = inspect_pairs_trade_open(
+        signal_id,
+        size_usd=size_usd,
+        conn=conn,
+        runtime_scope=runtime_scope,
+    )
+    latest_attempt = _latest_pairs_trade_attempt(conn, signal_id, runtime_scope)
+
+    open_trade_id = int(open_trade["id"]) if open_trade else None
+    latest_trade_id = int(latest_trade["id"]) if latest_trade else None
+    signal["runtime_scope"] = runtime_scope
+    signal["runtime_requested_size_usd"] = round(float(size_usd or 0.0), 2)
+    signal["open_trade_id"] = open_trade_id
+    signal["has_open_trade"] = open_trade_id is not None
+    signal["latest_trade_id"] = latest_trade_id
+    signal["latest_trade_status"] = latest_trade["status"] if latest_trade else None
+    signal["latest_trade_exit_reason"] = latest_trade["exit_reason"] if latest_trade else None
+    signal["latest_trade_closed_at"] = latest_trade["closed_at"] if latest_trade else None
+    signal["preflight_ok"] = bool(decision.get("ok"))
+    signal["preflight_reason"] = None if decision.get("ok") else decision.get("reason")
+    signal["preflight_reason_code"] = None if decision.get("ok") else decision.get("reason_code")
+    signal["manual_can_open_trade"] = bool(signal.get("tradeable")) and bool(decision.get("ok"))
+    signal["last_attempt"] = latest_attempt
+
+    if open_trade_id is not None:
+        signal["runtime_status"] = "open"
+        signal["runtime_status_detail"] = f"Open as trade #{open_trade_id}."
+        signal["runtime_status_reason_code"] = "opened"
+    elif latest_attempt and latest_attempt.get("outcome") == "allowed" and latest_attempt.get("trade_id"):
+        trade_id = latest_attempt.get("trade_id")
+        signal["runtime_status"] = "opened"
+        signal["runtime_status_detail"] = latest_attempt.get("reason") or f"Opened as trade #{trade_id}."
+        signal["runtime_status_reason_code"] = latest_attempt.get("reason_code") or "opened"
+    elif latest_attempt and latest_attempt.get("outcome") in {"blocked", "error"}:
+        signal["runtime_status"] = latest_attempt.get("outcome")
+        signal["runtime_status_detail"] = latest_attempt.get("reason")
+        signal["runtime_status_reason_code"] = latest_attempt.get("reason_code")
+    elif latest_trade and latest_trade["status"] == "closed":
+        signal["runtime_status"] = "closed"
+        signal["runtime_status_detail"] = latest_trade["exit_reason"] or f"Closed as trade #{latest_trade_id}."
+        signal["runtime_status_reason_code"] = "closed"
+    elif signal.get("tradeable") and not decision.get("ok"):
+        signal["runtime_status"] = "blocked"
+        signal["runtime_status_detail"] = decision.get("reason")
+        signal["runtime_status_reason_code"] = decision.get("reason_code")
+    elif signal.get("tradeable"):
+        signal["runtime_status"] = "ready"
+        signal["runtime_status_detail"] = (
+            "Ready for execution."
+            if runtime_scope == RUNTIME_SCOPE_PAPER
+            else "Ready unless a live-only safeguard vetoes execution."
+        )
+        signal["runtime_status_reason_code"] = "ready"
+    else:
+        signal["runtime_status"] = signal.get("admission_status") or "monitor"
+        signal["runtime_status_detail"] = signal.get("admission_summary")
+        signal["runtime_status_reason_code"] = signal.get("admission_reason_code")
+    return signal
+
+
+def get_signals(limit=50, status=None, include_rejected=True, runtime_scope: str | None = None, size_usd: float = 100):
     limit = _normalize_query_limit(limit, "get_signals")
     conn = get_conn()
     if status and limit is None:
@@ -1259,13 +1376,20 @@ def get_signals(limit=50, status=None, include_rejected=True):
         rows = conn.execute(
             "SELECT * FROM signals ORDER BY timestamp DESC LIMIT ?", (limit,)
         ).fetchall()
-    conn.close()
     results = []
     for r in rows:
         d = _deserialize_signal_row(r)
         if not include_rejected and not d.get("monitorable_signal"):
             continue
+        if runtime_scope in {RUNTIME_SCOPE_PAPER, RUNTIME_SCOPE_PENNY}:
+            d = _attach_pairs_runtime_status(
+                conn,
+                d,
+                runtime_scope=runtime_scope,
+                size_usd=size_usd,
+            )
         results.append(d)
+    conn.close()
     return results
 
 
