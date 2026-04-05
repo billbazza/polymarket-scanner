@@ -3946,21 +3946,22 @@ def inspect_weather_trade_open(
                 **_paper_position_policy_dict(),
             }
 
-        account_check = can_open_paper_trade(size_usd, runtime_scope=runtime_scope)
-        if not account_check["ok"]:
-            return {
-                "ok": False,
-                "reason_code": "insufficient_cash",
-                "reason": (
-                    f"Insufficient paper cash: ${account_check['available_cash']:.2f} available, "
-                    f"${account_check['requested_size_usd']:.2f} requested."
-                ),
-                "entry_token": entry_token,
-                "account": account_check["account"],
-                "available_cash": account_check["available_cash"],
-                "requested_size_usd": account_check["requested_size_usd"],
-                **_paper_position_policy_dict(),
-            }
+        if runtime_scope == RUNTIME_SCOPE_PAPER:
+            account_check = can_open_paper_trade(size_usd, runtime_scope=runtime_scope)
+            if not account_check["ok"]:
+                return {
+                    "ok": False,
+                    "reason_code": "insufficient_cash",
+                    "reason": (
+                        f"Insufficient paper cash: ${account_check['available_cash']:.2f} available, "
+                        f"${account_check['requested_size_usd']:.2f} requested."
+                    ),
+                    "entry_token": entry_token,
+                    "account": account_check["account"],
+                    "available_cash": account_check["available_cash"],
+                    "requested_size_usd": account_check["requested_size_usd"],
+                    **_paper_position_policy_dict(),
+                }
 
         entry_price = sig["market_price"] if action == "BUY_YES" else round(1.0 - (sig["market_price"] or 0), 4)
         return {
@@ -4074,22 +4075,25 @@ def open_weather_trade(
     size_usd=100,
     mode=None,
     runtime_scope: str = RUNTIME_SCOPE_PAPER,
+    metadata: dict | None = None,
 ):
-    """Open a single-leg paper trade from a weather signal.
+    """Open a single-leg weather trade from a weather signal.
 
     DB-level guard: returns None if an open trade already exists for this signal.
     """
     conn = get_conn()
+    metadata = metadata or {}
+    state_fields = _resolve_trade_state_fields(metadata)
     decision = inspect_weather_trade_open(
         weather_signal_id,
         size_usd=size_usd,
         conn=conn,
         mode=mode,
-        runtime_scope=runtime_scope,
+        runtime_scope=state_fields["runtime_scope"],
     )
     if not decision["ok"]:
         log.info(
-            "Paper weather trade blocked for signal %s: %s",
+            "Weather trade blocked for signal %s: %s",
             weather_signal_id,
             decision["reason"],
         )
@@ -4100,7 +4104,8 @@ def open_weather_trade(
     token = decision["entry_token"]
     entry_price = decision["entry_price"]
     strategy_name = (
-        decision["signal"].get("strategy_name")
+        metadata.get("strategy_name")
+        or decision["signal"].get("strategy_name")
         or decision["signal"].get("market_family")
         or "weather"
     )
@@ -4109,16 +4114,36 @@ def open_weather_trade(
         INSERT INTO trades (signal_id, weather_signal_id, trade_type, opened_at,
             side_a, side_b, entry_price_a, entry_price_b,
             token_id_a, size_usd, status, strategy_name, event, market_a,
-            trade_state_mode, reconciliation_mode, runtime_scope)
-        VALUES (NULL, ?, 'weather', ?, ?, '', ?, 0, ?, ?, 'open', ?, ?, ?, ?, ?, ?)
+            trade_state_mode, reconciliation_mode, runtime_scope, canonical_ref,
+            external_position_id, external_order_id_a, external_order_id_b, external_source,
+            entry_execution_json, entry_fee_usd, notes)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (
-        weather_signal_id, time.time(), action, entry_price, token, size_usd,
+        None,
+        weather_signal_id,
+        "weather",
+        time.time(),
+        action,
+        "",
+        entry_price,
+        0,
+        token,
+        size_usd,
+        metadata.get("status", "open"),
         strategy_name,
         decision["signal"].get("event"),
         decision["signal"].get("market"),
-        TRADE_STATE_PAPER,
-        RECONCILIATION_INTERNAL,
-        decision["runtime_scope"],
+        state_fields["trade_state_mode"],
+        state_fields["reconciliation_mode"],
+        state_fields["runtime_scope"],
+        state_fields["canonical_ref"],
+        state_fields["external_position_id"],
+        state_fields["external_order_id_a"],
+        state_fields["external_order_id_b"],
+        state_fields["external_source"],
+        json.dumps(metadata.get("entry_execution")) if metadata.get("entry_execution") is not None else None,
+        round(float(metadata.get("entry_fee_usd") or 0.0), 2),
+        metadata.get("notes"),
     ))
     trade_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
     conn.execute("UPDATE weather_signals SET status='traded' WHERE id=?", (weather_signal_id,))
@@ -4957,6 +4982,7 @@ def get_autonomy_runtime_settings(runtime_scope: str | None = None) -> dict:
     defaults = {
         "runtime_scope": scope,
         "auto_trade_enabled": scope == RUNTIME_SCOPE_PAPER,
+        "weather_auto_trade_enabled": scope == RUNTIME_SCOPE_PAPER,
         "max_open_override": None,
         "size_usd_override": None,
     }
@@ -4964,6 +4990,7 @@ def get_autonomy_runtime_settings(runtime_scope: str | None = None) -> dict:
     settings = {**defaults, **raw}
     settings["runtime_scope"] = scope
     settings["auto_trade_enabled"] = bool(settings.get("auto_trade_enabled"))
+    settings["weather_auto_trade_enabled"] = bool(settings.get("weather_auto_trade_enabled"))
     settings["max_open_override"] = _normalize_optional_cap(settings.get("max_open_override"))
     size_override = settings.get("size_usd_override")
     try:
@@ -4983,6 +5010,7 @@ def set_autonomy_runtime_settings(runtime_scope: str | None = None, updates: dic
     merged = {**current, **(updates or {})}
     merged["runtime_scope"] = scope
     merged["auto_trade_enabled"] = bool(merged.get("auto_trade_enabled"))
+    merged["weather_auto_trade_enabled"] = bool(merged.get("weather_auto_trade_enabled"))
     merged["max_open_override"] = _normalize_optional_cap(merged.get("max_open_override"))
     size_override = merged.get("size_usd_override")
     try:

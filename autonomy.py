@@ -185,6 +185,29 @@ def paper_only_runtime(runtime_scope: str | None) -> bool:
     return normalize_runtime_scope(runtime_scope) == RUNTIME_SCOPE_PAPER
 
 
+def weather_phase_policy(runtime_scope: str | None, runtime_controls: dict | None = None) -> dict:
+    scope = normalize_runtime_scope(runtime_scope)
+    controls = runtime_controls or db.get_autonomy_runtime_settings(scope)
+    weather_auto_trade_enabled = bool(controls.get("weather_auto_trade_enabled", scope == RUNTIME_SCOPE_PAPER))
+    if scope == RUNTIME_SCOPE_PAPER:
+        return {
+            "scan_enabled": True,
+            "auto_trade_enabled": weather_auto_trade_enabled,
+            "execution_mode": "paper-auto-trade" if weather_auto_trade_enabled else "scan-only",
+            "trade_mode": "paper",
+            "skip_reason_code": None,
+            "skip_reason": None,
+        }
+    return {
+        "scan_enabled": True,
+        "auto_trade_enabled": weather_auto_trade_enabled,
+        "execution_mode": "live-auto-trade" if weather_auto_trade_enabled else "scan-only",
+        "trade_mode": "live",
+        "skip_reason_code": None,
+        "skip_reason": None,
+    }
+
+
 def default_state(runtime_scope: str | None = None):
     """Return the default autonomy state."""
     scope = normalize_runtime_scope(runtime_scope)
@@ -1084,219 +1107,239 @@ def run_cycle(state):
         }
         cycle_summary["phases"].append(weather_phase)
         cycle_summary["weather_phase"] = weather_phase
+        weather_policy = weather_phase_policy(runtime_scope, config.get("runtime_controls"))
+        weather_phase["execution_mode"] = weather_policy["execution_mode"]
+        weather_phase["auto_trade_enabled"] = bool(weather_policy["auto_trade_enabled"])
         log.info(
             "Step 4b: Weather phase start scope=%s mode=%s",
             runtime_scope,
-            "paper-scan" if paper_only_runtime(runtime_scope) else "skip-paper-only",
+            weather_phase["execution_mode"],
         )
+        try:
+            import weather_exact_temp_scanner
+            import weather_strategy
 
-        if not paper_only_runtime(runtime_scope):
-            weather_phase["status"] = "skipped"
-            weather_phase["reason_code"] = "paper_only_scope_disabled"
-            weather_phase["reason"] = f"Weather auto-trading is paper-only and is disabled for scope={runtime_scope}."
-            weather_phase["duration_secs"] = round(time.time() - weather_phase_started, 1)
-            log.info(
-                "Step 4b: Weather phase complete scope=%s status=skipped duration=%.1fs opportunities=0 tradeable=0 traded=0 reason=%s",
-                runtime_scope,
-                weather_phase["duration_secs"],
-                weather_phase["reason_code"],
+            include_exact_temp = weather_exact_temp_scanner.exact_temp_enabled()
+            exact_temp_autotrade = weather_exact_temp_scanner.exact_temp_autotrade_enabled()
+            weather_opps, _ = weather_strategy.scan_weather_opportunities(
+                min_edge=0.06,
+                verbose=False,
+                include_exact_temp=include_exact_temp,
             )
-            journal({
-                "action": "paper_only_step_skipped",
-                "level": level,
-                "runtime_scope": runtime_scope,
-                "strategy": "weather",
-                "reason": f"Weather auto-trading is paper-only and is disabled for scope={runtime_scope}.",
-            })
-        elif slots_remaining is None or slots_remaining > 0:
-            try:
-                import weather_exact_temp_scanner
-                import weather_strategy
+            tradeable_weather = [o for o in weather_opps if o.get("tradeable")]
+            executable_weather = list(tradeable_weather)
+            weather_phase["result_counts"]["opportunities"] = len(weather_opps)
+            weather_phase["result_counts"]["tradeable"] = len(tradeable_weather)
+            weather_phase["exact_temp_enabled"] = bool(include_exact_temp)
+            weather_phase["exact_temp_autotrade_enabled"] = bool(exact_temp_autotrade)
+            weather_phase["result_counts"]["exact_temp_opportunities"] = sum(
+                1
+                for opp in weather_opps
+                if (opp.get("strategy_name") or opp.get("market_family")) == "weather_exact_temp"
+            )
+            if include_exact_temp and not exact_temp_autotrade:
+                executable_weather = [
+                    o for o in executable_weather
+                    if (o.get("strategy_name") or o.get("market_family")) != "weather_exact_temp"
+                ]
+            if weather_policy["trade_mode"] == "live":
+                executable_weather = [
+                    o for o in executable_weather
+                    if (o.get("strategy_name") or o.get("market_family")) != "weather_exact_temp"
+                ]
 
-                include_exact_temp = weather_exact_temp_scanner.exact_temp_enabled()
-                exact_temp_autotrade = weather_exact_temp_scanner.exact_temp_autotrade_enabled()
-                weather_opps, _ = weather_strategy.scan_weather_opportunities(
-                    min_edge=0.06,
-                    verbose=False,
-                    include_exact_temp=include_exact_temp,
-                )
-                tradeable_weather = [o for o in weather_opps if o.get("tradeable")]
-                weather_phase["result_counts"]["opportunities"] = len(weather_opps)
-                weather_phase["result_counts"]["tradeable"] = len(tradeable_weather)
-                if include_exact_temp and not exact_temp_autotrade:
-                    tradeable_weather = [
-                        o for o in tradeable_weather
-                        if (o.get("strategy_name") or o.get("market_family")) != "weather_exact_temp"
-                    ]
-                weather_traded = 0
-                candidates = tradeable_weather if slots_remaining is None else tradeable_weather[:slots_remaining]
-                for w_opp in candidates:
-                    try:
-                        w_id = db.save_weather_signal(w_opp)
-                        weather_phase["result_counts"]["saved"] += 1
-                        trade_size = size_usd if level != "book" else 20
-                        sizing_decision = paper_sizing.build_paper_sizing_decision(
+            weather_traded = 0
+            weather_phase["trade_candidates"] = len(executable_weather)
+            candidates = executable_weather
+            if weather_policy["auto_trade_enabled"]:
+                if slots_remaining is not None and slots_remaining <= 0:
+                    candidates = []
+                    weather_phase["trade_execution_status"] = "slots_full"
+                    weather_phase["reason_code"] = "max_open_reached_before_weather"
+                    weather_phase["reason"] = f"No weather slots remain for scope={runtime_scope}."
+                elif slots_remaining is not None:
+                    candidates = executable_weather[:slots_remaining]
+                    weather_phase["trade_execution_status"] = "limited_by_slots"
+                else:
+                    weather_phase["trade_execution_status"] = "enabled"
+            else:
+                candidates = []
+                weather_phase["trade_execution_status"] = "scan_only"
+                weather_phase["reason_code"] = "weather_auto_trade_disabled"
+                weather_phase["reason"] = f"Weather scanning completed for scope={runtime_scope}; live weather auto-trading is disabled by runtime control."
+                journal({
+                    "action": "weather_scan_only",
+                    "level": level,
+                    "runtime_scope": runtime_scope,
+                    "strategy": "weather",
+                    "reason": weather_phase["reason"],
+                })
+
+            for w_opp in executable_weather:
+                try:
+                    w_id = db.save_weather_signal(w_opp)
+                    weather_phase["result_counts"]["saved"] += 1
+                    if not weather_policy["auto_trade_enabled"]:
+                        continue
+                    if slots_remaining is not None and weather_traded >= max(slots_remaining, 0):
+                        continue
+                    trade_size = size_usd if level != "book" else 20
+                    sizing_account_overview = (
+                        db.get_runtime_account_overview(refresh_unrealized=False, runtime_scope=runtime_scope)
+                        if runtime_scope == RUNTIME_SCOPE_PENNY
+                        else db.get_paper_account_overview(refresh_unrealized=False, runtime_scope=runtime_scope)
+                    )
+                    sizing_decision = paper_sizing.build_paper_sizing_decision(
+                        "weather",
+                        w_opp,
+                        baseline_size_usd=trade_size,
+                        account_overview=sizing_account_overview,
+                        mode=weather_policy["trade_mode"],
+                        source="autonomy",
+                        weather_signal_id=w_id,
+                    )
+                    paper_sizing.record_sizing_decision(sizing_decision)
+                    trade_size = sizing_decision["selected_size_usd"]
+                    decision = db.inspect_weather_trade_open(
+                        w_id,
+                        size_usd=trade_size,
+                        max_total_open=max_open if weather_policy["auto_trade_enabled"] else None,
+                        mode=weather_policy["trade_mode"],
+                        runtime_scope=runtime_scope,
+                    )
+                    if not decision["ok"]:
+                        record_attempt(
+                            level,
                             "weather",
-                            w_opp,
-                            baseline_size_usd=trade_size,
-                            account_overview=db.get_paper_account_overview(refresh_unrealized=False, runtime_scope=runtime_scope),
-                            mode="paper",
-                            source="autonomy",
+                            "blocked",
+                            decision["reason_code"],
+                            decision["reason"],
+                            event=w_opp.get("event", w_opp.get("market", "")),
                             weather_signal_id=w_id,
-                        )
-                        paper_sizing.record_sizing_decision(sizing_decision)
-                        trade_size = sizing_decision["selected_size_usd"]
-                        decision = db.inspect_weather_trade_open(
-                            w_id,
+                            token_id=decision.get("entry_token"),
                             size_usd=trade_size,
-                            max_total_open=max_open,
-                            mode=level,
+                            phase=current_stage,
+                            details={"paper_sizing": sizing_decision, "execution_mode": weather_phase["execution_mode"]},
                         )
-                        if not decision["ok"]:
-                            record_attempt(
-                                level,
-                                "weather",
-                                "blocked",
-                                decision["reason_code"],
-                                decision["reason"],
-                                event=w_opp.get("event", w_opp.get("market", "")),
-                                weather_signal_id=w_id,
-                                token_id=decision.get("entry_token"),
-                                size_usd=trade_size,
-                                phase=current_stage,
-                                details={"paper_sizing": sizing_decision},
-                            )
-                            journal({
-                                "action": "skip_trade",
-                                "level": level,
-                                "trade_type": "weather",
-                                "event": w_opp.get("event", w_opp.get("market", ""))[:60],
-                                "reason": decision["reason"],
-                            })
-                            continue
-                        weather_signal_payload = {
-                            **w_opp,
-                            "id": w_id,
-                            "paper_sizing": sizing_decision,
-                        }
-                        result = execution.execute_weather_trade(
-                            weather_signal_payload,
+                        journal({
+                            "action": "skip_trade",
+                            "level": level,
+                            "trade_type": "weather",
+                            "event": w_opp.get("event", w_opp.get("market", ""))[:60],
+                            "reason": decision["reason"],
+                            "runtime_scope": runtime_scope,
+                        })
+                        continue
+                    weather_signal_payload = {
+                        **w_opp,
+                        "id": w_id,
+                        "paper_sizing": sizing_decision,
+                    }
+                    result = execution.execute_weather_trade(
+                        weather_signal_payload,
+                        size_usd=trade_size,
+                        mode=weather_policy["trade_mode"],
+                    )
+                    if result.get("ok"):
+                        record_attempt(
+                            level,
+                            "weather",
+                            "allowed",
+                            "opened",
+                            f"{weather_policy['trade_mode'].capitalize()} weather trade opened.",
+                            event=w_opp.get("event", w_opp.get("market", "")),
+                            weather_signal_id=w_id,
+                            trade_id=result["trade_id"],
+                            token_id=decision.get("entry_token"),
                             size_usd=trade_size,
-                            mode="paper",
+                            phase=current_stage,
+                            details={"paper_sizing": sizing_decision, "execution_mode": weather_phase["execution_mode"]},
                         )
-                        if result.get("ok"):
-                            record_attempt(
-                                level,
-                                "weather",
-                                "allowed",
-                                "opened",
-                                "Paper weather trade opened.",
-                                event=w_opp.get("event", w_opp.get("market", "")),
-                                weather_signal_id=w_id,
-                                trade_id=result["trade_id"],
-                                token_id=decision.get("entry_token"),
-                                size_usd=trade_size,
-                                phase=current_stage,
-                                details={"paper_sizing": sizing_decision},
-                            )
-                            weather_traded += 1
-                            weather_phase["result_counts"]["traded"] = weather_traded
-                            journal({
-                                "action": "trade_opened",
-                                "level": level,
-                                "mode": "paper",
-                                "trade_id": result["trade_id"],
-                                "signal_id": w_id,
-                                "trade_type": "weather",
-                                "event": w_opp.get("event", w_opp.get("market", ""))[:60],
-                                "size_usd": trade_size,
-                                "paper_sizing_policy": sizing_decision.get("selected_policy"),
-                                "paper_gate_rollout_state": sizing_decision.get("rollout_state"),
-                                "paper_gate_applied": sizing_decision.get("applied"),
-                                "paper_gate_blocker_codes": (sizing_decision.get("activation_status") or {}).get("blocker_codes"),
-                                "paper_gate_blockers": (sizing_decision.get("activation_status") or {}).get("blockers"),
-                                "paper_gate_can_apply_confidence": (sizing_decision.get("activation_status") or {}).get("can_apply_confidence"),
-                                "paper_gate_compare_only": sizing_decision.get("compare_only"),
-                                "paper_confidence_size_usd": sizing_decision.get("confidence_size_usd"),
-                                "reason": f"Weather edge {w_opp.get('combined_edge_pct', 0):+.1f}%",
-                            })
-                        else:
-                            record_attempt(
-                                level,
-                                "weather",
-                                "error",
-                                result.get("reason_code", "trade_open_failed"),
-                                result.get("error", "Weather trade open failed."),
-                                event=w_opp.get("event", w_opp.get("market", "")),
-                                weather_signal_id=w_id,
-                                token_id=decision.get("entry_token"),
-                                size_usd=trade_size,
-                                phase=current_stage,
-                                details={"paper_sizing": sizing_decision},
-                            )
-                    except Exception as e:
-                        log.warning("Weather trade open failed: %s", e)
+                        weather_traded += 1
+                        weather_phase["result_counts"]["traded"] = weather_traded
+                        journal({
+                            "action": "trade_opened",
+                            "level": level,
+                            "mode": weather_policy["trade_mode"],
+                            "trade_id": result["trade_id"],
+                            "signal_id": w_id,
+                            "trade_type": "weather",
+                            "event": w_opp.get("event", w_opp.get("market", ""))[:60],
+                            "size_usd": trade_size,
+                            "paper_sizing_policy": sizing_decision.get("selected_policy"),
+                            "paper_gate_rollout_state": sizing_decision.get("rollout_state"),
+                            "paper_gate_applied": sizing_decision.get("applied"),
+                            "paper_gate_blocker_codes": (sizing_decision.get("activation_status") or {}).get("blocker_codes"),
+                            "paper_gate_blockers": (sizing_decision.get("activation_status") or {}).get("blockers"),
+                            "paper_gate_can_apply_confidence": (sizing_decision.get("activation_status") or {}).get("can_apply_confidence"),
+                            "paper_gate_compare_only": sizing_decision.get("compare_only"),
+                            "paper_confidence_size_usd": sizing_decision.get("confidence_size_usd"),
+                            "reason": f"Weather edge {w_opp.get('combined_edge_pct', 0):+.1f}%",
+                            "runtime_scope": runtime_scope,
+                        })
+                    else:
                         record_attempt(
                             level,
                             "weather",
                             "error",
-                            "trade_open_failed",
-                            f"Weather trade open failed: {e}",
+                            result.get("reason_code", "trade_open_failed"),
+                            result.get("error", "Weather trade open failed."),
                             event=w_opp.get("event", w_opp.get("market", "")),
+                            weather_signal_id=w_id,
+                            token_id=decision.get("entry_token"),
+                            size_usd=trade_size,
                             phase=current_stage,
+                            details={"paper_sizing": sizing_decision, "execution_mode": weather_phase["execution_mode"]},
                         )
-                weather_phase["status"] = "completed"
-                weather_phase["duration_secs"] = round(time.time() - weather_phase_started, 1)
-                weather_phase["exact_temp_enabled"] = bool(include_exact_temp)
-                weather_phase["exact_temp_autotrade_enabled"] = bool(exact_temp_autotrade)
-                weather_phase["result_counts"]["exact_temp_opportunities"] = sum(
-                    1
-                    for opp in weather_opps
-                    if (opp.get("strategy_name") or opp.get("market_family")) == "weather_exact_temp"
-                )
-                if weather_traded:
-                    log.info("Step 4b: Opened %d weather trades", weather_traded)
-                log.info(
-                    "Step 4b: Weather phase complete scope=%s status=completed duration=%.1fs opportunities=%d tradeable=%d traded=%d",
-                    runtime_scope,
-                    weather_phase["duration_secs"],
-                    weather_phase["result_counts"]["opportunities"],
-                    weather_phase["result_counts"]["tradeable"],
-                    weather_phase["result_counts"]["traded"],
-                )
-            except Exception as e:
-                weather_phase["status"] = "error"
-                weather_phase["reason_code"] = "weather_scan_failed"
-                weather_phase["reason"] = str(e)
-                weather_phase["duration_secs"] = round(time.time() - weather_phase_started, 1)
-                log.debug("Weather scan skipped during %s: %s", current_stage, e)
-                record_attempt(
-                    level,
-                    "weather",
-                    "error",
-                    "weather_scan_failed",
-                    f"Weather scan failed: {e}",
-                    event="Weather scan",
-                    phase=current_stage,
-                )
-                log.info(
-                    "Step 4b: Weather phase complete scope=%s status=error duration=%.1fs opportunities=%d tradeable=%d traded=%d reason=%s",
-                    runtime_scope,
-                    weather_phase["duration_secs"],
-                    weather_phase["result_counts"]["opportunities"],
-                    weather_phase["result_counts"]["tradeable"],
-                    weather_phase["result_counts"]["traded"],
-                    weather_phase["reason_code"],
-                )
-        else:
-            weather_phase["status"] = "skipped"
-            weather_phase["reason_code"] = "max_open_reached_before_weather"
-            weather_phase["reason"] = f"No weather slots remain for scope={runtime_scope}."
+                except Exception as e:
+                    log.warning("Weather trade open failed: %s", e)
+                    record_attempt(
+                        level,
+                        "weather",
+                        "error",
+                        "trade_open_failed",
+                        f"Weather trade open failed: {e}",
+                        event=w_opp.get("event", w_opp.get("market", "")),
+                        phase=current_stage,
+                    )
+            weather_phase["status"] = "completed"
             weather_phase["duration_secs"] = round(time.time() - weather_phase_started, 1)
+            if weather_traded:
+                log.info("Step 4b: Opened %d weather trades", weather_traded)
             log.info(
-                "Step 4b: Weather phase complete scope=%s status=skipped duration=%.1fs opportunities=0 tradeable=0 traded=0 reason=%s",
+                "Step 4b: Weather phase complete scope=%s status=completed duration=%.1fs opportunities=%d tradeable=%d traded=%d mode=%s trade_status=%s reason=%s",
                 runtime_scope,
                 weather_phase["duration_secs"],
+                weather_phase["result_counts"]["opportunities"],
+                weather_phase["result_counts"]["tradeable"],
+                weather_phase["result_counts"]["traded"],
+                weather_phase["execution_mode"],
+                weather_phase.get("trade_execution_status"),
+                weather_phase.get("reason_code"),
+            )
+        except Exception as e:
+            weather_phase["status"] = "error"
+            weather_phase["reason_code"] = "weather_scan_failed"
+            weather_phase["reason"] = str(e)
+            weather_phase["duration_secs"] = round(time.time() - weather_phase_started, 1)
+            log.debug("Weather scan skipped during %s: %s", current_stage, e)
+            record_attempt(
+                level,
+                "weather",
+                "error",
+                "weather_scan_failed",
+                f"Weather scan failed: {e}",
+                event="Weather scan",
+                phase=current_stage,
+            )
+            log.info(
+                "Step 4b: Weather phase complete scope=%s status=error duration=%.1fs opportunities=%d tradeable=%d traded=%d mode=%s reason=%s",
+                runtime_scope,
+                weather_phase["duration_secs"],
+                weather_phase["result_counts"]["opportunities"],
+                weather_phase["result_counts"]["tradeable"],
+                weather_phase["result_counts"]["traded"],
+                weather_phase["execution_mode"],
                 weather_phase["reason_code"],
             )
 

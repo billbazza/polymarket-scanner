@@ -141,7 +141,7 @@ def _log_runtime_settings_change(
     requested_updates: dict,
 ) -> dict:
     changed_fields = {}
-    for key in ("auto_trade_enabled", "max_open_override", "size_usd_override"):
+    for key in ("auto_trade_enabled", "weather_auto_trade_enabled", "max_open_override", "size_usd_override"):
         if before.get(key) != after.get(key):
             changed_fields[key] = {
                 "old": before.get(key),
@@ -1578,15 +1578,16 @@ async def close_trade(trade_id: int, exit_price_a: float | None = None, exit_pri
 
 @app.post("/api/weather/{signal_id}/trade")
 async def open_weather_trade(signal_id: int, size_usd: float = 20, runtime_scope: str | None = None):
-    """Open a paper trade from a weather signal."""
+    """Open a scoped weather trade from a weather signal."""
     runtime_scope = _runtime_scope_param(runtime_scope)
+    mode = "live" if runtime_scope == db.RUNTIME_SCOPE_PENNY else "paper"
     signal = db.get_weather_signal_by_id(signal_id)
-    result = execution.execute_weather_trade(signal or {"id": signal_id}, size_usd=size_usd, mode="paper")
+    result = execution.execute_weather_trade(signal or {"id": signal_id}, size_usd=size_usd, mode=mode)
     if not result["ok"]:
         decision = result.get("decision") or db.inspect_weather_trade_open(
             signal_id,
             size_usd=size_usd,
-            mode="paper",
+            mode=mode,
             runtime_scope=runtime_scope,
         )
         _safe_record_paper_trade_attempt(
@@ -1626,7 +1627,7 @@ async def open_weather_trade(signal_id: int, size_usd: float = 20, runtime_scope
         outcome="allowed",
         runtime_scope=runtime_scope,
         reason_code="opened",
-        reason="Paper weather trade opened.",
+        reason=f"{mode.capitalize()} weather trade opened.",
         event=((signal or {}).get("event")),
         weather_signal_id=signal_id,
         trade_id=result["trade_id"],
@@ -1642,7 +1643,7 @@ async def open_weather_trade(signal_id: int, size_usd: float = 20, runtime_scope
         "runtime_scope": runtime_scope,
         "trade_state_mode": result["trade_state_mode"],
         "reconciliation_mode": result["reconciliation_mode"],
-        "paper_account": db.get_paper_account_state(refresh_unrealized=True, runtime_scope=runtime_scope),
+        "paper_account": db.get_runtime_account_overview(refresh_unrealized=True, runtime_scope=runtime_scope),
     }
 
 
@@ -1875,6 +1876,7 @@ async def update_autonomy_settings(
     request: Request,
     runtime_scope: str | None = None,
     auto_trade_enabled: bool | None = None,
+    weather_auto_trade_enabled: bool | None = None,
     max_open_override: int | None = None,
     size_usd_override: float | None = None,
 ):
@@ -1883,6 +1885,8 @@ async def update_autonomy_settings(
     updates = {}
     if auto_trade_enabled is not None:
         updates["auto_trade_enabled"] = bool(auto_trade_enabled)
+    if weather_auto_trade_enabled is not None:
+        updates["weather_auto_trade_enabled"] = bool(weather_auto_trade_enabled)
     if max_open_override is not None:
         updates["max_open_override"] = int(max_open_override) if int(max_open_override) > 0 else None
     if size_usd_override is not None:

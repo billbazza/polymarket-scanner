@@ -210,6 +210,27 @@ def _get_maker_prices(token_a, token_b, side_a, side_b):
     return _limit_price(token_a, side_a), _limit_price(token_b, side_b)
 
 
+def _get_single_leg_price(token_id, side, exec_mode=None):
+    """Return a price for a single-leg order using the shared maker/taker policy."""
+    exec_mode = exec_mode or EXECUTION_MODE
+    if exec_mode != "maker":
+        return api.get_midpoint(token_id)
+    try:
+        book = api.get_book(token_id)
+        bids = book.get("bids", [])
+        asks = book.get("asks", [])
+        if not bids or not asks:
+            return api.get_midpoint(token_id)
+        best_bid = float(bids[0]["price"])
+        best_ask = float(asks[0]["price"])
+        half_spread = (best_ask - best_bid) / 2
+        if side == "BUY":
+            return round(best_bid + MAKER_AGGRESSION * half_spread, 4)
+        return round(best_ask - MAKER_AGGRESSION * half_spread, 4)
+    except Exception:
+        return api.get_midpoint(token_id)
+
+
 def _safe_float(value, default=0.0):
     try:
         return float(value)
@@ -516,7 +537,7 @@ def _revalidate_weather_horizon(signal: dict | None):
 
 
 def execute_weather_trade(signal, size_usd, mode=None):
-    """Execute a paper-first weather trade from a saved weather signal."""
+    """Execute a weather trade from a saved weather signal."""
     mode = mode or _get_mode()
     runtime_scope = _runtime_scope_for_mode(mode)
     signal = dict(signal or {})
@@ -555,17 +576,17 @@ def execute_weather_trade(signal, size_usd, mode=None):
         mode,
     )
 
-    if mode != "paper":
+    if strategy_name.startswith("weather_exact_temp") and mode != "paper":
         log.warning(
-            "Weather live execution blocked for signal %s strategy=%s",
+            "Weather exact-temp live execution blocked for signal %s strategy=%s",
             weather_signal_id,
             strategy_name,
         )
         return {
             "ok": False,
             "mode": mode,
-            "reason_code": "paper_only_mode",
-            "error": "Weather execution is paper-only unless live rollout is explicitly approved.",
+            "reason_code": "exact_temp_paper_only",
+            "error": "Exact-temperature weather execution remains paper-only.",
             "strategy_name": strategy_name,
             "weather_signal_id": weather_signal_id,
         }
@@ -581,11 +602,11 @@ def execute_weather_trade(signal, size_usd, mode=None):
             "remaining_hours": horizon_check.get("remaining_hours"),
         }
 
-    bal = check_balance("paper")
+    bal = check_balance(mode)
     if not bal["ok"]:
         return {
             "ok": False,
-            "mode": "paper",
+            "mode": mode,
             "reason_code": "balance_check_failed",
             "error": f"Balance check failed: {bal.get('error')}",
             "weather_signal_id": weather_signal_id,
@@ -603,7 +624,7 @@ def execute_weather_trade(signal, size_usd, mode=None):
     if bal["balance_usd"] < size_usd:
         return {
             "ok": False,
-            "mode": "paper",
+            "mode": mode,
             "reason_code": "insufficient_cash",
             "error": f"Insufficient balance: ${bal['balance_usd']:.2f} < ${size_usd:.2f}",
             "paper_account": bal.get("paper_account"),
@@ -619,7 +640,7 @@ def execute_weather_trade(signal, size_usd, mode=None):
     if not decision["ok"]:
         return {
             "ok": False,
-            "mode": "paper",
+            "mode": mode,
             "reason_code": decision.get("reason_code"),
             "error": decision.get("reason"),
             "decision": decision,
@@ -627,44 +648,228 @@ def execute_weather_trade(signal, size_usd, mode=None):
             "strategy_name": strategy_name,
         }
 
-    trade_id = db.open_weather_trade(weather_signal_id, size_usd=size_usd, mode=mode, runtime_scope=runtime_scope)
-    if not trade_id:
+    if mode == "paper":
+        trade_id = db.open_weather_trade(weather_signal_id, size_usd=size_usd, mode=mode, runtime_scope=runtime_scope)
+        if not trade_id:
+            return {
+                "ok": False,
+                "mode": "paper",
+                "reason_code": "open_failed",
+                "error": "Weather trade could not be opened after preflight passed.",
+                "weather_signal_id": weather_signal_id,
+                "strategy_name": strategy_name,
+            }
+
+        account = db.get_paper_account_state(refresh_unrealized=False, runtime_scope=runtime_scope)
+        return {
+            "ok": True,
+            "mode": "paper",
+            "trade_id": trade_id,
+            "weather_signal_id": weather_signal_id,
+            "signal_id": weather_signal_id,
+            "strategy_name": strategy_name,
+            "entry_price": decision.get("entry_price"),
+            "action": decision.get("action"),
+            "runtime_scope": runtime_scope,
+            "trade_state_mode": db.TRADE_STATE_PAPER,
+            "reconciliation_mode": db.RECONCILIATION_INTERNAL,
+            "paper_account": account,
+            "confidence_score": confidence_meta.get("confidence_score") if confidence_meta else None,
+            "confidence_policy": confidence_meta.get("confidence_policy") if confidence_meta else None,
+            "confidence_applied": bool(confidence_meta),
+            "confidence_selected_size_usd": confidence_meta.get("confidence_selected_size_usd") if confidence_meta else None,
+            "confidence_baseline_size_usd": confidence_meta.get("confidence_baseline_size_usd") if confidence_meta else None,
+            "confidence_requested_policy": confidence_meta.get("confidence_requested_policy") if confidence_meta else None,
+            "confidence_gate_blockers": confidence_meta.get("gate_blockers") if confidence_meta else None,
+            "confidence_gate_blocker_codes": confidence_meta.get("gate_blocker_codes") if confidence_meta else None,
+            "confidence_gate_can_apply": confidence_meta.get("gate_can_apply_confidence") if confidence_meta else None,
+            "confidence_compare_only": confidence_meta.get("compare_only") if confidence_meta else None,
+            "confidence_rollout_state": confidence_meta.get("rollout_state") if confidence_meta else None,
+            "quarter_kelly_capped": bool(quarter_kelly_capped),
+        }
+
+    entry_token = decision.get("entry_token")
+    if not entry_token:
         return {
             "ok": False,
-            "mode": "paper",
-            "reason_code": "open_failed",
-            "error": "Weather trade could not be opened after preflight passed.",
+            "mode": "live",
+            "reason_code": "token_missing",
+            "error": "Weather signal lacks an entry token.",
             "weather_signal_id": weather_signal_id,
             "strategy_name": strategy_name,
         }
 
-    account = db.get_paper_account_state(refresh_unrealized=False, runtime_scope=runtime_scope)
-    return {
-        "ok": True,
-        "mode": "paper",
-        "trade_id": trade_id,
-        "weather_signal_id": weather_signal_id,
-        "signal_id": weather_signal_id,
-        "strategy_name": strategy_name,
-        "entry_price": decision.get("entry_price"),
-        "action": decision.get("action"),
-        "runtime_scope": runtime_scope,
-        "trade_state_mode": db.TRADE_STATE_PAPER,
-        "reconciliation_mode": db.RECONCILIATION_INTERNAL,
-        "paper_account": account,
-        "confidence_score": confidence_meta.get("confidence_score") if confidence_meta else None,
-        "confidence_policy": confidence_meta.get("confidence_policy") if confidence_meta else None,
-        "confidence_applied": bool(confidence_meta),
-        "confidence_selected_size_usd": confidence_meta.get("confidence_selected_size_usd") if confidence_meta else None,
-        "confidence_baseline_size_usd": confidence_meta.get("confidence_baseline_size_usd") if confidence_meta else None,
-        "confidence_requested_policy": confidence_meta.get("confidence_requested_policy") if confidence_meta else None,
-        "confidence_gate_blockers": confidence_meta.get("gate_blockers") if confidence_meta else None,
-        "confidence_gate_blocker_codes": confidence_meta.get("gate_blocker_codes") if confidence_meta else None,
-        "confidence_gate_can_apply": confidence_meta.get("gate_can_apply_confidence") if confidence_meta else None,
-        "confidence_compare_only": confidence_meta.get("compare_only") if confidence_meta else None,
-        "confidence_rollout_state": confidence_meta.get("rollout_state") if confidence_meta else None,
-        "quarter_kelly_capped": bool(quarter_kelly_capped),
-    }
+    slippage = math_engine.check_slippage(
+        entry_token,
+        trade_size_usd=size_usd,
+        max_slippage_pct=2.0,
+    )
+    if not slippage.get("ok"):
+        return {
+            "ok": False,
+            "mode": "live",
+            "reason_code": "slippage_block",
+            "error": slippage.get("reason"),
+            "weather_signal_id": weather_signal_id,
+            "strategy_name": strategy_name,
+            "slippage": slippage,
+        }
+
+    try:
+        from py_clob_client.client import ClobClient
+    except ImportError:
+        return {"ok": False, "error": "py-clob-client not installed", "mode": "live"}
+
+    private_key = runtime_config.get("POLYMARKET_PRIVATE_KEY")
+    if not private_key:
+        return {"ok": False, "error": "POLYMARKET_PRIVATE_KEY not set", "mode": "live"}
+
+    try:
+        client = ClobClient(host="https://clob.polymarket.com", key=private_key, chain_id=137)
+        side = "BUY"
+        exec_mode = EXECUTION_MODE
+        price = _get_single_leg_price(entry_token, side, exec_mode=exec_mode)
+        shares = round(size_usd / max(price, 0.0001), 4)
+        raw_order = client.create_and_post_order({
+            "tokenID": entry_token,
+            "price": price,
+            "size": shares,
+            "side": side,
+            "type": "GTC",
+        })
+        order_payload = _order_response_dict(raw_order)
+        order_id = _extract_order_id(order_payload) or str(raw_order)
+
+        wallet_address = None
+        try:
+            import blockchain
+            wallet_address = blockchain.get_wallet_address()
+        except Exception:
+            wallet_address = None
+
+        live_identity = db.build_live_trade_identity(order_id, None, wallet=wallet_address)
+        trade_status = "pending_fill" if exec_mode == "maker" else "open"
+        estimated_fee = _estimate_leg_fee_usd(exec_mode, size_usd)
+        entry_execution = {
+            "mode": "live",
+            "exec_mode": exec_mode,
+            "order_type": "GTC",
+            "status": trade_status,
+            "wallet_address": wallet_address,
+            "requested_prices": {"a": price},
+            "orders": {
+                "a": {
+                    "order_id": order_id,
+                    "tx_hash": _extract_tx_hash(order_payload),
+                    "token_id": entry_token,
+                    "side": side,
+                    "price": price,
+                    "size_shares": shares,
+                    "size_usd": round(size_usd, 2),
+                    "response": order_payload,
+                },
+            },
+            "estimated_fee_usd": estimated_fee,
+        }
+        trade_id = db.open_weather_trade(
+            weather_signal_id,
+            size_usd=size_usd,
+            mode=mode,
+            runtime_scope=runtime_scope,
+            metadata={
+                "status": trade_status,
+                "strategy_name": strategy_name,
+                "trade_state_mode": db.TRADE_STATE_LIVE,
+                "reconciliation_mode": db.RECONCILIATION_ORDERS,
+                "runtime_scope": runtime_scope,
+                "entry_execution": entry_execution,
+                "entry_fee_usd": estimated_fee,
+                **live_identity,
+            },
+        )
+        if not trade_id:
+            return {
+                "ok": False,
+                "mode": "live",
+                "reason_code": "open_failed",
+                "error": "Weather trade could not be opened after live preflight passed.",
+                "weather_signal_id": weather_signal_id,
+                "strategy_name": strategy_name,
+            }
+
+        now = time.time()
+        expires = now + ORDER_TTL_HOURS * 3600
+        db.save_open_order({
+            "order_id": order_id,
+            "trade_id": trade_id,
+            "signal_id": None,
+            "token_id": entry_token,
+            "side": side,
+            "leg": "a",
+            "limit_price": price,
+            "size_shares": shares,
+            "size_usd": size_usd,
+            "status": "pending",
+            "mode": "live",
+            "placed_at": now,
+            "expires_at": expires,
+            "purpose": "open",
+            "tx_hash": _extract_tx_hash(order_payload),
+            "response": order_payload,
+        })
+        try:
+            import hmrc
+            hmrc.log_real_trade({
+                **signal,
+                "trade_id": trade_id,
+                "weather_signal_id": weather_signal_id,
+                "size_usd": size_usd,
+                "entry_execution": entry_execution,
+                "fee_total_usd": estimated_fee,
+                "runtime_scope": runtime_scope,
+            }, action="opened")
+        except Exception as exc:
+            log.error("HMRC audit log failed during live weather open: %s", exc)
+
+        return {
+            "ok": True,
+            "mode": "live",
+            "trade_id": trade_id,
+            "weather_signal_id": weather_signal_id,
+            "signal_id": weather_signal_id,
+            "strategy_name": strategy_name,
+            "entry_price": price,
+            "action": decision.get("action"),
+            "runtime_scope": runtime_scope,
+            "trade_state_mode": db.TRADE_STATE_LIVE,
+            "reconciliation_mode": db.RECONCILIATION_ORDERS,
+            "fees_usd": estimated_fee,
+            "entry_execution": entry_execution,
+            "pending": exec_mode == "maker",
+            "slippage": slippage,
+            "confidence_score": confidence_meta.get("confidence_score") if confidence_meta else None,
+            "confidence_policy": confidence_meta.get("confidence_policy") if confidence_meta else None,
+            "confidence_applied": bool(confidence_meta),
+            "confidence_selected_size_usd": confidence_meta.get("confidence_selected_size_usd") if confidence_meta else None,
+            "confidence_baseline_size_usd": confidence_meta.get("confidence_baseline_size_usd") if confidence_meta else None,
+            "confidence_requested_policy": confidence_meta.get("confidence_requested_policy") if confidence_meta else None,
+            "confidence_gate_blockers": confidence_meta.get("gate_blockers") if confidence_meta else None,
+            "confidence_gate_blocker_codes": confidence_meta.get("gate_blocker_codes") if confidence_meta else None,
+            "confidence_gate_can_apply": confidence_meta.get("gate_can_apply_confidence") if confidence_meta else None,
+            "confidence_compare_only": confidence_meta.get("compare_only") if confidence_meta else None,
+            "confidence_rollout_state": confidence_meta.get("rollout_state") if confidence_meta else None,
+            "quarter_kelly_capped": bool(quarter_kelly_capped),
+        }
+    except Exception as exc:
+        log.error("Live weather execution failed for signal %s: %s", weather_signal_id, exc)
+        return {
+            "ok": False,
+            "mode": "live",
+            "reason_code": "live_execution_failed",
+            "error": str(exc),
+            "weather_signal_id": weather_signal_id,
+            "strategy_name": strategy_name,
+        }
 
 
 def execute_whale_trade(alert, size_usd=20, mode=None):

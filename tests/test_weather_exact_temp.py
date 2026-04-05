@@ -155,13 +155,13 @@ class WeatherExactTempTests(unittest.TestCase):
             self.assertEqual(len(opportunities), 2)
             self.assertTrue(meta["exact_temp_enabled"])
 
-    def test_execute_weather_trade_keeps_exact_temp_paper_only(self):
+    def test_execute_weather_trade_keeps_exact_temp_live_rollout_blocked(self):
         signal_id = self.db.save_weather_signal(_exact_temp_opp())
         signal = self.db.get_weather_signal_by_id(signal_id)
 
         blocked = self.execution.execute_weather_trade(signal, size_usd=20, mode="live")
         self.assertFalse(blocked["ok"])
-        self.assertEqual(blocked["reason_code"], "paper_only_mode")
+        self.assertEqual(blocked["reason_code"], "exact_temp_paper_only")
 
         opened = self.execution.execute_weather_trade(signal, size_usd=20, mode="paper")
         self.assertTrue(opened["ok"])

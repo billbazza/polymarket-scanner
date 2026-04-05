@@ -430,7 +430,7 @@ class RuntimeScopeSplitTests(unittest.TestCase):
         self.assertEqual(captured[0]["runtime_scope"], "penny")
         self.assertEqual(captured[0]["runtime_label"], "autonomy:penny")
 
-    def test_penny_runtime_skips_paper_only_autonomy_steps(self):
+    def test_penny_runtime_scans_weather_but_keeps_live_autotrading_explicit(self):
         import autonomy
 
         autonomy = importlib.reload(autonomy)
@@ -438,9 +438,24 @@ class RuntimeScopeSplitTests(unittest.TestCase):
         state["level"] = "penny"
 
         journal_entries = []
+        scanned_weather = []
         fake_weather_strategy = types.SimpleNamespace(
-            scan_weather_opportunities=lambda **kwargs: (_ for _ in ()).throw(
-                AssertionError("weather scan should be skipped for penny runtime")
+            scan_weather_opportunities=lambda **kwargs: (
+                scanned_weather.append(kwargs) or ([{
+                    "event": "London temperature",
+                    "market": "Will London hit 70F?",
+                    "strategy_name": "weather_threshold",
+                    "market_family": "weather_threshold",
+                    "yes_token": "weather-yes",
+                    "no_token": "weather-no",
+                    "market_price": 0.42,
+                    "combined_edge_pct": 9.0,
+                    "hours_ahead": 72,
+                    "timestamp": 1710000000,
+                    "liquidity": 9000,
+                    "action": "BUY_YES",
+                    "tradeable": True,
+                }], {"markets_checked": 1})
             )
         )
         fake_weather_exact = types.SimpleNamespace(
@@ -472,7 +487,10 @@ class RuntimeScopeSplitTests(unittest.TestCase):
                  "auto_trade_enabled": True,
                  "max_open": 3,
                  "size_usd": 3,
-                 "runtime_controls": {"auto_trade_enabled": True},
+                 "runtime_controls": {
+                     "auto_trade_enabled": True,
+                     "weather_auto_trade_enabled": False,
+                 },
              }), \
              patch.object(autonomy.db, "save_scan_run"), \
              patch.object(autonomy.tracker, "refresh_open_trades", return_value=[]), \
@@ -480,6 +498,7 @@ class RuntimeScopeSplitTests(unittest.TestCase):
              patch.object(autonomy.trade_monitor, "reconcile_open_trades", return_value={"counts": {}, "results": [], "auto_closed_trade_ids": []}), \
              patch.object(autonomy.tracker, "auto_close_trades", return_value=[]), \
              patch.object(autonomy.db, "get_trades", return_value=[]), \
+             patch.object(autonomy.db, "save_weather_signal", return_value=17), \
              patch.object(autonomy, "save_state"), \
              patch.object(autonomy, "journal", side_effect=lambda entry: journal_entries.append(entry)), \
              patch.dict(sys.modules, {
@@ -496,12 +515,19 @@ class RuntimeScopeSplitTests(unittest.TestCase):
         skipped = [entry for entry in journal_entries if entry.get("action") == "paper_only_step_skipped"]
         self.assertEqual(
             {entry.get("strategy") for entry in skipped},
-            {"weather", "copy", "wallet_discovery"},
+            {"copy", "wallet_discovery"},
         )
         self.assertTrue(all(entry.get("runtime_scope") == "penny" for entry in skipped))
+        self.assertEqual(len(scanned_weather), 1)
+        scan_only_entries = [entry for entry in journal_entries if entry.get("action") == "weather_scan_only"]
+        self.assertEqual(len(scan_only_entries), 1)
         weather_phase = (result or {}).get("cycle_summary", {}).get("weather_phase", {})
-        self.assertEqual(weather_phase.get("status"), "skipped")
-        self.assertEqual(weather_phase.get("reason_code"), "paper_only_scope_disabled")
+        self.assertEqual(weather_phase.get("status"), "completed")
+        self.assertEqual(weather_phase.get("execution_mode"), "scan-only")
+        self.assertEqual(weather_phase.get("reason_code"), "weather_auto_trade_disabled")
+        self.assertEqual(weather_phase.get("result_counts", {}).get("tradeable"), 1)
+        self.assertEqual(weather_phase.get("result_counts", {}).get("saved"), 1)
+        self.assertEqual(weather_phase.get("result_counts", {}).get("traded"), 0)
 
     def test_autonomy_background_status_includes_weather_phase_summary(self):
         import autonomy
@@ -516,13 +542,14 @@ class RuntimeScopeSplitTests(unittest.TestCase):
                  "state": {"level": "penny", "runtime_scope": "penny"},
                  "cycle_summary": {
                      "weather_phase": {
-                         "status": "skipped",
-                         "reason_code": "paper_only_scope_disabled",
-                         "reason": "Weather auto-trading is paper-only and is disabled for scope=penny.",
-                         "duration_secs": 0.0,
+                         "status": "completed",
+                         "reason_code": "weather_auto_trade_disabled",
+                         "reason": "Weather scanning completed for scope=penny; live weather auto-trading is disabled by runtime control.",
+                         "duration_secs": 0.1,
+                         "execution_mode": "scan-only",
                          "result_counts": {"opportunities": 0, "tradeable": 0, "traded": 0},
                      },
-                     "phases": [{"name": "weather_scan", "status": "skipped"}],
+                     "phases": [{"name": "weather_scan", "status": "completed"}],
                  },
              }):
             self.server._run_autonomy_background("penny")
@@ -534,8 +561,9 @@ class RuntimeScopeSplitTests(unittest.TestCase):
         self.assertEqual(last_result["signals_found"], 3)
         self.assertEqual(last_result["trades_opened"], 1)
         self.assertEqual(last_result["trades_closed"], 2)
-        self.assertEqual(last_result["weather_phase"]["status"], "skipped")
-        self.assertEqual(last_result["weather_phase"]["reason_code"], "paper_only_scope_disabled")
+        self.assertEqual(last_result["weather_phase"]["status"], "completed")
+        self.assertEqual(last_result["weather_phase"]["reason_code"], "weather_auto_trade_disabled")
+        self.assertEqual(last_result["weather_phase"]["execution_mode"], "scan-only")
 
     def test_autonomy_runtime_api_returns_scoped_state_and_limits(self):
         import autonomy
@@ -584,7 +612,7 @@ class RuntimeScopeSplitTests(unittest.TestCase):
         captured = []
         with patch.object(autonomy.journal_writer, "append_entry", side_effect=lambda entry: captured.append(entry) or entry):
             response = self.client.post(
-                "/api/autonomy/settings?runtime_scope=penny&auto_trade_enabled=true&max_open_override=5",
+                "/api/autonomy/settings?runtime_scope=penny&auto_trade_enabled=true&weather_auto_trade_enabled=true&max_open_override=5",
                 headers={"X-API-Key": "test-admin-key"},
             )
 
@@ -597,6 +625,7 @@ class RuntimeScopeSplitTests(unittest.TestCase):
         self.assertEqual(payload["runtime_scope"], "penny")
         self.assertEqual(payload["settings"]["runtime_scope"], "penny")
         self.assertTrue(payload["settings"]["auto_trade_enabled"])
+        self.assertTrue(payload["settings"]["weather_auto_trade_enabled"])
         self.assertEqual(payload["settings"]["max_open_override"], 5)
         self.assertEqual(payload["runtime"]["max_open"], 5)
         self.assertEqual(payload["runtime"]["max_open_usage"], "0/5")
@@ -611,9 +640,73 @@ class RuntimeScopeSplitTests(unittest.TestCase):
         self.assertEqual(payload["audit_entry"]["changed_fields"]["max_open_override"]["new"], 5)
         self.assertEqual(payload["audit_entry"]["changed_fields"]["auto_trade_enabled"]["old"], False)
         self.assertEqual(payload["audit_entry"]["changed_fields"]["auto_trade_enabled"]["new"], True)
+        self.assertEqual(payload["audit_entry"]["changed_fields"]["weather_auto_trade_enabled"]["old"], False)
+        self.assertEqual(payload["audit_entry"]["changed_fields"]["weather_auto_trade_enabled"]["new"], True)
         self.assertEqual(captured[0]["runtime_scope"], "penny")
         self.assertEqual(captured[0]["runtime_label"], "autonomy:penny")
         self.assertEqual(captured[0]["action"], "runtime_controls_updated")
+
+    def test_manual_penny_weather_trade_uses_live_execution_mode(self):
+        signal_id = self.db.save_weather_signal({
+            "event": "NYC temp",
+            "market": "Will NYC hit 80F?",
+            "strategy_name": "weather_threshold",
+            "market_family": "weather_threshold",
+            "market_id": "nyc-temp-80",
+            "yes_token": "nyc-yes",
+            "no_token": "nyc-no",
+            "city": "new york",
+            "lat": 40.7128,
+            "lon": -74.0060,
+            "target_date": "2026-04-06",
+            "threshold_f": 80.0,
+            "direction": "above",
+            "resolution_source": "wunderground_history",
+            "station_id": "KNYC",
+            "station_label": "New York City",
+            "settlement_unit": "F",
+            "settlement_precision": 1.0,
+            "station_timezone": "America/New_York",
+            "outcome_label": "80F or higher",
+            "market_price": 0.35,
+            "hours_ahead": 72,
+            "timestamp": 1710000000,
+            "liquidity": 8000,
+            "ev_pct": 8.0,
+            "kelly_fraction": 0.08,
+            "action": "BUY_YES",
+            "tradeable": True,
+            "noaa_forecast_f": 81.0,
+            "noaa_prob": 0.52,
+            "noaa_sigma_f": 2.1,
+            "om_forecast_f": 80.0,
+            "om_prob": 0.54,
+            "combined_prob": 0.53,
+            "combined_edge": 0.18,
+            "combined_edge_pct": 18.0,
+            "selected_prob": 0.53,
+            "selected_edge": 0.18,
+            "selected_edge_pct": 18.0,
+            "sources_agree": True,
+            "sources_available": 2,
+        })
+
+        with patch.object(self.server.execution, "execute_weather_trade", return_value={
+            "ok": True,
+            "trade_id": 88,
+            "trade_state_mode": self.db.TRADE_STATE_LIVE,
+            "reconciliation_mode": self.db.RECONCILIATION_ORDERS,
+        }) as execute_weather_trade:
+            response = self.client.post(
+                f"/api/weather/{signal_id}/trade?runtime_scope=penny&size_usd=3",
+                headers={"X-API-Key": "test-admin-key"},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["runtime_scope"], "penny")
+        self.assertEqual(response.json()["trade_state_mode"], self.db.TRADE_STATE_LIVE)
+        execute_weather_trade.assert_called_once()
+        self.assertEqual(execute_weather_trade.call_args.kwargs["mode"], "live")
 
     def test_dashboard_uses_runtime_scoped_history_and_runtime_fetches(self):
         html = Path(self.server.DASHBOARD_PATH).read_text()
