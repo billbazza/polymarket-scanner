@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 """Copy trader scanner — Phase 1: investigation and analysis of watched wallets.
 
 Pulls trade history and current positions from Polymarket's data API,

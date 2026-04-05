@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 """HMRC compliance module — required before any real-money trading.
 
 UK tax context:
@@ -108,7 +110,10 @@ def log_real_trade(trade: dict, action: str = "opened") -> None:
         "entry_value_gbp": trade.get("entry_value_gbp"),
         "pnl_usd": trade.get("pnl"),
         "pnl_gbp": round(trade.get("pnl", 0) * trade.get("gbp_rate", 0), 2) if trade.get("pnl") else None,
+        "fees_usd": trade.get("fee_total_usd") or trade.get("fees_usd"),
+        "fees_gbp": round((trade.get("fee_total_usd") or trade.get("fees_usd") or 0) * (trade.get("gbp_rate") or 0), 2) if trade.get("gbp_rate") else None,
         "trade_id": trade.get("id") or trade.get("trade_id"),
+        "runtime_scope": trade.get("runtime_scope") or "penny",
         "trade_type": trade.get("trade_type", "pairs"),
         "market_a": trade.get("market_a") or trade.get("event"),
         "market_b": trade.get("market_b"),
@@ -118,6 +123,12 @@ def log_real_trade(trade: dict, action: str = "opened") -> None:
         "exit_price_b": trade.get("exit_price_b"),
         "side_a": trade.get("side_a"),
         "side_b": trade.get("side_b"),
+        "external_order_id_a": trade.get("external_order_id_a") or ((trade.get("entry_execution") or {}).get("orders") or {}).get("a", {}).get("order_id"),
+        "external_order_id_b": trade.get("external_order_id_b") or ((trade.get("entry_execution") or {}).get("orders") or {}).get("b", {}).get("order_id"),
+        "entry_tx_hash_a": ((trade.get("entry_execution") or {}).get("orders") or {}).get("a", {}).get("tx_hash"),
+        "entry_tx_hash_b": ((trade.get("entry_execution") or {}).get("orders") or {}).get("b", {}).get("tx_hash"),
+        "exit_tx_hash_a": ((trade.get("exit_execution") or {}).get("orders") or {}).get("a", {}).get("tx_hash"),
+        "exit_tx_hash_b": ((trade.get("exit_execution") or {}).get("orders") or {}).get("b", {}).get("tx_hash"),
         "notes": trade.get("notes", ""),
     }
     with open(_AUDIT_LOG, "a") as f:

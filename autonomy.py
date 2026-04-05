@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+from __future__ import annotations
+
 """Autonomous trading engine — scans, trades, monitors, learns.
 
 Three levels of autonomy:
@@ -107,6 +109,20 @@ LEVELS = {
         "graduation": None,  # top level
     },
 }
+
+
+def get_level_config(level: str | None, runtime_scope: str | None = None) -> dict:
+    level_key = str(level or "").strip().lower()
+    config = dict(LEVELS.get(level_key, LEVELS["scout"]))
+    scope = normalize_runtime_scope(runtime_scope or runtime_scope_for_level(level_key))
+    controls = db.get_autonomy_runtime_settings(scope)
+    if controls.get("max_open_override") is not None:
+        config["max_open"] = controls["max_open_override"]
+    if controls.get("size_usd_override") is not None and config.get("size_usd") is not None:
+        config["size_usd"] = controls["size_usd_override"]
+    config["runtime_controls"] = controls
+    config["auto_trade_enabled"] = bool(controls.get("auto_trade_enabled", config.get("can_trade", False)))
+    return config
 
 
 # --- State Management ---
@@ -371,7 +387,7 @@ def run_cycle(state):
     runtime_tag = runtime_label(runtime_scope)
     state["runtime_scope"] = runtime_scope
     state["runtime_label"] = runtime_tag
-    config = LEVELS.get(level, LEVELS.get(level_key, LEVELS["scout"]))
+    config = get_level_config(level, runtime_scope)
     current_stage = "initializing"
 
     try:
@@ -719,6 +735,27 @@ def run_cycle(state):
             log.info("Step 4: SCOUT mode — not trading")
             journal({"action": "scout_only", "level": level,
                      "reason": "Level does not permit trading"})
+            save_state(state)
+            return state
+
+        if not config.get("auto_trade_enabled", True):
+            log.info("Step 4: Auto-trading disabled for scope=%s level=%s", runtime_scope, level)
+            journal({
+                "action": "auto_trade_disabled",
+                "level": level,
+                "runtime_scope": runtime_scope,
+                "reason": "Runtime auto-trading control is disabled.",
+            })
+            record_attempt(
+                level,
+                "pairs",
+                "blocked",
+                "auto_trade_disabled",
+                f"Runtime auto-trading is disabled for scope={runtime_scope}.",
+                event="Pairs autonomy preflight",
+                phase=current_stage,
+                details={"runtime_controls": config.get("runtime_controls")},
+            )
             save_state(state)
             return state
 
@@ -1712,7 +1749,7 @@ def run_cycle(state):
 def print_status(state):
     """Print detailed status report."""
     level = state["level"]
-    config = LEVELS[level]
+    config = get_level_config(level, state.get("runtime_scope"))
     perf = get_performance(state)
     can_graduate, report = check_graduation(state)
 

@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 """FastAPI backend — REST API + serves dashboard."""
 
 import asyncio
@@ -82,6 +84,7 @@ async def authorize_mutating_routes(request: Request, call_next):
         path.startswith("/api/trades")
         or path.startswith("/api/weather/")
         or path == "/api/paper-sizing/settings"
+        or path == "/api/autonomy/settings"
         or path == "/api/copy/mirror"
         or path == "/api/copy/settings"
         or path == "/api/copy/watch"
@@ -1369,8 +1372,9 @@ async def get_trade(trade_id: int):
 
 @app.post("/api/trades")
 async def create_trade(signal_id: int, size_usd: float = 100, runtime_scope: str | None = None):
-    """Open a paper trade from a signal."""
+    """Open a scoped trade from a signal."""
     runtime_scope = _runtime_scope_param(runtime_scope)
+    mode = "live" if runtime_scope == db.RUNTIME_SCOPE_PENNY else "paper"
     decision = db.inspect_pairs_trade_open(signal_id, size_usd=size_usd, runtime_scope=runtime_scope)
     if not decision["ok"]:
         _safe_record_paper_trade_attempt(
@@ -1403,15 +1407,16 @@ async def create_trade(signal_id: int, size_usd: float = 100, runtime_scope: str
                 },
             },
         )
-    trade_id = db.open_trade(signal_id, size_usd=size_usd, metadata={"runtime_scope": runtime_scope})
-    if not trade_id:
+    signal = db.get_signal_by_id(signal_id)
+    result = execution.execute_trade(signal or {"id": signal_id}, size_usd=size_usd, mode=mode)
+    if not result.get("ok"):
         _safe_record_paper_trade_attempt(
             source="manual_api",
             strategy="pairs",
             outcome="error",
             runtime_scope=runtime_scope,
             reason_code="open_failed",
-            reason="Pairs trade could not be opened after preflight passed.",
+            reason=result.get("error") or "Trade execution failed after preflight passed.",
             event=((decision.get("signal") or {}).get("event")),
             signal_id=signal_id,
             size_usd=size_usd,
@@ -1419,7 +1424,7 @@ async def create_trade(signal_id: int, size_usd: float = 100, runtime_scope: str
         )
         return JSONResponse(
             status_code=409,
-            content={"ok": False, "error": "Pairs trade could not be opened.", "reason_code": "open_failed"},
+            content={"ok": False, "error": result.get("error") or "Pairs trade could not be opened.", "reason_code": "open_failed"},
         )
     _safe_record_paper_trade_attempt(
         source="manual_api",
@@ -1430,35 +1435,45 @@ async def create_trade(signal_id: int, size_usd: float = 100, runtime_scope: str
         reason="Paper pairs trade opened.",
         event=((decision.get("signal") or {}).get("event")),
         signal_id=signal_id,
-        trade_id=trade_id,
+        trade_id=result.get("trade_id"),
         size_usd=size_usd,
         details={"path": "/api/trades"},
     )
     return {
         "ok": True,
-        "trade_id": trade_id,
+        **result,
         "status": "open",
         "runtime_scope": runtime_scope,
-        "trade_state_mode": db.TRADE_STATE_PAPER,
-        "reconciliation_mode": db.RECONCILIATION_INTERNAL,
-        "paper_account": db.get_paper_account_state(refresh_unrealized=True, runtime_scope=runtime_scope),
+        "trade_state_mode": db.TRADE_STATE_LIVE if mode == "live" else db.TRADE_STATE_PAPER,
+        "reconciliation_mode": db.RECONCILIATION_ORDERS if mode == "live" else db.RECONCILIATION_INTERNAL,
+        "paper_account": db.get_runtime_account_overview(refresh_unrealized=True, runtime_scope=runtime_scope),
     }
 
 
 @app.post("/api/trades/{trade_id}/close")
-async def close_trade(trade_id: int, exit_price_a: float, exit_price_b: float = None, notes: str = ""):
-    """Close a paper trade. exit_price_b is optional for single-leg (weather) trades."""
+async def close_trade(trade_id: int, exit_price_a: float | None = None, exit_price_b: float | None = None, notes: str = ""):
+    """Close a scoped trade. exit_price_b is optional for single-leg trades."""
     existing_trade = db.get_trade(trade_id)
-    pnl = db.close_trade(trade_id, exit_price_a, exit_price_b, notes)
-    if pnl is None:
+    if not existing_trade:
         raise HTTPException(404, "Trade not found")
     runtime_scope = (existing_trade or {}).get("runtime_scope") or db.RUNTIME_SCOPE_PAPER
+    if runtime_scope == db.RUNTIME_SCOPE_PENNY:
+        result = execution.close_live_trade(existing_trade, notes=notes)
+        if not result.get("ok"):
+            return JSONResponse(status_code=409, content=result)
+        pnl = result.get("pnl")
+    else:
+        if exit_price_a is None:
+            raise HTTPException(400, "exit_price_a is required for paper closes")
+        pnl = db.close_trade(trade_id, exit_price_a, exit_price_b, notes)
+        if pnl is None:
+            raise HTTPException(404, "Trade not found")
     return {
         "trade_id": trade_id,
         "pnl": round(pnl, 2),
         "status": "closed",
         "runtime_scope": runtime_scope,
-        "paper_account": db.get_paper_account_state(refresh_unrealized=True, runtime_scope=runtime_scope),
+        "paper_account": db.get_runtime_account_overview(refresh_unrealized=True, runtime_scope=runtime_scope),
     }
 
 
@@ -1725,7 +1740,7 @@ async def autonomy_runtime(runtime_scope: str | None = None):
     runtime_scope = _runtime_scope_param(runtime_scope)
     state = autonomy.load_state(runtime_scope=runtime_scope)
     level_key = str((state or {}).get("level") or "").strip().lower()
-    level_config = autonomy.LEVELS.get(level_key, autonomy.LEVELS["scout"])
+    level_config = autonomy.get_level_config(level_key, runtime_scope)
     max_open = level_config.get("max_open")
     open_positions = db.count_open_trades(runtime_scope=runtime_scope)
     slots_remaining = None if max_open is None else max(0, int(max_open) - int(open_positions))
@@ -1741,6 +1756,43 @@ async def autonomy_runtime(runtime_scope: str | None = None):
         "state_file": str(autonomy.state_file_for_scope(runtime_scope)),
         "running": _autonomy_status[runtime_scope]["running"],
         "last_result": _autonomy_status[runtime_scope]["last_result"],
+        "runtime_controls": level_config.get("runtime_controls"),
+        "auto_trade_enabled": bool(level_config.get("auto_trade_enabled")),
+    }
+
+
+@app.post("/api/autonomy/settings")
+async def update_autonomy_settings(
+    runtime_scope: str | None = None,
+    auto_trade_enabled: bool | None = None,
+    max_open_override: int | None = None,
+    size_usd_override: float | None = None,
+):
+    scope = _runtime_scope_param(runtime_scope)
+    updates = {}
+    if auto_trade_enabled is not None:
+        updates["auto_trade_enabled"] = bool(auto_trade_enabled)
+    if max_open_override is not None:
+        updates["max_open_override"] = int(max_open_override) if int(max_open_override) > 0 else None
+    if size_usd_override is not None:
+        updates["size_usd_override"] = round(float(size_usd_override), 2) if float(size_usd_override) > 0 else None
+    settings = db.set_autonomy_runtime_settings(scope, updates)
+    return {
+        "ok": True,
+        "runtime_scope": scope,
+        "settings": settings,
+        "runtime": await autonomy_runtime(runtime_scope=scope),
+    }
+
+
+@app.get("/api/reporting/hmrc")
+async def hmrc_reporting(runtime_scope: str | None = None, limit: int = 500):
+    scope = _runtime_scope_param(runtime_scope)
+    reporting = db.get_live_trade_reporting(limit=limit, runtime_scope=scope)
+    return {
+        "ok": True,
+        **reporting,
+        "hmrc_audit_log_path": str(Path(__file__).parent / "logs" / "hmrc_audit.jsonl"),
     }
 
 

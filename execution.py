@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 """Order execution engine — paper and live trading for Polymarket pairs.
 
 Paper mode (default): simulates orders against current midpoint prices.
@@ -206,6 +208,43 @@ def _get_maker_prices(token_a, token_b, side_a, side_b):
             return api.get_midpoint(token)
 
     return _limit_price(token_a, side_a), _limit_price(token_b, side_b)
+
+
+def _safe_float(value, default=0.0):
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _order_response_dict(result, fallback_order_id=None):
+    if isinstance(result, dict):
+        payload = dict(result)
+    else:
+        payload = {"order_id": str(result) if result is not None else None}
+    payload.setdefault("order_id", fallback_order_id)
+    return payload
+
+
+def _extract_order_id(order_payload):
+    for key in ("order_id", "id", "orderID"):
+        value = order_payload.get(key)
+        if value:
+            return str(value)
+    return None
+
+
+def _extract_tx_hash(order_payload):
+    for key in ("tx_hash", "transaction_hash", "txHash"):
+        value = order_payload.get(key)
+        if value:
+            return str(value)
+    return None
+
+
+def _estimate_leg_fee_usd(exec_mode: str, notional_usd: float) -> float:
+    fee_rate = 0.02 if exec_mode == "taker" else 0.0
+    return round(float(notional_usd or 0.0) * fee_rate, 2)
 
 
 def execute_trade(signal, size_usd, mode=None):
@@ -890,6 +929,160 @@ def settle_paper_trade(trade_id, pnl_usd):
     return True
 
 
+def close_live_trade(trade: dict, notes: str = "") -> dict:
+    """Best-effort live close using offsetting GTC orders and persisted execution metadata."""
+    trade = dict(trade or {})
+    trade_id = trade.get("id")
+    if not trade_id:
+        return {"ok": False, "error": "Trade missing id.", "mode": "live"}
+
+    try:
+        from py_clob_client.client import ClobClient
+    except ImportError:
+        return {"ok": False, "error": "py-clob-client not installed", "mode": "live"}
+
+    private_key = runtime_config.get("POLYMARKET_PRIVATE_KEY")
+    if not private_key:
+        return {"ok": False, "error": "POLYMARKET_PRIVATE_KEY not set", "mode": "live"}
+
+    try:
+        client = ClobClient(host="https://clob.polymarket.com", key=private_key, chain_id=137)
+        trade_type = trade.get("trade_type") or "pairs"
+        close_time = time.time()
+        exit_execution = {
+            "mode": "live",
+            "requested_at": close_time,
+            "status": "submitted",
+            "orders": {},
+        }
+
+        if trade_type in {"weather", "copy", "whale"}:
+            token_a = trade.get("token_id_a")
+            if not token_a:
+                return {"ok": False, "error": "Trade is missing token_id_a.", "mode": "live"}
+            current_a = api.get_midpoint(token_a)
+            close_side_a = "SELL" if "BUY" in str(trade.get("side_a") or "").upper() else "BUY"
+            shares_a = round((_safe_float(trade.get("size_usd")) / max(_safe_float(trade.get("entry_price_a")), 0.0001)), 4)
+            raw_order_a = client.create_and_post_order({
+                "tokenID": token_a,
+                "price": current_a,
+                "size": shares_a,
+                "side": close_side_a,
+                "type": "GTC",
+            })
+            order_a = _order_response_dict(raw_order_a)
+            exit_execution["orders"]["a"] = {
+                "order_id": _extract_order_id(order_a) or str(raw_order_a),
+                "tx_hash": _extract_tx_hash(order_a),
+                "token_id": token_a,
+                "side": close_side_a,
+                "price": current_a,
+                "size_shares": shares_a,
+                "response": order_a,
+            }
+            exit_fee_usd = _estimate_leg_fee_usd(EXECUTION_MODE, trade.get("size_usd"))
+            pnl = db.close_trade(
+                trade_id,
+                current_a,
+                notes=notes or "Operator live close",
+                metadata={
+                    "exit_execution": exit_execution,
+                    "exit_fee_usd": exit_fee_usd,
+                },
+            )
+            if pnl is not None:
+                try:
+                    import hmrc
+                    hmrc.log_real_trade({**trade, "pnl": pnl, "exit_execution": exit_execution, "fee_total_usd": trade.get("fee_total_usd", 0) + exit_fee_usd}, action="closed")
+                except Exception as exc:
+                    log.error("HMRC audit log failed during live close: %s", exc)
+            return {
+                "ok": pnl is not None,
+                "mode": "live",
+                "trade_id": trade_id,
+                "pnl": round(float(pnl or 0.0), 2),
+                "exit_execution": exit_execution,
+                "fees_usd": exit_fee_usd,
+            }
+
+        token_a = trade.get("token_id_a")
+        token_b = trade.get("token_id_b")
+        current_a = api.get_midpoint(token_a)
+        current_b = api.get_midpoint(token_b)
+        close_side_a = "BUY" if (trade.get("side_a") or "").upper() == "SELL" else "SELL"
+        close_side_b = "BUY" if (trade.get("side_b") or "").upper() == "SELL" else "SELL"
+        half_size = _safe_float(trade.get("size_usd")) / 2
+        shares_a = round(half_size / max(_safe_float(trade.get("entry_price_a")), 0.0001), 4)
+        shares_b = round(half_size / max(_safe_float(trade.get("entry_price_b")), 0.0001), 4)
+        raw_order_a = client.create_and_post_order({
+            "tokenID": token_a,
+            "price": current_a,
+            "size": shares_a,
+            "side": close_side_a,
+            "type": "GTC",
+        })
+        raw_order_b = client.create_and_post_order({
+            "tokenID": token_b,
+            "price": current_b,
+            "size": shares_b,
+            "side": close_side_b,
+            "type": "GTC",
+        })
+        order_a = _order_response_dict(raw_order_a)
+        order_b = _order_response_dict(raw_order_b)
+        exit_execution["orders"] = {
+            "a": {
+                "order_id": _extract_order_id(order_a) or str(raw_order_a),
+                "tx_hash": _extract_tx_hash(order_a),
+                "token_id": token_a,
+                "side": close_side_a,
+                "price": current_a,
+                "size_shares": shares_a,
+                "response": order_a,
+            },
+            "b": {
+                "order_id": _extract_order_id(order_b) or str(raw_order_b),
+                "tx_hash": _extract_tx_hash(order_b),
+                "token_id": token_b,
+                "side": close_side_b,
+                "price": current_b,
+                "size_shares": shares_b,
+                "response": order_b,
+            },
+        }
+        exit_fee_usd = round(
+            _estimate_leg_fee_usd(EXECUTION_MODE, half_size) + _estimate_leg_fee_usd(EXECUTION_MODE, half_size),
+            2,
+        )
+        pnl = db.close_trade(
+            trade_id,
+            current_a,
+            current_b,
+            notes=notes or "Operator live close",
+            metadata={
+                "exit_execution": exit_execution,
+                "exit_fee_usd": exit_fee_usd,
+            },
+        )
+        if pnl is not None:
+            try:
+                import hmrc
+                hmrc.log_real_trade({**trade, "pnl": pnl, "exit_execution": exit_execution, "fee_total_usd": trade.get("fee_total_usd", 0) + exit_fee_usd}, action="closed")
+            except Exception as exc:
+                log.error("HMRC audit log failed during live close: %s", exc)
+        return {
+            "ok": pnl is not None,
+            "mode": "live",
+            "trade_id": trade_id,
+            "pnl": round(float(pnl or 0.0), 2),
+            "exit_execution": exit_execution,
+            "fees_usd": exit_fee_usd,
+        }
+    except Exception as exc:
+        log.error("Live close failed for trade %s: %s", trade_id, exc)
+        return {"ok": False, "error": str(exc), "mode": "live", "trade_id": trade_id}
+
+
 def _execute_live(signal, size_usd, price_a, price_b,
                   side_a="BUY", side_b="SELL", exec_mode="maker",
                   confidence_metadata=None, quarter_kelly_capped=False):
@@ -920,22 +1113,26 @@ def _execute_live(signal, size_usd, price_a, price_b,
         half_size = size_usd / 2
         token_a = signal.get("token_id_a") or signal["market_a"]
         token_b = signal.get("token_id_b") or signal["market_b"]
-        order_type = "GTC" if exec_mode == "maker" else "FOK"
+        order_type = "GTC"
 
-        order_a = client.create_and_post_order({
+        raw_order_a = client.create_and_post_order({
             "tokenID": token_a,
             "price":   price_a,
             "size":    round(half_size / price_a, 4) if price_a > 0 else 0,
             "side":    side_a,
             "type":    order_type,
         })
-        order_b = client.create_and_post_order({
+        raw_order_b = client.create_and_post_order({
             "tokenID": token_b,
             "price":   price_b,
             "size":    round(half_size / price_b, 4) if price_b > 0 else 0,
             "side":    side_b,
             "type":    order_type,
         })
+        order_a = _order_response_dict(raw_order_a)
+        order_b = _order_response_dict(raw_order_b)
+        order_id_a = _extract_order_id(order_a) or str(raw_order_a)
+        order_id_b = _extract_order_id(order_b) or str(raw_order_b)
 
         signal_id = signal.get("id")
         wallet_address = None
@@ -944,9 +1141,44 @@ def _execute_live(signal, size_usd, price_a, price_b,
             wallet_address = blockchain.get_wallet_address()
         except Exception:
             wallet_address = None
-        live_identity = db.build_live_trade_identity(str(order_a), str(order_b), wallet=wallet_address)
+        live_identity = db.build_live_trade_identity(order_id_a, order_id_b, wallet=wallet_address)
         # In maker mode the trade is pending until both legs fill
         trade_status = "pending_fill" if exec_mode == "maker" else "open"
+        estimated_fee = round(
+            _estimate_leg_fee_usd(exec_mode, half_size) + _estimate_leg_fee_usd(exec_mode, half_size),
+            2,
+        )
+        entry_execution = {
+            "mode": "live",
+            "exec_mode": exec_mode,
+            "order_type": order_type,
+            "status": trade_status,
+            "wallet_address": wallet_address,
+            "requested_prices": {"a": price_a, "b": price_b},
+            "orders": {
+                "a": {
+                    "order_id": order_id_a,
+                    "tx_hash": _extract_tx_hash(order_a),
+                    "token_id": token_a,
+                    "side": side_a,
+                    "price": price_a,
+                    "size_shares": round(half_size / price_a, 4) if price_a > 0 else 0,
+                    "size_usd": round(half_size, 2),
+                    "response": order_a,
+                },
+                "b": {
+                    "order_id": order_id_b,
+                    "tx_hash": _extract_tx_hash(order_b),
+                    "token_id": token_b,
+                    "side": side_b,
+                    "price": price_b,
+                    "size_shares": round(half_size / price_b, 4) if price_b > 0 else 0,
+                    "size_usd": round(half_size, 2),
+                    "response": order_b,
+                },
+            },
+            "estimated_fee_usd": estimated_fee,
+        }
         trade_id = db.open_trade(
             signal_id,
             size_usd=size_usd,
@@ -955,15 +1187,17 @@ def _execute_live(signal, size_usd, price_a, price_b,
                 "trade_state_mode": db.TRADE_STATE_LIVE,
                 "reconciliation_mode": db.RECONCILIATION_ORDERS,
                 "runtime_scope": db.RUNTIME_SCOPE_PENNY,
+                "entry_execution": entry_execution,
+                "entry_fee_usd": estimated_fee,
                 **live_identity,
             },
         ) if signal_id else None
 
         now = time.time()
         expires = now + ORDER_TTL_HOURS * 3600
-        for leg, token_id, side, price, order_id in [
-            ("a", token_a, side_a, price_a, str(order_a)),
-            ("b", token_b, side_b, price_b, str(order_b)),
+        for leg, token_id, side, price, order_id, order_payload in [
+            ("a", token_a, side_a, price_a, order_id_a, order_a),
+            ("b", token_b, side_b, price_b, order_id_b, order_b),
         ]:
             db.save_open_order({
                 "order_id":    order_id,
@@ -979,10 +1213,13 @@ def _execute_live(signal, size_usd, price_a, price_b,
                 "mode":        "live",
                 "placed_at":   now,
                 "expires_at":  expires,
+                "purpose":     "open",
+                "tx_hash":     _extract_tx_hash(order_payload),
+                "response":    order_payload,
             })
 
         log.info("LIVE %s: trade=%s | orders=%s,%s | size=$%.2f",
-                 exec_mode.upper(), trade_id, order_a, order_b, size_usd)
+                 exec_mode.upper(), trade_id, order_id_a, order_id_b, size_usd)
 
         return {
             "ok": True,
@@ -990,11 +1227,15 @@ def _execute_live(signal, size_usd, price_a, price_b,
             "exec_mode": exec_mode,
             "trade_id": trade_id,
             "canonical_ref": live_identity["canonical_ref"],
-            "order_a": str(order_a),
-            "order_b": str(order_b),
+            "order_a": order_id_a,
+            "order_b": order_id_b,
+            "tx_hash_a": _extract_tx_hash(order_a),
+            "tx_hash_b": _extract_tx_hash(order_b),
             "fill_price_a": price_a,
             "fill_price_b": price_b,
             "size_usd": size_usd,
+            "fees_usd": estimated_fee,
+            "entry_execution": entry_execution,
             "pending": exec_mode == "maker",
             "confidence_score": confidence_metadata.get("confidence_score") if confidence_metadata else None,
             "confidence_policy": confidence_metadata.get("confidence_policy") if confidence_metadata else None,

@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 """SQLite persistence layer for the scanner."""
 import json
 import logging
@@ -16,6 +18,7 @@ _DB_INITIALIZED = False
 log = logging.getLogger("scanner.db")
 
 LIVE_LEDGER_MAX_AGE_SECONDS = 180
+AUTONOMY_RUNTIME_SETTINGS_KEY_PREFIX = "autonomy_runtime_controls::"
 
 TRADE_STATE_PAPER = "paper_research"
 TRADE_STATE_WALLET = "wallet_attached"
@@ -953,6 +956,24 @@ def _migration_019_signal_grade_field(conn):
     _add_column_if_missing(conn, "signals", "grade", "INTEGER")
 
 
+def _migration_022_live_trade_execution_fields(conn):
+    for col, coltype in [
+        ("entry_execution_json", "TEXT"),
+        ("exit_execution_json", "TEXT"),
+        ("entry_fee_usd", "REAL DEFAULT 0"),
+        ("exit_fee_usd", "REAL DEFAULT 0"),
+        ("exit_slippage_pct_a", "REAL"),
+        ("exit_slippage_pct_b", "REAL"),
+    ]:
+        _add_column_if_missing(conn, "trades", col, coltype)
+    for col, coltype in [
+        ("purpose", "TEXT DEFAULT 'open'"),
+        ("tx_hash", "TEXT"),
+        ("response_json", "TEXT"),
+    ]:
+        _add_column_if_missing(conn, "open_orders", col, coltype)
+
+
 _MIGRATIONS = [
     ("001_base_schema", _migration_001_base_schema),
     ("002_backfill_columns", _migration_002_backfill_columns),
@@ -974,6 +995,7 @@ _MIGRATIONS = [
     ("018_weather_token_probation", _migration_018_weather_token_probation),
     ("019_signal_grade_field", _migration_019_signal_grade_field),
     ("021_runtime_scope_split", _migration_021_runtime_scope_split),
+    ("022_live_trade_execution_fields", _migration_022_live_trade_execution_fields),
 ]
 
 
@@ -1476,6 +1498,14 @@ def calculate_single_leg_mark_to_market(size_usd, entry_price, current_price) ->
     }
 
 
+def _trade_paid_fee_total(trade: dict | sqlite3.Row | None) -> float:
+    trade = dict(trade or {})
+    return round(
+        float(trade.get("entry_fee_usd") or 0.0) + float(trade.get("exit_fee_usd") or 0.0),
+        2,
+    )
+
+
 def calculate_pairs_mark_to_market(
     size_usd,
     entry_price_a,
@@ -1611,6 +1641,7 @@ def _find_runtime_scoped_trade(rows, runtime_scope: str | None, *, status: str |
 def _latest_open_trade_valuation_rows(conn):
     return conn.execute("""
         SELECT t.id, t.trade_type, t.side_a, t.size_usd, t.entry_price_a, t.entry_price_b,
+               t.entry_fee_usd,
                s.price_a, s.price_b, s.timestamp AS snapshot_timestamp
         FROM trades t
         LEFT JOIN snapshots s ON s.id = (
@@ -1657,28 +1688,33 @@ def get_whale_open_drawdown_snapshot():
 def _open_trade_valuation_map_from_snapshots(conn):
     valuations = {}
     for row in _latest_open_trade_valuation_rows(conn):
-        trade_type = row["trade_type"] or "pairs"
+        trade = dict(row)
+        trade_type = trade["trade_type"] or "pairs"
         if trade_type in {"weather", "copy", "whale"}:
             valuation = calculate_single_leg_mark_to_market(
-                row["size_usd"],
-                row["entry_price_a"],
-                row["price_a"],
+                trade["size_usd"],
+                trade["entry_price_a"],
+                trade["price_a"],
             )
         else:
             valuation = calculate_pairs_mark_to_market(
-                row["size_usd"],
-                row["entry_price_a"],
-                row["price_a"],
-                row["entry_price_b"],
-                row["price_b"],
-                row["side_a"],
+                trade["size_usd"],
+                trade["entry_price_a"],
+                trade["price_a"],
+                trade["entry_price_b"],
+                trade["price_b"],
+                trade["side_a"],
             )
+        paid_fees = float(trade.get("entry_fee_usd") or 0.0)
+        if valuation["ok"]:
+            valuation["pnl_usd"] = round(float(valuation["pnl_usd"]) - paid_fees, 2)
+            valuation["current_value"] = round(float(valuation.get("current_value") or 0.0) - paid_fees, 2)
 
-        valuations[int(row["id"])] = {
+        valuations[int(trade["id"])] = {
             "ok": bool(valuation["ok"]),
             "pnl_usd": float(valuation["pnl_usd"]) if valuation["ok"] else 0.0,
             "current_value": float(valuation.get("current_value") or 0.0) if valuation["ok"] else 0.0,
-            "snapshot_timestamp": row["snapshot_timestamp"],
+            "snapshot_timestamp": trade["snapshot_timestamp"],
             "mark_missing": not bool(valuation["ok"]),
         }
     return valuations
@@ -1971,7 +2007,7 @@ def get_paper_account_state(
         rows = conn.execute("""
             SELECT id, trade_type, strategy_name, status, pnl, size_usd, notes,
                    trade_state_mode, reconciliation_mode, runtime_scope,
-                   external_order_id_a, external_order_id_b
+                   external_order_id_a, external_order_id_b, entry_fee_usd, exit_fee_usd
             FROM trades
         """ + where_clause, params).fetchall()
         valuation_map = _open_trade_valuation_map_from_snapshots(conn)
@@ -1987,6 +2023,7 @@ def get_paper_account_state(
     excluded_open_trades = 0
     excluded_unrealized_pnl = 0.0
     excluded_realized_pnl = 0.0
+    fees_paid_usd = 0.0
     inferred_trade_states = 0
     open_paper_trades_missing_marks = 0
     excluded_non_ledger_trades = 0
@@ -2003,6 +2040,7 @@ def get_paper_account_state(
             inferred_trade_states += 1
         size_usd = float(trade.get("size_usd") or 0.0)
         pnl = float(trade.get("pnl") or 0.0)
+        fees_paid = _trade_paid_fee_total(trade)
         if trade.get("status") == "open":
             valuation = valuation_map.get(int(trade["id"]), {"ok": False, "pnl_usd": 0.0})
             if state["is_paper"] or runtime_scope == RUNTIME_SCOPE_PENNY:
@@ -2019,6 +2057,7 @@ def get_paper_account_state(
         elif trade.get("status") == "closed":
             if state["is_paper"] or runtime_scope == RUNTIME_SCOPE_PENNY:
                 realized_pnl += pnl
+                fees_paid_usd += fees_paid
                 if pnl < 0:
                     cumulative_losses += abs(pnl)
                 elif pnl > 0:
@@ -2046,6 +2085,7 @@ def get_paper_account_state(
         "excluded_open_trades": excluded_open_trades,
         "excluded_realized_pnl": round(excluded_realized_pnl, 2),
         "excluded_unrealized_pnl": round(excluded_unrealized_pnl, 2),
+        "fees_paid_usd": round(fees_paid_usd, 2),
         "reporting_scope": (
             "paper_research_only"
             if runtime_scope == RUNTIME_SCOPE_PAPER
@@ -2220,6 +2260,7 @@ def get_live_account_overview(
             "realized_gains_usd": None,
             "cumulative_losses_usd": None,
             "unrealized_pnl_usd": None,
+            "fees_paid_usd": round(float(scoped_account.get("fees_paid_usd") or 0.0), 2),
             "total_equity_usd": None,
             "open_positions": int(scoped_account.get("open_trades") or 0),
             "wallet_exposure_pct": None,
@@ -2269,6 +2310,7 @@ def get_live_account_overview(
         "realized_gains_usd": round(float(scoped_account.get("realized_gains") or 0.0), 2),
         "cumulative_losses_usd": round(float(scoped_account.get("cumulative_losses") or 0.0), 2),
         "unrealized_pnl_usd": round(float(scoped_account.get("unrealized_pnl") or 0.0), 2),
+        "fees_paid_usd": round(float(scoped_account.get("fees_paid_usd") or 0.0), 2),
         "total_equity_usd": round(total_equity, 2),
         "open_positions": int(scoped_account.get("open_trades") or 0),
         "wallet_exposure_pct": round(wallet_exposure_pct, 1),
@@ -2311,6 +2353,17 @@ def _sanitize_operator_reason(reason, fallback: str = "Decision recorded.") -> s
     if not text:
         return fallback
     return text[:240]
+
+
+def _decode_json_field(value):
+    if not value:
+        return None
+    if isinstance(value, (dict, list)):
+        return value
+    try:
+        return json.loads(value)
+    except Exception:
+        return value
 
 
 def _resolve_trade_state_fields(metadata: dict | None = None) -> dict:
@@ -3000,21 +3053,22 @@ def inspect_pairs_trade_open(signal_id, size_usd=100, conn=None, runtime_scope: 
                 **_paper_position_policy_dict(),
             }
 
-        account_check = can_open_paper_trade(size_usd, runtime_scope=runtime_scope)
-        if not account_check["ok"]:
-            return {
-                "ok": False,
-                "reason_code": "insufficient_cash",
-                "reason": (
-                    f"Insufficient paper cash: ${account_check['available_cash']:.2f} available, "
-                    f"${account_check['requested_size_usd']:.2f} requested."
-                ),
-                "available_cash": account_check["available_cash"],
-                "requested_size_usd": account_check["requested_size_usd"],
-                "shortfall_usd": account_check["shortfall_usd"],
-                "account": account_check["account"],
-                **_paper_position_policy_dict(),
-            }
+        if runtime_scope == RUNTIME_SCOPE_PAPER:
+            account_check = can_open_paper_trade(size_usd, runtime_scope=runtime_scope)
+            if not account_check["ok"]:
+                return {
+                    "ok": False,
+                    "reason_code": "insufficient_cash",
+                    "reason": (
+                        f"Insufficient paper cash: ${account_check['available_cash']:.2f} available, "
+                        f"${account_check['requested_size_usd']:.2f} requested."
+                    ),
+                    "available_cash": account_check["available_cash"],
+                    "requested_size_usd": account_check["requested_size_usd"],
+                    "shortfall_usd": account_check["shortfall_usd"],
+                    "account": account_check["account"],
+                    **_paper_position_policy_dict(),
+                }
 
         return {
             "ok": True,
@@ -3374,8 +3428,9 @@ def open_trade(signal_id, size_usd=100, metadata=None):
             regime_break_threshold, regime_break_flag,
             token_id_a, token_id_b, event, market_a,
             trade_state_mode, reconciliation_mode, runtime_scope, canonical_ref,
-            external_position_id, external_order_id_a, external_order_id_b, external_source)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            external_position_id, external_order_id_a, external_order_id_b, external_source,
+            entry_execution_json, entry_fee_usd)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (
         signal_id, time.time(), side_a, side_b,
         sig["price_a"], sig["price_b"], size_usd, "open",
@@ -3407,6 +3462,8 @@ def open_trade(signal_id, size_usd=100, metadata=None):
         state_fields["external_order_id_a"],
         state_fields["external_order_id_b"],
         state_fields["external_source"],
+        json.dumps(metadata.get("entry_execution")) if metadata.get("entry_execution") is not None else None,
+        round(float(metadata.get("entry_fee_usd") or 0.0), 2),
     ))
     trade_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
     conn.execute("UPDATE signals SET status=? WHERE id=?", ("traded", signal_id))
@@ -3949,7 +4006,7 @@ def open_weather_trade(
     return trade_id
 
 
-def close_trade(trade_id, exit_price_a, exit_price_b=None, notes=""):
+def close_trade(trade_id, exit_price_a, exit_price_b=None, notes="", metadata: dict | None = None):
     """Close a paper trade and calculate P&L.
 
     For single-leg trades (weather/copy/whale), exit_price_b is not needed.
@@ -3958,6 +4015,7 @@ def close_trade(trade_id, exit_price_a, exit_price_b=None, notes=""):
     For pairs trades, both exit prices are required.
     """
     conn = get_conn()
+    metadata = metadata or {}
     trade = conn.execute("SELECT * FROM trades WHERE id=?", (trade_id,)).fetchone()
     if not trade:
         conn.close()
@@ -3999,11 +4057,28 @@ def close_trade(trade_id, exit_price_a, exit_price_b=None, notes=""):
             closed_z_score = round((spread - spread_mean) / spread_std, 4) if spread_std > 0 else 0.0
 
     token_id = trade["token_id_a"]
+    exit_fee_usd = round(float(metadata.get("exit_fee_usd") or 0.0), 2)
+    paid_fees = round(float(trade["entry_fee_usd"] or 0.0) + exit_fee_usd, 2)
+    pnl_net = round(float(pnl_usd) - paid_fees, 2)
     conn.execute("""
         UPDATE trades SET closed_at=?, exit_price_a=?, exit_price_b=?,
-            pnl=?, status='closed', notes=?, exit_reason=?, closed_z_score=?
+            pnl=?, status='closed', notes=?, exit_reason=?, closed_z_score=?,
+            exit_execution_json=?, exit_fee_usd=?, exit_slippage_pct_a=?, exit_slippage_pct_b=?
         WHERE id=?
-    """, (time.time(), exit_price_a, exit_b, pnl_usd, notes, exit_reason, closed_z_score, trade_id))
+    """, (
+        time.time(),
+        exit_price_a,
+        exit_b,
+        pnl_net,
+        notes,
+        exit_reason,
+        closed_z_score,
+        json.dumps(metadata.get("exit_execution")) if metadata.get("exit_execution") is not None else None,
+        exit_fee_usd,
+        metadata.get("exit_slippage_pct_a"),
+        metadata.get("exit_slippage_pct_b"),
+        trade_id,
+    ))
     if trade_type == "weather" and trade["weather_signal_id"]:
         conn.execute(
             "UPDATE weather_signals SET status='closed' WHERE id=?",
@@ -4014,7 +4089,7 @@ def close_trade(trade_id, exit_price_a, exit_price_b=None, notes=""):
     conn.commit()
     conn.close()
 
-    return pnl_usd
+    return pnl_net
 
 
 def update_trade_notes(trade_id, notes):
@@ -4038,6 +4113,8 @@ _TRADES_SELECT = """
         t.regime_break_threshold, t.regime_break_flag, t.regime_break_notes,
         t.trade_state_mode, t.reconciliation_mode, t.runtime_scope, t.canonical_ref,
         t.external_position_id, t.external_order_id_a, t.external_order_id_b, t.external_source,
+        t.entry_execution_json, t.exit_execution_json, t.entry_fee_usd, t.exit_fee_usd,
+        t.exit_slippage_pct_a, t.exit_slippage_pct_b,
         ww.active AS copy_wallet_active,
         ww.auto_drop_reason AS copy_wallet_reason,
         COALESCE(s.event, ws.event, t.copy_label, t.event) AS event,
@@ -4073,7 +4150,13 @@ def get_trades(status=None, limit=50, runtime_scope: str | None = None):
         params.append(limit)
     rows = conn.execute(query, params).fetchall()
     conn.close()
-    trades = [dict(r) for r in rows]
+    trades = []
+    for row in rows:
+        trade = dict(row)
+        trade["entry_execution"] = _decode_json_field(trade.pop("entry_execution_json", None))
+        trade["exit_execution"] = _decode_json_field(trade.pop("exit_execution_json", None))
+        trade["fee_total_usd"] = _trade_paid_fee_total(trade)
+        trades.append(trade)
     if scope in {RUNTIME_SCOPE_PAPER, RUNTIME_SCOPE_PENNY}:
         trades = [trade for trade in trades if _is_trade_in_runtime_ledger(trade, scope)]
     return trades
@@ -4085,7 +4168,45 @@ def get_trade(trade_id):
         _TRADES_SELECT + " WHERE t.id=?", (trade_id,)
     ).fetchone()
     conn.close()
-    return dict(row) if row else None
+    if not row:
+        return None
+    trade = dict(row)
+    trade["entry_execution"] = _decode_json_field(trade.pop("entry_execution_json", None))
+    trade["exit_execution"] = _decode_json_field(trade.pop("exit_execution_json", None))
+    trade["fee_total_usd"] = _trade_paid_fee_total(trade)
+    return trade
+
+
+def get_live_trade_reporting(limit: int = 500, runtime_scope: str = RUNTIME_SCOPE_PENNY) -> dict:
+    trades = get_trades(limit=limit, runtime_scope=runtime_scope)
+    live_trades = [
+        trade for trade in trades
+        if _resolve_reporting_trade_state(trade)["mode"] == TRADE_STATE_LIVE
+    ]
+    totals = {
+        "trade_count": len(live_trades),
+        "open_trades": 0,
+        "closed_trades": 0,
+        "realized_pnl_usd": 0.0,
+        "fees_usd": 0.0,
+        "size_usd": 0.0,
+    }
+    for trade in live_trades:
+        totals["size_usd"] += float(trade.get("size_usd") or 0.0)
+        totals["fees_usd"] += float(trade.get("fee_total_usd") or 0.0)
+        if trade.get("status") == "open":
+            totals["open_trades"] += 1
+        else:
+            totals["closed_trades"] += 1
+            totals["realized_pnl_usd"] += float(trade.get("pnl") or 0.0)
+    for key in ("realized_pnl_usd", "fees_usd", "size_usd"):
+        totals[key] = round(totals[key], 2)
+    return {
+        "runtime_scope": normalize_runtime_scope(runtime_scope, default=RUNTIME_SCOPE_PENNY),
+        "generated_at": time.time(),
+        "totals": totals,
+        "trades": live_trades,
+    }
 
 
 def get_runtime_scope_trade_reconciliation(runtime_scope: str | None = None) -> dict:
@@ -4701,6 +4822,55 @@ def get_copy_trade_settings() -> dict:
         "caps_active": bool(cap_enabled and (per_wallet_cap is not None or total_open_cap is not None)),
         **_paper_position_policy_dict(),
     }
+
+
+def _autonomy_runtime_settings_key(runtime_scope: str | None) -> str:
+    return AUTONOMY_RUNTIME_SETTINGS_KEY_PREFIX + normalize_runtime_scope(runtime_scope)
+
+
+def get_autonomy_runtime_settings(runtime_scope: str | None = None) -> dict:
+    scope = normalize_runtime_scope(runtime_scope)
+    defaults = {
+        "runtime_scope": scope,
+        "auto_trade_enabled": scope == RUNTIME_SCOPE_PAPER,
+        "max_open_override": None,
+        "size_usd_override": None,
+    }
+    raw = get_setting(_autonomy_runtime_settings_key(scope), default=None) or {}
+    settings = {**defaults, **raw}
+    settings["runtime_scope"] = scope
+    settings["auto_trade_enabled"] = bool(settings.get("auto_trade_enabled"))
+    settings["max_open_override"] = _normalize_optional_cap(settings.get("max_open_override"))
+    size_override = settings.get("size_usd_override")
+    try:
+        settings["size_usd_override"] = (
+            round(float(size_override), 2)
+            if size_override is not None and float(size_override) > 0
+            else None
+        )
+    except (TypeError, ValueError):
+        settings["size_usd_override"] = None
+    return settings
+
+
+def set_autonomy_runtime_settings(runtime_scope: str | None = None, updates: dict | None = None) -> dict:
+    scope = normalize_runtime_scope(runtime_scope)
+    current = get_autonomy_runtime_settings(scope)
+    merged = {**current, **(updates or {})}
+    merged["runtime_scope"] = scope
+    merged["auto_trade_enabled"] = bool(merged.get("auto_trade_enabled"))
+    merged["max_open_override"] = _normalize_optional_cap(merged.get("max_open_override"))
+    size_override = merged.get("size_usd_override")
+    try:
+        merged["size_usd_override"] = (
+            round(float(size_override), 2)
+            if size_override is not None and float(size_override) > 0
+            else None
+        )
+    except (TypeError, ValueError):
+        merged["size_usd_override"] = None
+    set_setting(_autonomy_runtime_settings_key(scope), merged)
+    return get_autonomy_runtime_settings(scope)
 
 # --- Longshot Signals ---
 
@@ -5436,8 +5606,8 @@ def save_open_order(order: dict) -> int:
         INSERT INTO open_orders
             (order_id, trade_id, signal_id, token_id, side, leg,
              limit_price, size_shares, size_usd, status, mode,
-             placed_at, expires_at)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+             placed_at, expires_at, purpose, tx_hash, response_json)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
     """, (
         order["order_id"], order.get("trade_id"), order.get("signal_id"),
         order["token_id"], order["side"], order["leg"],
@@ -5445,6 +5615,9 @@ def save_open_order(order: dict) -> int:
         order.get("status", "pending"), order.get("mode", "paper"),
         order.get("placed_at", time.time()),
         order.get("expires_at", time.time() + 4 * 3600),
+        order.get("purpose", "open"),
+        order.get("tx_hash"),
+        json.dumps(order.get("response")) if order.get("response") is not None else None,
     ))
     row_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
     conn.commit()
@@ -5459,14 +5632,19 @@ def get_open_orders(status: str = "pending") -> list[dict]:
         (status,)
     ).fetchall()
     conn.close()
-    return [dict(r) for r in rows]
+    orders = []
+    for row in rows:
+        order = dict(row)
+        order["response"] = _decode_json_field(order.pop("response_json", None))
+        orders.append(order)
+    return orders
 
 
-def fill_open_order(row_id: int, fill_price: float) -> None:
+def fill_open_order(row_id: int, fill_price: float, response: dict | None = None) -> None:
     conn = get_conn()
     conn.execute(
-        "UPDATE open_orders SET status='filled', filled_at=?, fill_price=? WHERE id=?",
-        (time.time(), fill_price, row_id),
+        "UPDATE open_orders SET status='filled', filled_at=?, fill_price=?, response_json=COALESCE(?, response_json) WHERE id=?",
+        (time.time(), fill_price, json.dumps(response) if response is not None else None, row_id),
     )
     conn.commit()
     conn.close()

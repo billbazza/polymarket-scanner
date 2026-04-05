@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 """Math engine — Kelly Criterion, Expected Value, Slippage Protection.
 
 All local math, zero external dependencies beyond numpy.

@@ -674,6 +674,19 @@
         <strong>Scoped Runtime</strong>
         <span id="runtimeScopeMeta">Loading scoped autonomy state…</span>
       </div>
+      <div id="runtimeControlsBox" style="display:none;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:10px;margin-bottom:10px">
+        <label style="display:grid;gap:4px">
+          <span style="font-size:11px;color:var(--text2)">Penny Auto-Trading</span>
+          <select id="runtimeAutoTradeSelect" onchange="saveRuntimeControls()" style="background:var(--surface);color:var(--text);border:1px solid var(--border);border-radius:8px;padding:8px">
+            <option value="true">Enabled</option>
+            <option value="false">Disabled</option>
+          </select>
+        </label>
+        <label style="display:grid;gap:4px">
+          <span style="font-size:11px;color:var(--text2)">Penny Max Open</span>
+          <input id="runtimeMaxOpenInput" type="number" min="1" step="1" value="3" onchange="saveRuntimeControls()" style="background:var(--surface);color:var(--text);border:1px solid var(--border);border-radius:8px;padding:8px">
+        </label>
+      </div>
       <div class="runtime-scope-grid">
         <div class="runtime-scope-metric">
           <div class="label">Autonomy Level</div>
@@ -1470,7 +1483,7 @@ async function loadStats() {
     setSignedValue('statRealized', realizedPnl);
     document.getElementById('statRealizedMeta').textContent = isPaper
       ? `Closed-trade net: gains ${fmtUsd(account.realized_gains || 0)} vs losses ${fmtUsd(cumulativeLosses)}.`
-      : `Closed penny positions: gains ${fmtUsd(account.realized_gains_usd || 0)} vs losses ${fmtUsd(cumulativeLosses)}.`;
+      : `Closed penny positions: gains ${fmtUsd(account.realized_gains_usd || 0)} vs losses ${fmtUsd(cumulativeLosses)}. Fees paid ${fmtUsd(account.fees_paid_usd || 0)}.`;
     setSignedValue('statUnrealized', unrealizedPnl);
     document.getElementById('statUnrealizedMeta').textContent = `Current mark-to-market on open trades.`;
     document.getElementById('statLossesUsd').textContent = fmtUsd(cumulativeLosses);
@@ -1637,6 +1650,50 @@ function renderRuntimeScopePanel(runtimeData, statsData, account) {
   getEl('runtimeCycleMeta').textContent = cycleMeta;
   getEl('runtimeStateFileValue').textContent = scope === 'paper' ? 'autonomy_state.paper.json' : 'autonomy_state.penny.json';
   getEl('runtimeStateFileMeta').textContent = runtimeData?.state_file || '—';
+  renderRuntimeControls(runtimeData, scope);
+}
+
+function renderRuntimeControls(runtimeData, scope) {
+  const box = getEl('runtimeControlsBox');
+  const autoTrade = getEl('runtimeAutoTradeSelect');
+  const maxOpen = getEl('runtimeMaxOpenInput');
+  if (!box || !autoTrade || !maxOpen) return;
+  const isPenny = scope === 'penny';
+  box.style.display = isPenny ? 'grid' : 'none';
+  if (!isPenny) return;
+  const controls = runtimeData?.runtime_controls || {};
+  autoTrade.value = String(controls.auto_trade_enabled !== false);
+  maxOpen.value = String(runtimeData?.max_open || controls.max_open_override || 3);
+}
+
+async function saveRuntimeControls() {
+  if (ACTIVE_RUNTIME_SCOPE !== 'penny') return;
+  const autoTrade = getEl('runtimeAutoTradeSelect');
+  const maxOpen = getEl('runtimeMaxOpenInput');
+  if (!autoTrade || !maxOpen) return;
+  const parsedMaxOpen = Number(maxOpen.value);
+  if (!Number.isFinite(parsedMaxOpen) || parsedMaxOpen < 1) {
+    toast('Penny max-open must be at least 1.', true);
+    loadStats();
+    return;
+  }
+  const params = new URLSearchParams({
+    runtime_scope: 'penny',
+    auto_trade_enabled: autoTrade.value,
+    max_open_override: String(parsedMaxOpen),
+  });
+  try {
+    const r = await fetch(API + `/api/autonomy/settings?${params.toString()}`, { method: 'POST' });
+    const data = await r.json();
+    if (!r.ok || data?.ok === false) {
+      throw new Error(data?.detail || data?.error || 'Failed to save runtime controls');
+    }
+    toast(`Penny runtime updated: auto-trading ${autoTrade.value === 'true' ? 'enabled' : 'disabled'}, max open ${parsedMaxOpen}.`);
+    loadStats();
+  } catch (e) {
+    toast(`Runtime control save failed: ${e.message || e}`, true);
+    loadStats();
+  }
 }
 
 function renderPaperSizingControls(settings) {
@@ -2141,7 +2198,7 @@ async function loadTrades() {
         <td class="event-name" title="${esc(t.event)}">${esc(t.event)}</td>
         <td><span class="badge ${t.side_a==='BUY'?'yes':'no'}">${t.side_a} / <span class="${t.side_b==='BUY'?'yes':'no'}">${t.side_b}</span></span></td>
         <td>${fmtPct(t.entry_price_a)}</td>
-        <td>${fmtPct(t.entry_price_b)}${monPill}</td>
+        <td>${fmtPct(t.entry_price_b)}${monPill}<div style="color:var(--text2);font-size:11px">${ACTIVE_RUNTIME_SCOPE === 'penny' ? esc([t.external_order_id_a, t.external_order_id_b].filter(Boolean).join(' / ') || `fees ${fmtUsd(t.fee_total_usd || 0)}`) : ''}</div></td>
         <td>${fmtUsd(t.size_usd)}</td>
         <td><button class="btn sm" onclick="closeTrade(${t.id})">Close</button></td>
       </tr>`;
@@ -2168,7 +2225,7 @@ async function loadHistory() {
       <td>${fmtPct(t.entry_price_a)} / ${fmtPct(t.entry_price_b)}</td>
       <td>${t.exit_price_a ? fmtPct(t.exit_price_a) + ' / ' + fmtPct(t.exit_price_b) : '-'}</td>
       <td class="${t.pnl>=0?'pnl-pos':'pnl-neg'}">${fmtUsd(t.pnl)}</td>
-      <td>${esc(t.notes||'')}</td>
+      <td>${esc([t.notes || '', ACTIVE_RUNTIME_SCOPE === 'penny' ? `fees ${fmtUsd(t.fee_total_usd || 0)}` : '', ACTIVE_RUNTIME_SCOPE === 'penny' ? [t.external_order_id_a, t.external_order_id_b].filter(Boolean).join(' / ') : ''].filter(Boolean).join(' · '))}</td>
     </tr>`).join('');
   } catch(e) {}
 }
@@ -2391,11 +2448,8 @@ async function brainValidateWhale(alertId) {
 }
 
 async function paperTrade(signalId) {
-  if (ACTIVE_RUNTIME_SCOPE !== 'paper') {
-    toast('Manual paper entries are available in the paper view only.', true);
-    return;
-  }
-  const size = prompt('Paper trade size (USD):', '100');
+  const isPaper = ACTIVE_RUNTIME_SCOPE === 'paper';
+  const size = prompt(`${isPaper ? 'Research' : 'Penny'} trade size (USD):`, isPaper ? '100' : '3');
   if (!size) return;
   try {
     const r = await fetch(API + runtimeScopedUrl('/api/trades', { signal_id: signalId, size_usd: size }), { method: 'POST' });
@@ -2405,18 +2459,28 @@ async function paperTrade(signalId) {
       loadPaperAttempts();
       return;
     }
-    toast(`Paper trade opened (ID: ${data.trade_id})`);
+    const fillInfo = !isPaper && (data.order_a || data.order_b)
+      ? ` Orders ${[data.order_a, data.order_b].filter(Boolean).join(' / ')}.`
+      : '';
+    toast(`${isPaper ? 'Research' : 'Penny'} trade opened (ID: ${data.trade_id}).${fillInfo}`);
     loadSignals(); loadTrades(); loadStats(); loadPaperAttempts();
   } catch(e) { toast('Failed: ' + e.message); }
 }
 
 async function closeTrade(tradeId) {
-  const exitA = prompt('Exit price A (0–1):'); if (!exitA) return;
-  const exitB = prompt('Exit price B (0–1):'); if (!exitB) return;
   const notes = prompt('Notes (optional):', '') || '';
   try {
-    const r = await fetch(API + `/api/trades/${tradeId}/close?exit_price_a=${exitA}&exit_price_b=${exitB}&notes=${encodeURIComponent(notes)}`, { method: 'POST' });
+    let url = `${API}/api/trades/${tradeId}/close?notes=${encodeURIComponent(notes)}`;
+    if (ACTIVE_RUNTIME_SCOPE === 'paper') {
+      const exitA = prompt('Exit price A (0–1):'); if (!exitA) return;
+      const exitB = prompt('Exit price B (0–1):'); if (!exitB) return;
+      url += `&exit_price_a=${exitA}&exit_price_b=${exitB}`;
+    }
+    const r = await fetch(url, { method: 'POST' });
     const data = await r.json();
+    if (!r.ok || data.ok === false) {
+      throw new Error(data.detail || data.error || 'Close failed');
+    }
     toast(`Trade closed. P&L: ${fmtUsd(data.pnl)}`);
     loadTrades(); loadStats();
   } catch(e) { toast('Failed: ' + e.message); }

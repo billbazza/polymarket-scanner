@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 """Route-level authorization helpers for the FastAPI server."""
 from fastapi import Header, HTTPException, Request, status
 
