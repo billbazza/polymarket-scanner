@@ -563,12 +563,18 @@ async def stats(runtime_scope: str | None = None):
     return db.get_stats(runtime_scope=_runtime_scope_param(runtime_scope))
 
 
-@app.get("/api/paper-account")
-async def paper_account(runtime_scope: str | None = None):
-    return db.get_paper_account_overview(
+@app.get("/api/runtime/account")
+async def runtime_account(runtime_scope: str | None = None):
+    return db.get_runtime_account_overview(
         refresh_unrealized=True,
         runtime_scope=_runtime_scope_param(runtime_scope),
     )
+
+
+@app.get("/api/paper-account")
+async def paper_account(runtime_scope: str | None = None):
+    """Backward-compatible alias for the runtime-aware account overview."""
+    return await runtime_account(runtime_scope=runtime_scope)
 
 
 @app.get("/api/paper-sizing")

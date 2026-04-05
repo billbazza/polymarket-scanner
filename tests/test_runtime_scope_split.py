@@ -131,15 +131,29 @@ class RuntimeScopeSplitTests(unittest.TestCase):
         self.assertEqual([row["id"] for row in paper_trades], [paper_trade_id])
         self.assertEqual([row["id"] for row in penny_trades], [penny_trade_id])
 
-        paper_stats = self.client.get("/api/stats?runtime_scope=paper").json()
-        penny_stats = self.client.get("/api/stats?runtime_scope=penny").json()
+        with patch.object(self.db, "_get_live_wallet_snapshot", return_value={
+            "wallet_connected": True,
+            "wallet_address": "0x1234567890abcdef1234567890abcdef12345678",
+            "available_balance_usd": 17.25,
+            "balance_source": "polygon_wallet",
+            "wallet_error": None,
+        }):
+            paper_stats = self.client.get("/api/stats?runtime_scope=paper").json()
+            penny_stats = self.client.get("/api/stats?runtime_scope=penny").json()
+            penny_account = self.client.get("/api/runtime/account?runtime_scope=penny").json()
         self.assertEqual(paper_stats["runtime_scope"], "paper")
         self.assertEqual(paper_stats["open_trades"], 1)
-        self.assertEqual(paper_stats["paper_account"]["runtime_scope"], "paper")
+        self.assertEqual(paper_stats["runtime_account"]["runtime_scope"], "paper")
+        self.assertEqual(paper_stats["runtime_account"]["account_mode"], "paper_bankroll")
         self.assertEqual(penny_stats["runtime_scope"], "penny")
         self.assertEqual(penny_stats["open_trades"], 1)
-        self.assertEqual(penny_stats["paper_account"]["runtime_scope"], "penny")
-        self.assertEqual(penny_stats["paper_account"]["committed_capital"], 3.0)
+        self.assertEqual(penny_stats["runtime_account"]["runtime_scope"], "penny")
+        self.assertEqual(penny_stats["runtime_account"]["account_mode"], "live_wallet")
+        self.assertEqual(penny_stats["runtime_account"]["deployed_capital_usd"], 3.0)
+        self.assertEqual(penny_stats["runtime_account"]["available_balance_usd"], 17.25)
+        self.assertEqual(penny_account["account_mode"], "live_wallet")
+        self.assertEqual(penny_account["available_balance_usd"], 17.25)
+        self.assertNotIn("paper_account", penny_account)
 
     def test_closed_trade_history_api_is_runtime_scoped(self):
         signal_id = self.db.save_signal(_signal())
@@ -237,6 +251,7 @@ class RuntimeScopeSplitTests(unittest.TestCase):
         html = Path(self.server.DASHBOARD_PATH).read_text()
         self.assertIn("runtimeScopedUrl('/api/trades', { status: 'closed', limit: 500 }, scope)", html)
         self.assertIn("fetch(API + runtimeScopedUrl('/api/autonomy/runtime', {}, scope))", html)
+        self.assertIn("fetch(API + runtimeScopedUrl('/api/runtime/account', {}, scope))", html)
         self.assertIn("if (requestId !== SCOPE_REQUEST_SEQ.history || scope !== ACTIVE_RUNTIME_SCOPE) return;", html)
         self.assertIn("if (requestId !== SCOPE_REQUEST_SEQ.stats || scope !== ACTIVE_RUNTIME_SCOPE) return;", html)
 

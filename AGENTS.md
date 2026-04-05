@@ -63,6 +63,7 @@ Every opportunity flows: scanner finds pair → `math_engine.score_opportunity()
 ### Trading Modes
 - **Paper** (default): simulates against current prices, tracks in SQLite. There are no limits on numbers of trades while in paper mode. Paper-runtime trades, balances, and autonomy state are now isolated from the penny runtime, so open paper experiments do not block penny `max_open` limits or penny dashboard views. Autonomy now derives `mode="paper"` explicitly from the normalized `level` string so paper-level cointegration trades never invoke `brain.validate_signal()`; the system logs a `brain_validation_skipped` journal entry for each admitted A+ cohort signal, making the math-only trade path auditable while still enforcing slippage and balance checks.
 - **Live**: requires `POLYMARKET_PRIVATE_KEY` in the macOS Keychain (or an explicit per-process env override), uses py-clob-client
+- **Dashboard/runtime semantics**: `/api/runtime/account` is the canonical dashboard account endpoint. Paper scope reports bankroll accounting; penny scope reports Polygon wallet-backed cash plus only penny-scoped positions/PnL. In penny mode the browser must not render paper balances, paper PnL, or shared aggregate totals.
 
 ### Database
 SQLite at `scanner.db`. Schema auto-migrates on import via `db.init_db()`. New columns added via ALTER TABLE with try/except. `get_trades()`/`get_trade()` use LEFT JOIN to both `signals` and `weather_signals` so both trade types are returned correctly.

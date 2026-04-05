@@ -2046,6 +2046,123 @@ def get_paper_account_overview(
     return overview
 
 
+def _get_live_wallet_snapshot() -> dict:
+    """Return the current Polygon wallet/balance snapshot for penny-mode reporting."""
+    try:
+        import blockchain
+    except Exception as exc:
+        log.warning("Live wallet snapshot unavailable: %s", exc)
+        return {
+            "wallet_connected": False,
+            "wallet_address": None,
+            "available_balance_usd": 0.0,
+            "balance_source": "polygon_wallet",
+            "wallet_error": f"blockchain module unavailable: {exc}",
+        }
+
+    try:
+        wallet_address = blockchain.get_wallet_address()
+    except Exception as exc:
+        log.warning("Failed to derive live wallet address: %s", exc)
+        return {
+            "wallet_connected": False,
+            "wallet_address": None,
+            "available_balance_usd": 0.0,
+            "balance_source": "polygon_wallet",
+            "wallet_error": str(exc),
+        }
+
+    if not wallet_address:
+        return {
+            "wallet_connected": False,
+            "wallet_address": None,
+            "available_balance_usd": 0.0,
+            "balance_source": "polygon_wallet",
+            "wallet_error": "POLYMARKET_PRIVATE_KEY not configured",
+        }
+
+    try:
+        available_balance_usd = float(blockchain.get_usdc_balance(wallet_address) or 0.0)
+        return {
+            "wallet_connected": True,
+            "wallet_address": wallet_address,
+            "available_balance_usd": round(available_balance_usd, 2),
+            "balance_source": "polygon_wallet",
+            "wallet_error": None,
+        }
+    except Exception as exc:
+        log.warning("Failed to fetch Polygon wallet balance for %s: %s", wallet_address, exc)
+        return {
+            "wallet_connected": False,
+            "wallet_address": wallet_address,
+            "available_balance_usd": 0.0,
+            "balance_source": "polygon_wallet",
+            "wallet_error": str(exc),
+        }
+
+
+def get_live_account_overview(
+    refresh_unrealized: bool = False,
+    runtime_scope: str = RUNTIME_SCOPE_PENNY,
+) -> dict:
+    """Return live wallet-backed account reporting for penny runtime."""
+    runtime_scope = normalize_runtime_scope(runtime_scope, default=RUNTIME_SCOPE_PENNY)
+    if runtime_scope != RUNTIME_SCOPE_PENNY:
+        runtime_scope = RUNTIME_SCOPE_PENNY
+
+    if refresh_unrealized:
+        strategy_breakdown = get_strategy_performance(refresh_unrealized=True, runtime_scope=runtime_scope)
+        scoped_account = get_paper_account_state(refresh_unrealized=False, runtime_scope=runtime_scope)
+    else:
+        scoped_account = get_paper_account_state(refresh_unrealized=False, runtime_scope=runtime_scope)
+        strategy_breakdown = get_strategy_performance(refresh_unrealized=False, runtime_scope=runtime_scope)
+
+    wallet_snapshot = _get_live_wallet_snapshot()
+    wallet_balance = float(wallet_snapshot.get("available_balance_usd") or 0.0)
+    open_position_value = float(scoped_account.get("open_position_value") or 0.0)
+    total_equity = wallet_balance + open_position_value
+    deployed_capital = float(scoped_account.get("committed_capital") or 0.0)
+    wallet_exposure_pct = (open_position_value / total_equity * 100) if total_equity > 0 else 0.0
+
+    return {
+        "runtime_scope": runtime_scope,
+        "account_mode": "live_wallet",
+        "balance_source": wallet_snapshot.get("balance_source"),
+        "wallet_connected": bool(wallet_snapshot.get("wallet_connected")),
+        "wallet_address": wallet_snapshot.get("wallet_address"),
+        "wallet_error": wallet_snapshot.get("wallet_error"),
+        "available_balance_usd": round(wallet_balance, 2),
+        "deployed_capital_usd": round(deployed_capital, 2),
+        "open_position_value_usd": round(open_position_value, 2),
+        "realized_pnl_usd": round(float(scoped_account.get("realized_pnl") or 0.0), 2),
+        "realized_gains_usd": round(float(scoped_account.get("realized_gains") or 0.0), 2),
+        "cumulative_losses_usd": round(float(scoped_account.get("cumulative_losses") or 0.0), 2),
+        "unrealized_pnl_usd": round(float(scoped_account.get("unrealized_pnl") or 0.0), 2),
+        "total_equity_usd": round(total_equity, 2),
+        "open_positions": int(scoped_account.get("open_trades") or 0),
+        "wallet_exposure_pct": round(wallet_exposure_pct, 1),
+        "reporting_scope": f"live_wallet_scope::{runtime_scope}",
+        "data_quality": dict(scoped_account.get("data_quality") or {}),
+        "strategy_breakdown": strategy_breakdown,
+        "runtime_scope_detail": (
+            "Penny mode reports the Polygon wallet cash balance plus only penny-scoped open and closed trades."
+        ),
+    }
+
+
+def get_runtime_account_overview(
+    refresh_unrealized: bool = False,
+    runtime_scope: str = RUNTIME_SCOPE_PAPER,
+) -> dict:
+    """Return the account overview matching the requested runtime scope."""
+    runtime_scope = normalize_runtime_scope(runtime_scope)
+    if runtime_scope == RUNTIME_SCOPE_PENNY:
+        return get_live_account_overview(refresh_unrealized=refresh_unrealized, runtime_scope=runtime_scope)
+    overview = get_paper_account_overview(refresh_unrealized=refresh_unrealized, runtime_scope=runtime_scope)
+    overview["account_mode"] = "paper_bankroll"
+    return overview
+
+
 def _sanitize_operator_reason(reason, fallback: str = "Decision recorded.") -> str:
     if reason is None:
         return fallback
@@ -4624,9 +4741,10 @@ def get_stats(runtime_scope: str | None = None):
     conn.close()
 
     win_rate = (wins / closed_trades * 100) if closed_trades > 0 else 0
-    paper_account = get_paper_account_overview(refresh_unrealized=True, runtime_scope=scope or RUNTIME_SCOPE_PAPER)
-    strategy_breakdown = paper_account["strategy_breakdown"]
-    paper_sizing = get_paper_sizing_summary(limit=200)
+    runtime_scope_value = scope or RUNTIME_SCOPE_PAPER
+    runtime_account = get_runtime_account_overview(refresh_unrealized=True, runtime_scope=runtime_scope_value)
+    strategy_breakdown = runtime_account["strategy_breakdown"]
+    paper_sizing = get_paper_sizing_summary(limit=200) if runtime_scope_value == RUNTIME_SCOPE_PAPER else None
 
     # Build cumulative series: each point is the running total after that trade closes
     cumulative = 0.0
@@ -4641,15 +4759,15 @@ def get_stats(runtime_scope: str | None = None):
         "open_trades": open_trades,
         "closed_trades": closed_trades,
         "total_pnl": round(total_pnl, 2),
-        "realized_pnl": paper_account["realized_pnl"],
-        "unrealized_pnl": paper_account["unrealized_pnl"],
+        "realized_pnl": runtime_account.get("realized_pnl", runtime_account.get("realized_pnl_usd", 0.0)),
+        "unrealized_pnl": runtime_account.get("unrealized_pnl", runtime_account.get("unrealized_pnl_usd", 0.0)),
         "wins": wins,
         "losses": losses,
         "win_rate": round(win_rate, 1),
         "total_signals": total_signals,
         "total_scans": total_scans,
         "pnl_series": pnl_series,
-        "paper_account": paper_account,
+        "runtime_account": runtime_account,
         "strategy_breakdown": strategy_breakdown,
         "paper_sizing": paper_sizing,
         "cointegration_trial": get_cointegration_trial_summary(),

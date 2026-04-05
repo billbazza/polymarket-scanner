@@ -248,17 +248,23 @@ class StrategyPerformanceTests(unittest.TestCase):
         body = response.json()
 
         self.assertIn("strategy_breakdown", body)
-        self.assertIn("strategy_breakdown", body["paper_account"])
+        self.assertIn("strategy_breakdown", body["runtime_account"])
         strategies = {row["strategy"]: row for row in body["strategy_breakdown"]["strategies"]}
         self.assertIn("cointegration", strategies)
         self.assertEqual(strategies["cointegration"]["closed_trades"], 1)
-        self.assertEqual(body["paper_account"]["reporting_scope"], "paper_research_only")
+        self.assertEqual(body["runtime_account"]["reporting_scope"], "paper_research_only")
 
         paper_account_response = self.client.get("/api/paper-account")
         self.assertEqual(paper_account_response.status_code, 200)
         paper_account = paper_account_response.json()
         self.assertIn("strategy_breakdown", paper_account)
         self.assertEqual(paper_account["strategy_breakdown"]["strategies"][0]["strategy"], "cointegration")
+
+        runtime_account_response = self.client.get("/api/runtime/account")
+        self.assertEqual(runtime_account_response.status_code, 200)
+        runtime_account = runtime_account_response.json()
+        self.assertEqual(runtime_account["account_mode"], "paper_bankroll")
+        self.assertIn("strategy_breakdown", runtime_account)
 
 
 if __name__ == "__main__":

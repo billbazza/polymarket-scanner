@@ -539,8 +539,8 @@
       <span class="status-dot" id="statusDot"></span>
       <span id="lastScan" style="color: var(--text2); font-size: 12px;">No scans yet</span>
       <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">
-        <span id="runtimeScopeBadge" class="pill" style="background:rgba(14,165,233,0.18);color:var(--sky);border:1px solid rgba(14,165,233,0.35)">Paper View</span>
-        <button class="btn sm" id="runtimeScopePaperBtn" onclick="setRuntimeScope('paper')">Paper</button>
+        <span id="runtimeScopeBadge" class="pill" style="background:rgba(14,165,233,0.18);color:var(--sky);border:1px solid rgba(14,165,233,0.35)">Research View</span>
+        <button class="btn sm" id="runtimeScopePaperBtn" onclick="setRuntimeScope('paper')">Research</button>
         <button class="btn sm" id="runtimeScopePennyBtn" onclick="setRuntimeScope('penny')">Penny</button>
       </div>
       <button class="btn" id="autoTradeBtn" onclick="runAutoTrade()" style="background:var(--green);color:#000;font-weight:600;">Auto Trade</button>
@@ -566,9 +566,9 @@
   <div class="hero-panel">
     <div class="hero-head">
       <div class="hero-title">
-        <div class="hero-kicker" id="accountKicker">Paper Account</div>
+        <div class="hero-kicker" id="accountKicker">Research Account</div>
         <h2 id="accountHeading">Fixed bankroll accounting with cash, commitments, and equity separated cleanly.</h2>
-        <p id="accountSummaryText">Paper trading starts from a fixed bankroll and moves funds from cash into committed capital when a trade opens.</p>
+        <p id="accountSummaryText">Research trading starts from a fixed bankroll and moves funds from cash into committed capital when a trade opens.</p>
       </div>
       <div class="hero-equity">
         <div class="label" id="equityLabel">Total Equity</div>
@@ -579,9 +579,9 @@
 
     <div class="account-grid">
       <div class="account-card accent-cash">
-        <div class="label">Available Cash</div>
+        <div class="label" id="statCashLabel">Available Cash</div>
         <div class="value" id="statAvailableCash">$0.00</div>
-        <div class="meta" id="statCashMeta">Ready for new paper trades.</div>
+        <div class="meta" id="statCashMeta">Ready for new research trades.</div>
         <div id="paperSizingControls" style="display:grid;grid-template-columns:1fr;gap:8px;margin-top:10px">
           <label style="display:grid;gap:4px">
             <span style="font-size:11px;color:var(--text2)">Adaptive Min Size</span>
@@ -602,7 +602,7 @@
         </div>
       </div>
       <div class="account-card accent-commit">
-        <div class="label">Committed Capital</div>
+        <div class="label" id="statCommittedLabel">Committed Capital</div>
         <div class="value amber" id="statCommitted">$0.00</div>
         <div class="meta" id="statCommittedMeta">Open positions currently using bankroll.</div>
       </div>
@@ -617,19 +617,19 @@
         <div class="meta" id="statUnrealizedMeta">Mark-to-market on open trades.</div>
       </div>
       <div class="account-card">
-        <div class="label">Cumulative Losses</div>
+        <div class="label" id="statLossesLabel">Cumulative Losses</div>
         <div class="value red" id="statLossesUsd">$0.00</div>
         <div class="meta">Gross losses from losing closed trades, shown separately from net P&amp;L.</div>
       </div>
       <div class="account-card">
-        <div class="label">Bankroll In Use</div>
+        <div class="label" id="statUtilizationLabel">Bankroll In Use</div>
         <div class="value sky" id="statUtilization" style="color:var(--sky);">0%</div>
         <div class="meta" id="statUtilizationMeta">0 open positions.</div>
       </div>
     </div>
 
     <div class="account-explainer" id="accountExplainer">
-      <strong>Accounting rule:</strong> opening a paper trade immediately deducts its size from available cash and classifies it as committed capital until the trade closes.
+      <strong>Accounting rule:</strong> opening a research trade immediately deducts its size from available cash and classifies it as committed capital until the trade closes.
     </div>
 
     <div class="runtime-scope-panel">
@@ -670,7 +670,7 @@
         <table>
           <thead>
             <tr>
-              <th>Strategy</th><th>Realized</th><th>Open MTM</th><th>Net</th><th>Trades / State</th><th>Paper Capital In Use</th><th>Coverage</th>
+              <th>Strategy</th><th>Realized</th><th>Open MTM</th><th>Net</th><th>Trades / State</th><th id="strategyCapitalHeader">Research Capital In Use</th><th>Coverage</th>
             </tr>
           </thead>
           <tbody id="strategyBreakdownBody">
@@ -725,7 +725,7 @@
     <div class="tab"        data-tab="weather"  onclick="switchTab('weather')">Weather <span class="badge-count" id="cntWeather">0</span></div>
     <div class="tab"        data-tab="whales"   onclick="switchTab('whales')">Whales <span class="badge-count" id="cntWhales" style="background:rgba(239,68,68,0.2);color:var(--red)">0</span></div>
     <div class="tab"        data-tab="copy"     onclick="switchTab('copy')">Copy Trader <span class="badge-count" id="cntCopy">0</span></div>
-    <div class="tab"        data-tab="paper-attempts" onclick="switchTab('paper-attempts')">Paper Gate <span class="badge-count" id="cntPaperAttempts">0</span></div>
+    <div class="tab" id="paperAttemptsTab" data-tab="paper-attempts" onclick="switchTab('paper-attempts')"><span id="paperAttemptsTabLabel">Research Gate</span> <span class="badge-count" id="cntPaperAttempts">0</span></div>
     <div class="tab"        data-tab="trades"   onclick="switchTab('trades')">Open Trades</div>
     <div class="tab"        data-tab="history"  onclick="switchTab('history')">Trade History</div>
     <div class="tab"        data-tab="scans"    onclick="switchTab('scans')">Scan Log</div>
@@ -1078,7 +1078,7 @@ function runtimeScopedUrl(path, params = {}, runtimeScope = ACTIVE_RUNTIME_SCOPE
 
 function updateRuntimeScopeUi() {
   const isPaper = ACTIVE_RUNTIME_SCOPE === 'paper';
-  if (getEl('runtimeScopeBadge')) getEl('runtimeScopeBadge').textContent = isPaper ? 'Paper View' : 'Penny View';
+  if (getEl('runtimeScopeBadge')) getEl('runtimeScopeBadge').textContent = isPaper ? 'Research View' : 'Penny Live View';
   if (getEl('runtimeScopePaperBtn')) {
     getEl('runtimeScopePaperBtn').style.background = isPaper ? 'var(--blue)' : '';
     getEl('runtimeScopePaperBtn').style.color = isPaper ? '#fff' : '';
@@ -1087,13 +1087,23 @@ function updateRuntimeScopeUi() {
     getEl('runtimeScopePennyBtn').style.background = !isPaper ? 'var(--amber)' : '';
     getEl('runtimeScopePennyBtn').style.color = !isPaper ? '#111827' : '';
   }
-  if (getEl('accountKicker')) getEl('accountKicker').textContent = isPaper ? 'Paper Account' : 'Penny Runtime';
+  if (getEl('accountKicker')) getEl('accountKicker').textContent = isPaper ? 'Research Account' : 'Penny Runtime';
   if (getEl('accountHeading')) getEl('accountHeading').textContent = isPaper
     ? 'Fixed bankroll accounting with cash, commitments, and equity separated cleanly.'
-    : 'Live penny trading is isolated from paper experiments, with its own runtime state and open-trade limits.';
-  if (getEl('equityLabel')) getEl('equityLabel').textContent = isPaper ? 'Total Equity' : 'Scoped Equity';
+    : 'Live penny trading is isolated from research experiments, with wallet-backed balances and its own runtime limits.';
+  if (getEl('equityLabel')) getEl('equityLabel').textContent = isPaper ? 'Total Equity' : 'Wallet + Open Positions';
+  if (getEl('statCashLabel')) getEl('statCashLabel').textContent = isPaper ? 'Available Cash' : 'Wallet Balance';
+  if (getEl('statCommittedLabel')) getEl('statCommittedLabel').textContent = isPaper ? 'Committed Capital' : 'Open Position Cost';
+  if (getEl('statLossesLabel')) getEl('statLossesLabel').textContent = isPaper ? 'Cumulative Losses' : 'Closed Losses';
+  if (getEl('statUtilizationLabel')) getEl('statUtilizationLabel').textContent = isPaper ? 'Bankroll In Use' : 'Wallet Exposure';
+  if (getEl('strategyCapitalHeader')) getEl('strategyCapitalHeader').textContent = isPaper ? 'Research Capital In Use' : 'Live Capital Deployed';
+  if (getEl('paperAttemptsTabLabel')) getEl('paperAttemptsTabLabel').textContent = isPaper ? 'Research Gate' : 'Runtime Gate';
   if (getEl('paperSizingControls')) getEl('paperSizingControls').style.display = isPaper ? 'grid' : 'none';
-  if (getEl('autoTradeBtn')) getEl('autoTradeBtn').textContent = isPaper ? 'Run Paper' : 'Run Penny';
+  if (getEl('autoTradeBtn')) getEl('autoTradeBtn').textContent = isPaper ? 'Run Research' : 'Run Penny';
+  if (getEl('paperAttemptsTab')) getEl('paperAttemptsTab').style.display = isPaper ? '' : 'none';
+  if (!isPaper && document.querySelector('.tab.active')?.dataset?.tab === 'paper-attempts') {
+    switchTab('trades');
+  }
 }
 
 function setRuntimeScope(scope) {
@@ -1358,16 +1368,18 @@ async function loadStats() {
   const scope = ACTIVE_RUNTIME_SCOPE;
   const requestId = ++SCOPE_REQUEST_SEQ.stats;
   try {
-    const [statsR, sizingR, runtimeR] = await Promise.all([
+    const requests = [
       fetch(API + runtimeScopedUrl('/api/stats', {}, scope)),
-      fetch(API + '/api/paper-sizing?limit=20'),
+      fetch(API + runtimeScopedUrl('/api/runtime/account', {}, scope)),
       fetch(API + runtimeScopedUrl('/api/autonomy/runtime', {}, scope)),
-    ]);
+    ];
+    if (scope === 'paper') requests.push(fetch(API + '/api/paper-sizing?limit=20'));
+    const [statsR, accountR, runtimeR, sizingR] = await Promise.all(requests);
     const s = await statsR.json();
-    const sizingData = await sizingR.json();
+    const account = await accountR.json();
     const runtimeData = await runtimeR.json();
+    const sizingData = sizingR ? await sizingR.json() : null;
     if (requestId !== SCOPE_REQUEST_SEQ.stats || scope !== ACTIVE_RUNTIME_SCOPE) return;
-    const account = s.paper_account || {};
     const isPaper = (s.runtime_scope || ACTIVE_RUNTIME_SCOPE) === 'paper';
     const strategyBreakdown = (s.strategy_breakdown || account.strategy_breakdown || {});
     const setSignedValue = (id, value) => {
@@ -1376,46 +1388,61 @@ async function loadStats() {
       el.className = 'value ' + (value >= 0 ? 'green' : 'red');
     };
     const formatSignedCell = value => `<span style="color:${value >= 0 ? 'var(--green)' : 'var(--red)'}">${fmtUsd(value)}</span>`;
+    const availableBalance = isPaper ? (account.available_cash || 0) : (account.available_balance_usd || 0);
+    const deployedCapital = isPaper ? (account.committed_capital || 0) : (account.deployed_capital_usd || 0);
+    const totalEquity = isPaper ? (account.total_equity || 0) : (account.total_equity_usd || 0);
+    const realizedPnl = isPaper ? (account.realized_pnl || 0) : (account.realized_pnl_usd || 0);
+    const unrealizedPnl = isPaper ? (account.unrealized_pnl || 0) : (account.unrealized_pnl_usd || 0);
+    const cumulativeLosses = isPaper ? (account.cumulative_losses || 0) : (account.cumulative_losses_usd || 0);
+    const openTrades = isPaper ? (account.open_trades || 0) : (account.open_positions || 0);
 
-    document.getElementById('statEquity').textContent = fmtUsd(account.total_equity);
+    document.getElementById('statEquity').textContent = fmtUsd(totalEquity);
     document.getElementById('statStartingBankroll').textContent = isPaper
       ? `Starting bankroll ${fmtUsd(account.starting_bankroll)}`
-      : `Scoped runtime ${String(s.runtime_scope || ACTIVE_RUNTIME_SCOPE).toUpperCase()}`;
-    document.getElementById('statAvailableCash').textContent = fmtUsd(account.available_cash);
+      : (account.wallet_connected
+          ? `Polygon wallet ${String(account.wallet_address || '').slice(0, 8)}...${String(account.wallet_address || '').slice(-4)}`
+          : `Penny runtime ${String(s.runtime_scope || ACTIVE_RUNTIME_SCOPE).toUpperCase()}`);
+    document.getElementById('statAvailableCash').textContent = fmtUsd(availableBalance);
     const drawdownPct = account.starting_bankroll > 0
-      ? Math.max(0, ((account.starting_bankroll - account.total_equity) / account.starting_bankroll) * 100)
+      ? Math.max(0, ((account.starting_bankroll - totalEquity) / account.starting_bankroll) * 100)
       : 0;
     const maxDrawdownPct = sizingData?.settings?.constraints?.max_drawdown_pct ?? 15;
     document.getElementById('statCashMeta').textContent = isPaper
-      ? `${fmtUsd(account.available_cash)} free to deploy now. Drawdown ${drawdownPct.toFixed(1)}% / cap ${Number(maxDrawdownPct).toFixed(0)}%.`
-      : `${fmtUsd(account.available_cash)} available in the penny runtime. Paper experiments no longer consume these slots or balances.`;
-    document.getElementById('statCommitted').textContent = fmtUsd(account.committed_capital);
-    document.getElementById('statCommittedMeta').textContent = `${fmtUsd(account.committed_capital)} tied up across ${account.open_trades || 0} open ${isPaper ? 'paper' : 'penny'} trade${(account.open_trades || 0) === 1 ? '' : 's'}.`;
-    setSignedValue('statRealized', account.realized_pnl || 0);
-    document.getElementById('statRealizedMeta').textContent = `Closed-trade net: gains ${fmtUsd(account.realized_gains || 0)} vs losses ${fmtUsd(account.cumulative_losses || 0)}.`;
-    setSignedValue('statUnrealized', account.unrealized_pnl || 0);
+      ? `${fmtUsd(availableBalance)} free to deploy now. Drawdown ${drawdownPct.toFixed(1)}% / cap ${Number(maxDrawdownPct).toFixed(0)}%.`
+      : (account.wallet_error
+          ? `Wallet balance unavailable: ${account.wallet_error}.`
+          : `${fmtUsd(availableBalance)} currently available in the Polygon wallet for penny trading.`);
+    document.getElementById('statCommitted').textContent = fmtUsd(deployedCapital);
+    document.getElementById('statCommittedMeta').textContent = isPaper
+      ? `${fmtUsd(deployedCapital)} tied up across ${openTrades} open research trade${openTrades === 1 ? '' : 's'}.`
+      : `${fmtUsd(deployedCapital)} deployed across ${openTrades} open penny position${openTrades === 1 ? '' : 's'}.`;
+    setSignedValue('statRealized', realizedPnl);
+    document.getElementById('statRealizedMeta').textContent = isPaper
+      ? `Closed-trade net: gains ${fmtUsd(account.realized_gains || 0)} vs losses ${fmtUsd(cumulativeLosses)}.`
+      : `Closed penny positions: gains ${fmtUsd(account.realized_gains_usd || 0)} vs losses ${fmtUsd(cumulativeLosses)}.`;
+    setSignedValue('statUnrealized', unrealizedPnl);
     document.getElementById('statUnrealizedMeta').textContent = `Current mark-to-market on open trades.`;
-    document.getElementById('statLossesUsd').textContent = fmtUsd(account.cumulative_losses);
-    document.getElementById('statUtilization').textContent = (account.bankroll_used_pct || 0).toFixed(1) + '%';
+    document.getElementById('statLossesUsd').textContent = fmtUsd(cumulativeLosses);
+    document.getElementById('statUtilization').textContent = ((isPaper ? (account.bankroll_used_pct || 0) : (account.wallet_exposure_pct || 0))).toFixed(1) + '%';
     document.getElementById('statUtilizationMeta').textContent = isPaper
-      ? `${fmtUsd(account.committed_capital || 0)} of ${fmtUsd(account.starting_bankroll || 0)} paper bankroll currently committed.` +
+      ? `${fmtUsd(deployedCapital)} of ${fmtUsd(account.starting_bankroll || 0)} research bankroll currently committed.` +
         ((account.excluded_open_trades || 0)
           ? ` ${account.excluded_open_trades} wallet/live trade${(account.excluded_open_trades || 0) === 1 ? '' : 's'} excluded from utilization.`
           : '')
-      : `${account.open_trades || 0} penny trade${(account.open_trades || 0) === 1 ? '' : 's'} currently consume the live runtime's scoped capital.`;
+      : `${openTrades} open penny position${openTrades === 1 ? '' : 's'} currently represent ${(account.wallet_exposure_pct || 0).toFixed(1)}% of live wallet equity.`;
     document.getElementById('accountSummaryText').textContent = isPaper
-      ? `Equity ${fmtUsd(account.total_equity)} = cash ${fmtUsd(account.available_cash)} + marked open positions ${fmtUsd(account.open_position_value)}.`
-      : `Penny scope tracks only its own open and closed trades, so paper research no longer blocks penny max-open checks.`;
+      ? `Equity ${fmtUsd(totalEquity)} = cash ${fmtUsd(availableBalance)} + marked open positions ${fmtUsd(account.open_position_value)}.`
+      : `Penny scope reads the Polygon wallet balance plus only penny-scoped open and closed positions.`;
     document.getElementById('accountExplainer').innerHTML = isPaper
-      ? `<strong>Accounting rule:</strong> ${esc(account.cash_after_open_explanation || 'Opening a paper trade deducts its size from available cash immediately.')} ` +
-        `${esc(account.position_policy_detail || 'Paper trading is uncapped by position count and limited by available cash.')} ` +
-        `Available cash is computed as starting bankroll ${fmtUsd(account.starting_bankroll)} + realized P&amp;L ${fmtUsd(account.realized_pnl)} - committed capital ${fmtUsd(account.committed_capital)}. ` +
-        `Marked open-position value is committed capital ${fmtUsd(account.committed_capital)} + unrealized P&amp;L ${fmtUsd(account.unrealized_pnl)}. ` +
+      ? `<strong>Accounting rule:</strong> ${esc(account.cash_after_open_explanation || 'Opening a research trade deducts its size from available cash immediately.')} ` +
+        `${esc(account.position_policy_detail || 'Research trading is uncapped by position count and limited by available cash.')} ` +
+        `Available cash is computed as starting bankroll ${fmtUsd(account.starting_bankroll)} + realized P&amp;L ${fmtUsd(realizedPnl)} - committed capital ${fmtUsd(deployedCapital)}. ` +
+        `Marked open-position value is committed capital ${fmtUsd(deployedCapital)} + unrealized P&amp;L ${fmtUsd(unrealizedPnl)}. ` +
         ((account.excluded_open_trades || 0)
           ? `Wallet-attached/live trades are tracked separately and do not consume this paper bankroll view.`
           : '')
-      : `<strong>Runtime rule:</strong> Penny mode reads only penny-scoped trades and status. Open paper experiments remain visible in the paper view and do not consume penny max-open slots.`;
-    renderPaperSizingControls(sizingData?.settings || {});
+      : `<strong>Runtime rule:</strong> Penny mode reads the live Polygon wallet balance and only penny-scoped positions. Research experiments remain isolated in the research view and do not consume penny max-open slots or wallet metrics.`;
+    if (isPaper) renderPaperSizingControls(sizingData?.settings || {});
 
     document.getElementById('statWinRate').textContent = s.win_rate + '%';
     document.getElementById('statOpen').textContent = s.open_trades;
@@ -1436,15 +1463,19 @@ async function loadStats() {
       const dq = strategyBreakdown.data_quality || {};
       meta.textContent =
         `Top net contributor: ${topNet?.label || '—'} ${fmtUsd(topNet?.net_pnl || 0)}. ` +
-        `Most paper capital in use: ${topUtil?.label || '—'} ${fmtUsd(topUtil?.committed_capital || 0)}.` +
-        (dq.has_gaps
+        `${isPaper ? 'Most research capital in use' : 'Most live capital deployed'}: ${topUtil?.label || '—'} ${fmtUsd(topUtil?.committed_capital || 0)}.` +
+        (isPaper && dq.has_gaps
           ? ` ${dq.external_open_trades_excluded_from_paper_utilization || 0} external open trade(s) excluded from paper utilization; ${dq.open_trades_missing_marks || 0} open trade(s) missing marks.`
           : '');
       body.innerHTML = strategies.map(row => {
         const tradeLabel = `${row.trade_count || 0} total`;
         const tradeSub = `${row.open_trades || 0} open / ${row.closed_trades || 0} closed`;
-        const stateSub = `${row.paper_open_trades || 0} paper open · ${row.external_open_trades || 0} external open`;
-        const capitalSub = `${(row.bankroll_utilization_pct || 0).toFixed(1)}% of paper bankroll`;
+        const stateSub = isPaper
+          ? `${row.paper_open_trades || 0} research open · ${row.external_open_trades || 0} external open`
+          : `${row.open_trades || 0} penny open · ${row.live_open_trades || 0} exchange-tracked`;
+        const capitalSub = isPaper
+          ? `${(row.bankroll_utilization_pct || 0).toFixed(1)}% of research bankroll`
+          : `${fmtUsd(row.committed_capital || 0)} in live exposure`;
         const coverage = row.data_quality_status === 'ok'
           ? 'Clean'
           : `${row.open_trades_missing_marks || 0} missing mark${(row.open_trades_missing_marks || 0) === 1 ? '' : 's'}${row.trade_state_inferred_trades ? ` · ${row.trade_state_inferred_trades} inferred state` : ''}`;
@@ -1485,11 +1516,11 @@ function renderRuntimeScopePanel(runtimeData, statsData, account) {
         ? `Last ${scope} cycle failed: ${lastResult.error}`
         : `No ${scope} autonomy cycle result recorded in this server process yet.`;
   const maxOpenMeta = isPaper
-    ? 'Paper mode stays cash-limited and intentionally has no hard max-open cap.'
-    : `${account?.open_trades || 0} open penny trade${(account?.open_trades || 0) === 1 ? '' : 's'} currently count against this scoped limit.`;
+    ? 'Research mode stays cash-limited and intentionally has no hard max-open cap.'
+    : `${account?.open_positions || 0} open penny position${(account?.open_positions || 0) === 1 ? '' : 's'} currently count against this scoped limit.`;
   getEl('runtimeScopeMeta').textContent = isPaper
-    ? 'Paper and penny read different state files, trade totals, and autonomy lanes.'
-    : 'Penny view is driven only by penny-scoped state, balances, and open-trade limits.';
+    ? 'Research and penny read different state files, trade totals, and autonomy lanes.'
+    : 'Penny view is driven only by live wallet balances, penny-scoped trades, and open-position limits.';
   getEl('runtimeLevelValue').textContent = levelName;
   getEl('runtimeLevelMeta').textContent = `Level key ${String(state.level || scope).toUpperCase()} · scope ${String(scope).toUpperCase()}`;
   getEl('runtimeMaxOpenValue').textContent = runtimeData?.max_open_label || '—';
