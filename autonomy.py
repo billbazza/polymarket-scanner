@@ -188,7 +188,8 @@ def paper_only_runtime(runtime_scope: str | None) -> bool:
 def weather_phase_policy(runtime_scope: str | None, runtime_controls: dict | None = None) -> dict:
     scope = normalize_runtime_scope(runtime_scope)
     controls = runtime_controls or db.get_autonomy_runtime_settings(scope)
-    weather_auto_trade_enabled = bool(controls.get("weather_auto_trade_enabled", scope == RUNTIME_SCOPE_PAPER))
+    # Weather now follows the runtime's primary auto-trade switch in every scope.
+    weather_auto_trade_enabled = bool(controls.get("auto_trade_enabled", scope == RUNTIME_SCOPE_PAPER))
     if scope == RUNTIME_SCOPE_PAPER:
         return {
             "scan_enabled": True,
@@ -1165,8 +1166,8 @@ def run_cycle(state):
             else:
                 candidates = []
                 weather_phase["trade_execution_status"] = "scan_only"
-                weather_phase["reason_code"] = "weather_auto_trade_disabled"
-                weather_phase["reason"] = f"Weather scanning completed for scope={runtime_scope}; live weather auto-trading is disabled by runtime control."
+                weather_phase["reason_code"] = "runtime_auto_trade_disabled"
+                weather_phase["reason"] = f"Weather scanning completed for scope={runtime_scope}; the primary runtime auto-trade control is disabled."
                 journal({
                     "action": "weather_scan_only",
                     "level": level,
@@ -1298,7 +1299,11 @@ def run_cycle(state):
                             token_id=decision.get("entry_token"),
                             size_usd=trade_size,
                             phase=current_stage,
-                            details={"paper_sizing": sizing_decision, "execution_mode": weather_phase["execution_mode"]},
+                            details={
+                                "paper_sizing": sizing_decision,
+                                "execution_mode": weather_phase["execution_mode"],
+                                "execution_result": result,
+                            },
                         )
                 except Exception as e:
                     log.warning("Weather trade open failed: %s", e)

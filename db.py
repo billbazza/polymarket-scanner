@@ -5129,7 +5129,10 @@ def get_autonomy_runtime_settings(runtime_scope: str | None = None) -> dict:
     settings = {**defaults, **raw}
     settings["runtime_scope"] = scope
     settings["auto_trade_enabled"] = bool(settings.get("auto_trade_enabled"))
-    settings["weather_auto_trade_enabled"] = bool(settings.get("weather_auto_trade_enabled"))
+    # Preserve the legacy field for API compatibility, but keep it in parity
+    # with the runtime-wide auto-trade switch so weather cannot be disabled
+    # independently in penny mode.
+    settings["weather_auto_trade_enabled"] = settings["auto_trade_enabled"]
     settings["max_open_override"] = _normalize_optional_cap(settings.get("max_open_override"))
     size_override = settings.get("size_usd_override")
     try:
@@ -5149,7 +5152,7 @@ def set_autonomy_runtime_settings(runtime_scope: str | None = None, updates: dic
     merged = {**current, **(updates or {})}
     merged["runtime_scope"] = scope
     merged["auto_trade_enabled"] = bool(merged.get("auto_trade_enabled"))
-    merged["weather_auto_trade_enabled"] = bool(merged.get("weather_auto_trade_enabled"))
+    merged["weather_auto_trade_enabled"] = merged["auto_trade_enabled"]
     merged["max_open_override"] = _normalize_optional_cap(merged.get("max_open_override"))
     size_override = merged.get("size_usd_override")
     try:

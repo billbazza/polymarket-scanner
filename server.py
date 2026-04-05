@@ -141,7 +141,7 @@ def _log_runtime_settings_change(
     requested_updates: dict,
 ) -> dict:
     changed_fields = {}
-    for key in ("auto_trade_enabled", "weather_auto_trade_enabled", "max_open_override", "size_usd_override"):
+    for key in ("auto_trade_enabled", "max_open_override", "size_usd_override"):
         if before.get(key) != after.get(key):
             changed_fields[key] = {
                 "old": before.get(key),
@@ -1900,6 +1900,8 @@ async def update_autonomy_settings(
     if auto_trade_enabled is not None:
         updates["auto_trade_enabled"] = bool(auto_trade_enabled)
     if weather_auto_trade_enabled is not None:
+        # Backward-compatible no-op: weather now follows the primary runtime
+        # auto-trade control and cannot diverge into scan-only in penny mode.
         updates["weather_auto_trade_enabled"] = bool(weather_auto_trade_enabled)
     if max_open_override is not None:
         updates["max_open_override"] = int(max_open_override) if int(max_open_override) > 0 else None
