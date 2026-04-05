@@ -587,6 +587,7 @@ class RuntimeScopeSplitTests(unittest.TestCase):
         self.assertEqual(weather_phase.get("result_counts", {}).get("tradeable"), 1)
         self.assertEqual(weather_phase.get("result_counts", {}).get("saved"), 1)
         self.assertEqual(weather_phase.get("result_counts", {}).get("traded"), 1)
+        self.assertEqual(weather_phase.get("result_counts", {}).get("live_vetoed"), 0)
 
     def test_autonomy_background_status_includes_weather_phase_summary(self):
         import autonomy
@@ -916,8 +917,7 @@ class RuntimeScopeSplitTests(unittest.TestCase):
         self.assertEqual(payload["audit_entry"]["runtime_scope"], "penny")
         self.assertEqual(payload["audit_entry"]["changed_fields"]["max_open_override"]["old"], None)
         self.assertEqual(payload["audit_entry"]["changed_fields"]["max_open_override"]["new"], 5)
-        self.assertEqual(payload["audit_entry"]["changed_fields"]["auto_trade_enabled"]["old"], False)
-        self.assertEqual(payload["audit_entry"]["changed_fields"]["auto_trade_enabled"]["new"], True)
+        self.assertNotIn("auto_trade_enabled", payload["audit_entry"]["changed_fields"])
         self.assertNotIn("weather_auto_trade_enabled", payload["audit_entry"]["changed_fields"])
         self.assertEqual(captured[0]["runtime_scope"], "penny")
         self.assertEqual(captured[0]["runtime_label"], "autonomy:penny")
@@ -1000,12 +1000,47 @@ class RuntimeScopeSplitTests(unittest.TestCase):
         self.assertIn("runtimeData?.slot_limit_state || {}", html)
         self.assertIn("Slot Limit State", html)
         self.assertIn("const strategySummary = ['cointegration', 'weather']", html)
+        self.assertIn("weather.live_safeguard_reason_counts", html)
+        self.assertIn("Live safeguard vetoes", html)
         self.assertIn("acceptance && acceptance.all_passed === false", html)
         self.assertIn("Weather phase: skipped", html)
         self.assertIn("cycle started in background", html)
         self.assertIn("Penny Max Open Trades", html)
         self.assertIn("Changes save immediately to the live penny scope and are appended to the audit journal.", html)
         self.assertIn("const auditAction = data?.audit_entry?.action === 'runtime_controls_update_noop'", html)
+
+    def test_penny_runtime_slot_limit_state_surfaces_weather_live_vetoes(self):
+        self.server._autonomy_status["penny"]["last_result"] = {
+            "ok": True,
+            "weather_phase": {
+                "status": "completed",
+                "trade_execution_status": "live_safeguard_vetoed",
+                "reason_code": "live_safeguard_vetoed",
+                "reason": "Weather live safeguards vetoed 2 trade attempt(s): slippage_block x1, balance_check_failed x1.",
+                "live_safeguard_veto_count": 2,
+                "live_safeguard_reason_counts": [
+                    {"reason_code": "balance_check_failed", "count": 1},
+                    {"reason_code": "slippage_block", "count": 1},
+                ],
+                "result_counts": {
+                    "tradeable": 2,
+                    "traded": 0,
+                    "live_vetoed": 2,
+                },
+            },
+        }
+
+        response = self.client.get(
+            "/api/autonomy/runtime?runtime_scope=penny",
+            headers={"X-API-Key": "test-admin-key"},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["slot_limit_state"]["status"], "attention")
+        self.assertEqual(payload["slot_limit_state"]["strategies"]["weather"]["status"], "blocked")
+        self.assertEqual(payload["slot_limit_state"]["strategies"]["weather"]["reason_code"], "live_safeguard_vetoed")
+        self.assertIn("slippage_block x1", payload["slot_limit_state"]["strategies"]["weather"]["reason"])
 
     def test_penny_runtime_slot_limit_state_marks_full_budget_as_blocked(self):
         signal_id = self.db.save_signal(_signal())

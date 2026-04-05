@@ -1625,8 +1625,15 @@ function formatWeatherPhaseStatus(lastResult, scope) {
   const opportunities = Number(counts.opportunities || 0);
   const tradeable = Number(counts.tradeable || 0);
   const traded = Number(counts.traded || 0);
+  const liveVetoed = Number(counts.live_vetoed || weather.live_safeguard_veto_count || 0);
+  const vetoSummary = (weather.live_safeguard_reason_counts || [])
+    .map((item) => `${item.reason_code} x${item.count}`)
+    .join(', ');
   if (weather.status === 'completed') {
-    return `Weather phase: completed in ${duration}s with ${opportunities} opportunities, ${tradeable} tradeable, ${traded} traded.`;
+    return `Weather phase: completed in ${duration}s with ${opportunities} opportunities, ${tradeable} tradeable, ${traded} traded.` +
+      (liveVetoed > 0
+        ? ` Live safeguard vetoes: ${liveVetoed}${vetoSummary ? ` (${vetoSummary})` : ''}.`
+        : '');
   }
   if (weather.status === 'skipped') {
     return `Weather phase: skipped in ${duration}s. ${weather.reason || 'Disabled for this runtime scope.'}`;

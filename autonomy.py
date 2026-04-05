@@ -189,7 +189,9 @@ def weather_phase_policy(runtime_scope: str | None, runtime_controls: dict | Non
     scope = normalize_runtime_scope(runtime_scope)
     controls = runtime_controls or db.get_autonomy_runtime_settings(scope)
     # Weather now follows the runtime's primary auto-trade switch in every scope.
-    weather_auto_trade_enabled = bool(controls.get("auto_trade_enabled", scope == RUNTIME_SCOPE_PAPER))
+    # Trading runtimes default to parity-on unless the operator explicitly
+    # disables the scoped runtime control.
+    weather_auto_trade_enabled = bool(controls.get("auto_trade_enabled", True))
     if scope == RUNTIME_SCOPE_PAPER:
         return {
             "scan_enabled": True,
@@ -1217,8 +1219,11 @@ def run_cycle(state):
                 "tradeable": 0,
                 "saved": 0,
                 "traded": 0,
+                "live_vetoed": 0,
                 "exact_temp_opportunities": 0,
             },
+            "live_safeguard_vetoes": [],
+            "live_safeguard_reason_counts": [],
         }
         weather_phase["slot_usage_at_start"] = weather_slot_usage
         cycle_summary["phases"].append(weather_phase)
@@ -1421,6 +1426,29 @@ def run_cycle(state):
                             "runtime_scope": runtime_scope,
                         })
                     else:
+                        if weather_policy["trade_mode"] == "live":
+                            veto_entry = {
+                                "weather_signal_id": w_id,
+                                "event": w_opp.get("event", w_opp.get("market", "")),
+                                "reason_code": result.get("reason_code", "trade_open_failed"),
+                                "reason": result.get("error", "Weather trade open failed."),
+                            }
+                            veto_counts = {
+                                item["reason_code"]: int(item["count"])
+                                for item in weather_phase.get("live_safeguard_reason_counts") or []
+                                if item.get("reason_code")
+                            }
+                            veto_counts[veto_entry["reason_code"]] = veto_counts.get(veto_entry["reason_code"], 0) + 1
+                            weather_phase["live_safeguard_vetoes"] = (
+                                (weather_phase.get("live_safeguard_vetoes") or []) + [veto_entry]
+                            )[:10]
+                            weather_phase["live_safeguard_reason_counts"] = [
+                                {"reason_code": code, "count": count}
+                                for code, count in sorted(veto_counts.items(), key=lambda item: (-item[1], item[0]))
+                            ]
+                            weather_phase["result_counts"]["live_vetoed"] = int(
+                                weather_phase["result_counts"].get("live_vetoed") or 0
+                            ) + 1
                         record_attempt(
                             level,
                             "weather",
@@ -1451,6 +1479,31 @@ def run_cycle(state):
                     )
             weather_phase["status"] = "completed"
             weather_phase["duration_secs"] = round(time.time() - weather_phase_started, 1)
+            live_vetoed = int(weather_phase["result_counts"].get("live_vetoed") or 0)
+            if live_vetoed:
+                veto_reason_counts = weather_phase.get("live_safeguard_reason_counts") or []
+                veto_summary = ", ".join(
+                    f"{item.get('reason_code')} x{item.get('count')}"
+                    for item in veto_reason_counts
+                    if item.get("reason_code")
+                ) or f"{live_vetoed} vetoes"
+                weather_phase["live_safeguard_veto_count"] = live_vetoed
+                weather_phase["reason_code"] = weather_phase.get("reason_code") or "live_safeguard_vetoed"
+                if weather_phase.get("trade_execution_status") not in {"slots_full", "limited_by_slots"}:
+                    weather_phase["trade_execution_status"] = (
+                        "enabled_with_live_vetoes"
+                        if weather_traded
+                        else "live_safeguard_vetoed"
+                    )
+                    weather_phase["reason"] = (
+                        f"Weather live safeguards vetoed {live_vetoed} trade attempt(s): {veto_summary}."
+                    )
+                log.warning(
+                    "Step 4b: Weather live safeguards vetoed %d trade attempt(s) for scope=%s (%s)",
+                    live_vetoed,
+                    runtime_scope,
+                    veto_summary,
+                )
             weather_phase["slot_usage_at_end"] = db.get_runtime_slot_usage(
                 runtime_scope=runtime_scope,
                 max_open=max_open,

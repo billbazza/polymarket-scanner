@@ -5190,8 +5190,10 @@ def get_autonomy_runtime_settings(runtime_scope: str | None = None) -> dict:
     scope = normalize_runtime_scope(runtime_scope)
     defaults = {
         "runtime_scope": scope,
-        "auto_trade_enabled": scope == RUNTIME_SCOPE_PAPER,
-        "weather_auto_trade_enabled": scope == RUNTIME_SCOPE_PAPER,
+        # Parity-first default: trading runtimes should auto-trade unless the
+        # operator explicitly disables the scoped runtime control.
+        "auto_trade_enabled": True,
+        "weather_auto_trade_enabled": True,
         "max_open_override": None,
         "size_usd_override": None,
     }
