@@ -5,6 +5,7 @@ when web3 is not installed or keys are not configured.
 """
 import json
 import logging
+import time
 import requests
 
 import runtime_config
@@ -39,6 +40,8 @@ ERC20_ABI = [
         "type": "function",
     },
 ]
+
+LIVE_LEDGER_MAX_BLOCK_AGE_SECONDS = 180
 
 
 def _get_rpc_url():
@@ -131,6 +134,120 @@ def get_latest_block_metadata():
         "base_fee_per_gas": _hex_to_int(block.get("baseFeePerGas")),
     }
     return {"ok": True, "block": parsed}
+
+
+def get_verified_wallet_snapshot(max_block_age_seconds: int = LIVE_LEDGER_MAX_BLOCK_AGE_SECONDS):
+    """Return a verified Polygon wallet snapshot for live-ledger reads.
+
+    The snapshot is considered verified only when all of the following hold:
+    - a wallet address can be derived
+    - Polygon RPC is reachable and reports chain ID 137
+    - latest block metadata is available
+    - the latest block timestamp is not stale
+    - the USDC.e balance call succeeds
+    """
+    snapshot = {
+        "ok": False,
+        "verified": False,
+        "wallet_connected": False,
+        "wallet_address": None,
+        "available_balance_usd": 0.0,
+        "balance_source": "polygon_wallet",
+        "wallet_error": None,
+        "verification_error": None,
+        "verification_status": "unverified",
+        "chain_id": None,
+        "expected_chain_id": 137,
+        "chain_parity_ok": False,
+        "block_number": None,
+        "block_hash": None,
+        "block_timestamp": None,
+        "block_age_seconds": None,
+        "max_block_age_seconds": int(max_block_age_seconds),
+        "verified_at": int(time.time()),
+    }
+
+    try:
+        wallet_address = get_wallet_address()
+    except Exception as exc:
+        log.warning("Failed to derive live wallet address: %s", exc)
+        snapshot["wallet_error"] = str(exc)
+        snapshot["verification_error"] = str(exc)
+        snapshot["verification_status"] = "wallet_unavailable"
+        return snapshot
+
+    if not wallet_address:
+        snapshot["wallet_error"] = "POLYMARKET_PRIVATE_KEY not configured"
+        snapshot["verification_error"] = snapshot["wallet_error"]
+        snapshot["verification_status"] = "wallet_unavailable"
+        return snapshot
+
+    snapshot["wallet_address"] = wallet_address
+
+    rollout = capture_polygon_rollout()
+    snapshot["chain_id"] = rollout.get("chain_id")
+    snapshot["expected_chain_id"] = rollout.get("expected_chain_id", 137)
+    snapshot["chain_parity_ok"] = bool(rollout.get("chain_parity_ok"))
+    block = rollout.get("block") or {}
+    snapshot["block_number"] = block.get("block_number")
+    snapshot["block_hash"] = block.get("block_hash")
+    snapshot["block_timestamp"] = block.get("timestamp")
+
+    if not rollout.get("ok"):
+        verification_error = rollout.get("chain_error") or rollout.get("block_error") or "Polygon rollout verification failed"
+        snapshot["wallet_error"] = verification_error
+        snapshot["verification_error"] = verification_error
+        snapshot["verification_status"] = "rpc_unavailable"
+        return snapshot
+
+    block_timestamp = snapshot.get("block_timestamp")
+    if block_timestamp:
+        snapshot["block_age_seconds"] = max(0, int(time.time()) - int(block_timestamp))
+    if snapshot["block_age_seconds"] is None:
+        snapshot["wallet_error"] = "Latest Polygon block timestamp missing"
+        snapshot["verification_error"] = snapshot["wallet_error"]
+        snapshot["verification_status"] = "block_unavailable"
+        return snapshot
+    if snapshot["block_age_seconds"] > int(max_block_age_seconds):
+        snapshot["wallet_error"] = (
+            f"Latest Polygon block is stale ({snapshot['block_age_seconds']}s old > "
+            f"{int(max_block_age_seconds)}s limit)"
+        )
+        snapshot["verification_error"] = snapshot["wallet_error"]
+        snapshot["verification_status"] = "stale"
+        return snapshot
+
+    w3 = _get_web3()
+    if not w3:
+        snapshot["wallet_error"] = "Web3 not available"
+        snapshot["verification_error"] = snapshot["wallet_error"]
+        snapshot["verification_status"] = "rpc_unavailable"
+        return snapshot
+
+    try:
+        contract = w3.eth.contract(
+            address=w3.to_checksum_address(USDC_E_ADDRESS),
+            abi=ERC20_ABI,
+        )
+        raw_balance = contract.functions.balanceOf(
+            w3.to_checksum_address(wallet_address)
+        ).call()
+        balance = raw_balance / (10 ** USDC_E_DECIMALS)
+    except Exception as exc:
+        log.warning("Failed to fetch verified USDC.e balance for %s: %s", wallet_address, exc)
+        snapshot["wallet_error"] = str(exc)
+        snapshot["verification_error"] = str(exc)
+        snapshot["verification_status"] = "balance_unavailable"
+        return snapshot
+
+    snapshot["ok"] = True
+    snapshot["verified"] = True
+    snapshot["wallet_connected"] = True
+    snapshot["wallet_error"] = None
+    snapshot["verification_error"] = None
+    snapshot["verification_status"] = "verified"
+    snapshot["available_balance_usd"] = round(float(balance), 2)
+    return snapshot
 
 
 def capture_polygon_rollout():

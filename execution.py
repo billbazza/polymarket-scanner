@@ -145,6 +145,29 @@ def check_balance(mode=None):
     # Live mode — use blockchain module
     try:
         import blockchain
+        snapshot_getter = getattr(blockchain, "get_verified_wallet_snapshot", None)
+        if callable(snapshot_getter):
+            snapshot = snapshot_getter(max_block_age_seconds=db.LIVE_LEDGER_MAX_AGE_SECONDS)
+            if not snapshot.get("verified"):
+                return {
+                    "ok": False,
+                    "balance_usd": 0,
+                    "mode": "live",
+                    "runtime_scope": runtime_scope,
+                    "error": snapshot.get("verification_error") or snapshot.get("wallet_error") or "Live Polygon wallet verification failed",
+                    "wallet_snapshot": snapshot,
+                }
+            balance = float(snapshot.get("available_balance_usd") or 0.0)
+            wallet = snapshot.get("wallet_address")
+            if wallet:
+                log.info("Live balance for %s: $%.2f", wallet[:10] + "...", balance)
+            return {
+                "ok": True,
+                "balance_usd": balance,
+                "mode": "live",
+                "runtime_scope": runtime_scope,
+                "wallet_snapshot": snapshot,
+            }
         wallet = blockchain.get_wallet_address()
         if not wallet:
             return {"ok": False, "balance_usd": 0, "mode": "live",

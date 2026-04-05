@@ -15,6 +15,8 @@ _INIT_LOCK = threading.Lock()
 _DB_INITIALIZED = False
 log = logging.getLogger("scanner.db")
 
+LIVE_LEDGER_MAX_AGE_SECONDS = 180
+
 TRADE_STATE_PAPER = "paper_research"
 TRADE_STATE_WALLET = "wallet_attached"
 TRADE_STATE_LIVE = "live_exchange"
@@ -2060,6 +2062,29 @@ def _get_live_wallet_snapshot() -> dict:
             "wallet_error": f"blockchain module unavailable: {exc}",
         }
 
+    verified_snapshot = getattr(blockchain, "get_verified_wallet_snapshot", None)
+    if callable(verified_snapshot):
+        try:
+            snapshot = verified_snapshot(max_block_age_seconds=LIVE_LEDGER_MAX_AGE_SECONDS)
+            if isinstance(snapshot, dict):
+                snapshot.setdefault("balance_source", "polygon_wallet")
+                snapshot.setdefault("max_block_age_seconds", LIVE_LEDGER_MAX_AGE_SECONDS)
+                return snapshot
+        except Exception as exc:
+            log.warning("Verified live wallet snapshot failed: %s", exc)
+            return {
+                "wallet_connected": False,
+                "wallet_address": None,
+                "available_balance_usd": 0.0,
+                "balance_source": "polygon_wallet",
+                "wallet_error": str(exc),
+                "verification_error": str(exc),
+                "verification_status": "verification_failed",
+                "verified": False,
+                "ok": False,
+                "max_block_age_seconds": LIVE_LEDGER_MAX_AGE_SECONDS,
+            }
+
     try:
         wallet_address = blockchain.get_wallet_address()
     except Exception as exc:
@@ -2118,6 +2143,52 @@ def get_live_account_overview(
         strategy_breakdown = get_strategy_performance(refresh_unrealized=False, runtime_scope=runtime_scope)
 
     wallet_snapshot = _get_live_wallet_snapshot()
+    verified_live_ledger = bool(wallet_snapshot.get("verified"))
+    verification_status = wallet_snapshot.get("verification_status") or ("verified" if verified_live_ledger else "unverified")
+    verification_error = wallet_snapshot.get("verification_error") or wallet_snapshot.get("wallet_error")
+    if not verified_live_ledger:
+        return {
+            "runtime_scope": runtime_scope,
+            "account_mode": "live_wallet",
+            "balance_source": wallet_snapshot.get("balance_source"),
+            "wallet_connected": bool(wallet_snapshot.get("wallet_connected")),
+            "wallet_address": wallet_snapshot.get("wallet_address"),
+            "wallet_error": wallet_snapshot.get("wallet_error"),
+            "verification_error": verification_error,
+            "verification_status": verification_status,
+            "verified_live_ledger": False,
+            "ledger_mode": "live_polygon_wallet",
+            "available_balance_usd": None,
+            "deployed_capital_usd": None,
+            "open_position_value_usd": None,
+            "realized_pnl_usd": None,
+            "realized_gains_usd": None,
+            "cumulative_losses_usd": None,
+            "unrealized_pnl_usd": None,
+            "total_equity_usd": None,
+            "open_positions": int(scoped_account.get("open_trades") or 0),
+            "wallet_exposure_pct": None,
+            "reporting_scope": f"live_wallet_scope::{runtime_scope}",
+            "data_quality": dict(scoped_account.get("data_quality") or {}),
+            "strategy_breakdown": strategy_breakdown,
+            "block_number": wallet_snapshot.get("block_number"),
+            "block_hash": wallet_snapshot.get("block_hash"),
+            "block_timestamp": wallet_snapshot.get("block_timestamp"),
+            "block_age_seconds": wallet_snapshot.get("block_age_seconds"),
+            "max_block_age_seconds": wallet_snapshot.get("max_block_age_seconds"),
+            "chain_id": wallet_snapshot.get("chain_id"),
+            "expected_chain_id": wallet_snapshot.get("expected_chain_id"),
+            "chain_parity_ok": wallet_snapshot.get("chain_parity_ok"),
+            "verified_at": wallet_snapshot.get("verified_at"),
+            "runtime_scope_detail": (
+                "Penny mode requires a verified Polygon wallet ledger and fails closed when the live wallet cannot be verified."
+            ),
+            "error": (
+                verification_error
+                or "Verified Polygon wallet data is unavailable; penny mode is blocked."
+            ),
+        }
+
     wallet_balance = float(wallet_snapshot.get("available_balance_usd") or 0.0)
     open_position_value = float(scoped_account.get("open_position_value") or 0.0)
     total_equity = wallet_balance + open_position_value
@@ -2131,6 +2202,10 @@ def get_live_account_overview(
         "wallet_connected": bool(wallet_snapshot.get("wallet_connected")),
         "wallet_address": wallet_snapshot.get("wallet_address"),
         "wallet_error": wallet_snapshot.get("wallet_error"),
+        "verification_error": None,
+        "verification_status": verification_status,
+        "verified_live_ledger": True,
+        "ledger_mode": "live_polygon_wallet",
         "available_balance_usd": round(wallet_balance, 2),
         "deployed_capital_usd": round(deployed_capital, 2),
         "open_position_value_usd": round(open_position_value, 2),
@@ -2144,8 +2219,17 @@ def get_live_account_overview(
         "reporting_scope": f"live_wallet_scope::{runtime_scope}",
         "data_quality": dict(scoped_account.get("data_quality") or {}),
         "strategy_breakdown": strategy_breakdown,
+        "block_number": wallet_snapshot.get("block_number"),
+        "block_hash": wallet_snapshot.get("block_hash"),
+        "block_timestamp": wallet_snapshot.get("block_timestamp"),
+        "block_age_seconds": wallet_snapshot.get("block_age_seconds"),
+        "max_block_age_seconds": wallet_snapshot.get("max_block_age_seconds"),
+        "chain_id": wallet_snapshot.get("chain_id"),
+        "expected_chain_id": wallet_snapshot.get("expected_chain_id"),
+        "chain_parity_ok": wallet_snapshot.get("chain_parity_ok"),
+        "verified_at": wallet_snapshot.get("verified_at"),
         "runtime_scope_detail": (
-            "Penny mode reports the Polygon wallet cash balance plus only penny-scoped open and closed trades."
+            "Penny mode reports the verified Polygon wallet cash balance plus only penny-scoped open and closed trades."
         ),
     }
 

@@ -565,10 +565,28 @@ async def stats(runtime_scope: str | None = None):
 
 @app.get("/api/runtime/account")
 async def runtime_account(runtime_scope: str | None = None):
-    return db.get_runtime_account_overview(
+    runtime_scope = _runtime_scope_param(runtime_scope)
+    overview = db.get_runtime_account_overview(
         refresh_unrealized=True,
-        runtime_scope=_runtime_scope_param(runtime_scope),
+        runtime_scope=runtime_scope,
     )
+    if runtime_scope == db.RUNTIME_SCOPE_PENNY and not overview.get("verified_live_ledger"):
+        log.error(
+            "Penny runtime account blocked: verification_status=%s error=%s wallet=%s",
+            overview.get("verification_status"),
+            overview.get("verification_error") or overview.get("wallet_error"),
+            overview.get("wallet_address"),
+        )
+        return JSONResponse(
+            status_code=503,
+            content={
+                **overview,
+                "ok": False,
+                "error": overview.get("error") or "Verified Polygon wallet data unavailable",
+                "message": "Penny mode is blocked until verified Polygon wallet ledger data is available.",
+            },
+        )
+    return overview
 
 
 @app.get("/api/paper-account")

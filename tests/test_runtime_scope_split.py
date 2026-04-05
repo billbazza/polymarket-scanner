@@ -132,11 +132,24 @@ class RuntimeScopeSplitTests(unittest.TestCase):
         self.assertEqual([row["id"] for row in penny_trades], [penny_trade_id])
 
         with patch.object(self.db, "_get_live_wallet_snapshot", return_value={
+            "ok": True,
+            "verified": True,
+            "verification_status": "verified",
             "wallet_connected": True,
             "wallet_address": "0x1234567890abcdef1234567890abcdef12345678",
             "available_balance_usd": 17.25,
             "balance_source": "polygon_wallet",
             "wallet_error": None,
+            "verification_error": None,
+            "block_number": 123,
+            "block_hash": "0xabc",
+            "block_timestamp": 1710000000,
+            "block_age_seconds": 12,
+            "max_block_age_seconds": 180,
+            "chain_id": 137,
+            "expected_chain_id": 137,
+            "chain_parity_ok": True,
+            "verified_at": 1710000012,
         }):
             paper_stats = self.client.get("/api/stats?runtime_scope=paper").json()
             penny_stats = self.client.get("/api/stats?runtime_scope=penny").json()
@@ -149,11 +162,46 @@ class RuntimeScopeSplitTests(unittest.TestCase):
         self.assertEqual(penny_stats["open_trades"], 1)
         self.assertEqual(penny_stats["runtime_account"]["runtime_scope"], "penny")
         self.assertEqual(penny_stats["runtime_account"]["account_mode"], "live_wallet")
+        self.assertTrue(penny_stats["runtime_account"]["verified_live_ledger"])
         self.assertEqual(penny_stats["runtime_account"]["deployed_capital_usd"], 3.0)
         self.assertEqual(penny_stats["runtime_account"]["available_balance_usd"], 17.25)
         self.assertEqual(penny_account["account_mode"], "live_wallet")
+        self.assertTrue(penny_account["verified_live_ledger"])
         self.assertEqual(penny_account["available_balance_usd"], 17.25)
         self.assertNotIn("paper_account", penny_account)
+
+    def test_penny_runtime_account_fails_closed_without_verified_live_wallet(self):
+        self._seed_scoped_pairs_trades()
+
+        with patch.object(self.db, "_get_live_wallet_snapshot", return_value={
+            "ok": False,
+            "verified": False,
+            "verification_status": "stale",
+            "wallet_connected": False,
+            "wallet_address": "0x1234567890abcdef1234567890abcdef12345678",
+            "available_balance_usd": 0.0,
+            "balance_source": "polygon_wallet",
+            "wallet_error": "Latest Polygon block is stale",
+            "verification_error": "Latest Polygon block is stale",
+            "block_number": 123,
+            "block_hash": "0xabc",
+            "block_timestamp": 1710000000,
+            "block_age_seconds": 999,
+            "max_block_age_seconds": 180,
+            "chain_id": 137,
+            "expected_chain_id": 137,
+            "chain_parity_ok": True,
+            "verified_at": 1710000999,
+        }):
+            response = self.client.get("/api/runtime/account?runtime_scope=penny")
+            payload = response.json()
+
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(payload["account_mode"], "live_wallet")
+        self.assertFalse(payload["verified_live_ledger"])
+        self.assertEqual(payload["verification_status"], "stale")
+        self.assertIn("blocked", payload["message"].lower())
+        self.assertIsNone(payload["available_balance_usd"])
 
     def test_closed_trade_history_api_is_runtime_scoped(self):
         signal_id = self.db.save_signal(_signal())
@@ -254,6 +302,9 @@ class RuntimeScopeSplitTests(unittest.TestCase):
         self.assertIn("fetch(API + runtimeScopedUrl('/api/runtime/account', {}, scope))", html)
         self.assertIn("if (requestId !== SCOPE_REQUEST_SEQ.history || scope !== ACTIVE_RUNTIME_SCOPE) return;", html)
         self.assertIn("if (requestId !== SCOPE_REQUEST_SEQ.stats || scope !== ACTIVE_RUNTIME_SCOPE) return;", html)
+        self.assertIn("LIVE / POLYGON WALLET VERIFIED", html)
+        self.assertIn("LIVE / POLYGON WALLET BLOCKED", html)
+        self.assertIn("Penny mode fails closed", html)
 
 
 if __name__ == "__main__":

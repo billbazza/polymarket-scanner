@@ -266,9 +266,41 @@
     border-color: rgba(245, 158, 11, 0.28);
     background: rgba(245, 158, 11, 0.08);
   }
+  .runtime-pill-critical {
+    border-color: rgba(239, 68, 68, 0.48);
+    background: rgba(127, 29, 29, 0.3);
+    color: #fecaca;
+  }
   .runtime-pill-muted {
     border-color: rgba(107, 114, 128, 0.35);
     background: rgba(51, 65, 85, 0.5);
+  }
+  .ledger-banner {
+    margin-top: 12px;
+    padding: 12px 14px;
+    border-radius: 12px;
+    border: 1px solid rgba(71, 85, 105, 0.35);
+    background: rgba(15, 23, 42, 0.72);
+  }
+  .ledger-banner.live {
+    border-color: rgba(20, 184, 166, 0.35);
+    background: rgba(6, 78, 59, 0.22);
+  }
+  .ledger-banner.blocked {
+    border-color: rgba(239, 68, 68, 0.4);
+    background: rgba(127, 29, 29, 0.3);
+  }
+  .ledger-banner .title {
+    font-size: 12px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.7px;
+  }
+  .ledger-banner .meta {
+    margin-top: 6px;
+    color: var(--text2);
+    font-size: 12px;
+    line-height: 1.5;
   }
 
   header {
@@ -561,6 +593,11 @@
         <span class="runtime-pill-status">Checking…</span>
       </div>
     </div>
+  </div>
+
+  <div class="ledger-banner live" id="liveLedgerBanner" aria-live="polite">
+    <div class="title" id="liveLedgerTitle">Research / Paper Ledger</div>
+    <div class="meta" id="liveLedgerMeta">Research mode is isolated from live wallet accounting.</div>
   </div>
 
   <div class="hero-panel">
@@ -1381,6 +1418,20 @@ async function loadStats() {
     const sizingData = sizingR ? await sizingR.json() : null;
     if (requestId !== SCOPE_REQUEST_SEQ.stats || scope !== ACTIVE_RUNTIME_SCOPE) return;
     const isPaper = (s.runtime_scope || ACTIVE_RUNTIME_SCOPE) === 'paper';
+    const pennyLedgerBlocked = !isPaper && (!accountR.ok || account?.verified_live_ledger !== true);
+
+    renderLiveLedgerBanner({
+      isPaper,
+      account,
+      blocked: pennyLedgerBlocked,
+      responseOk: accountR.ok,
+    });
+
+    if (pennyLedgerBlocked) {
+      renderBlockedPennyAccount(account, runtimeData, s);
+      return;
+    }
+
     const strategyBreakdown = (s.strategy_breakdown || account.strategy_breakdown || {});
     const setSignedValue = (id, value) => {
       const el = document.getElementById(id);
@@ -1410,7 +1461,7 @@ async function loadStats() {
     document.getElementById('statCashMeta').textContent = isPaper
       ? `${fmtUsd(availableBalance)} free to deploy now. Drawdown ${drawdownPct.toFixed(1)}% / cap ${Number(maxDrawdownPct).toFixed(0)}%.`
       : (account.wallet_error
-          ? `Wallet balance unavailable: ${account.wallet_error}.`
+          ? `Wallet verification unavailable: ${account.verification_error || account.wallet_error}.`
           : `${fmtUsd(availableBalance)} currently available in the Polygon wallet for penny trading.`);
     document.getElementById('statCommitted').textContent = fmtUsd(deployedCapital);
     document.getElementById('statCommittedMeta').textContent = isPaper
@@ -1432,7 +1483,7 @@ async function loadStats() {
       : `${openTrades} open penny position${openTrades === 1 ? '' : 's'} currently represent ${(account.wallet_exposure_pct || 0).toFixed(1)}% of live wallet equity.`;
     document.getElementById('accountSummaryText').textContent = isPaper
       ? `Equity ${fmtUsd(totalEquity)} = cash ${fmtUsd(availableBalance)} + marked open positions ${fmtUsd(account.open_position_value)}.`
-      : `Penny scope reads the Polygon wallet balance plus only penny-scoped open and closed positions.`;
+      : `Penny scope reads the verified Polygon wallet balance plus only penny-scoped open and closed positions.`;
     document.getElementById('accountExplainer').innerHTML = isPaper
       ? `<strong>Accounting rule:</strong> ${esc(account.cash_after_open_explanation || 'Opening a research trade deducts its size from available cash immediately.')} ` +
         `${esc(account.position_policy_detail || 'Research trading is uncapped by position count and limited by available cash.')} ` +
@@ -1441,7 +1492,7 @@ async function loadStats() {
         ((account.excluded_open_trades || 0)
           ? `Wallet-attached/live trades are tracked separately and do not consume this paper bankroll view.`
           : '')
-      : `<strong>Runtime rule:</strong> Penny mode reads the live Polygon wallet balance and only penny-scoped positions. Research experiments remain isolated in the research view and do not consume penny max-open slots or wallet metrics.`;
+      : `<strong>Runtime rule:</strong> Penny mode reads the verified live Polygon wallet balance and only penny-scoped positions. Research experiments remain isolated in the research view and do not consume penny max-open slots or wallet metrics.`;
     if (isPaper) renderPaperSizingControls(sizingData?.settings || {});
 
     document.getElementById('statWinRate').textContent = s.win_rate + '%';
@@ -1493,6 +1544,55 @@ async function loadStats() {
 
     drawPnlChart(s.pnl_series);
   } catch(e) {}
+}
+
+function renderLiveLedgerBanner({ isPaper, account, blocked, responseOk }) {
+  const banner = getEl('liveLedgerBanner');
+  const title = getEl('liveLedgerTitle');
+  const meta = getEl('liveLedgerMeta');
+  if (isPaper) {
+    banner.className = 'ledger-banner live';
+    title.textContent = 'Research / Paper Ledger';
+    meta.textContent = 'Research mode is isolated from live wallet accounting.';
+    return;
+  }
+  if (blocked) {
+    banner.className = 'ledger-banner blocked';
+    title.textContent = 'LIVE / POLYGON WALLET BLOCKED';
+    meta.textContent = (account?.message || account?.error || account?.verification_error || 'Verified Polygon wallet data unavailable.') +
+      ` Status: ${String(account?.verification_status || (responseOk ? 'unverified' : 'http_error')).toUpperCase()}.`;
+    return;
+  }
+  banner.className = 'ledger-banner live';
+  title.textContent = 'LIVE / POLYGON WALLET VERIFIED';
+  meta.textContent =
+    `Wallet ${String(account?.wallet_address || '').slice(0, 8)}...${String(account?.wallet_address || '').slice(-4)} ` +
+    `verified on Polygon block ${account?.block_number ?? 'n/a'} with block age ${account?.block_age_seconds ?? 'n/a'}s.`;
+}
+
+function renderBlockedPennyAccount(account, runtimeData, statsData) {
+  const err = account?.message || account?.error || account?.verification_error || account?.wallet_error || 'Verified Polygon wallet data unavailable.';
+  document.getElementById('statEquity').textContent = 'BLOCKED';
+  document.getElementById('statStartingBankroll').textContent = 'LIVE / POLYGON WALLET required';
+  document.getElementById('statAvailableCash').textContent = '—';
+  document.getElementById('statCommitted').textContent = '—';
+  document.getElementById('statRealized').textContent = '—';
+  document.getElementById('statUnrealized').textContent = '—';
+  document.getElementById('statLossesUsd').textContent = '—';
+  document.getElementById('statUtilization').textContent = '—';
+  document.getElementById('statCashMeta').textContent = err;
+  document.getElementById('statCommittedMeta').textContent = 'Penny dashboard is fail-closed until live wallet verification succeeds.';
+  document.getElementById('statRealizedMeta').textContent = 'Paper and aggregate values are intentionally suppressed.';
+  document.getElementById('statUnrealizedMeta').textContent = 'No penny PnL is rendered without verified Polygon wallet data.';
+  document.getElementById('statUtilizationMeta').textContent = 'Wallet exposure cannot be computed safely.';
+  document.getElementById('accountSummaryText').textContent = 'Penny mode is blocked because the backend could not provide verified Polygon wallet ledger data.';
+  document.getElementById('accountExplainer').innerHTML =
+    `<strong>Safety rule:</strong> Penny mode fails closed. The dashboard will not fall back to paper balances, paper P&amp;L, or shared totals when live Polygon wallet verification fails.`;
+  document.getElementById('strategyBreakdownBody').innerHTML =
+    `<tr><td colspan="7" class="empty"><div class="icon">■</div>LIVE / POLYGON WALLET verification failed. ${esc(err)}</td></tr>`;
+  document.getElementById('strategyBreakdownMeta').textContent =
+    `Penny strategy metrics are blocked while verification status is ${String(account?.verification_status || 'unverified').toUpperCase()}.`;
+  renderRuntimeScopePanel(runtimeData, statsData, account);
 }
 
 function renderRuntimeScopePanel(runtimeData, statsData, account) {
