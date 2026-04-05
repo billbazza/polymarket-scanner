@@ -1160,10 +1160,7 @@ function updateRuntimeScopeUi() {
   if (getEl('paperAttemptsTabLabel')) getEl('paperAttemptsTabLabel').textContent = isPaper ? 'Research Gate' : 'Runtime Gate';
   if (getEl('paperSizingControls')) getEl('paperSizingControls').style.display = isPaper ? 'grid' : 'none';
   if (getEl('autoTradeBtn')) getEl('autoTradeBtn').textContent = isPaper ? 'Run Research' : 'Run Penny';
-  if (getEl('paperAttemptsTab')) getEl('paperAttemptsTab').style.display = isPaper ? '' : 'none';
-  if (!isPaper && document.querySelector('.tab.active')?.dataset?.tab === 'paper-attempts') {
-    switchTab('trades');
-  }
+  if (getEl('paperAttemptsTab')) getEl('paperAttemptsTab').style.display = '';
 }
 
 function setRuntimeScope(scope) {
@@ -1659,10 +1656,15 @@ function renderRuntimeScopePanel(runtimeData, statsData, account) {
     : (lastResult?.ok === true
       ? 'Idle'
       : (lastResult?.ok === false ? 'Error' : 'Idle'));
+  const pairsPhase = lastResult?.pairs_phase || {};
+  const latestPairsVeto = pairsPhase?.latest_live_veto || null;
+  const pairsVetoSummary = latestPairsVeto
+    ? ` Cointegration live veto: ${latestPairsVeto.reason_code || 'live_safeguard_blocked'}${latestPairsVeto.reason ? ` (${latestPairsVeto.reason})` : ''}.`
+    : '';
   const cycleMeta = running
     ? `A ${scope} autonomy cycle is currently running in background; this panel updates after all enabled phases finish.`
     : lastResult?.ok === true
-        ? `Last ${scope} cycle: ${lastResult.trades_opened || 0} opened, ${lastResult.trades_closed || 0} closed in ${lastResult.duration_secs || 0}s. ${formatWeatherPhaseStatus(lastResult, scope)}`
+        ? `Last ${scope} cycle: ${lastResult.trades_opened || 0} opened, ${lastResult.trades_closed || 0} closed in ${lastResult.duration_secs || 0}s. ${formatWeatherPhaseStatus(lastResult, scope)}${pairsVetoSummary}`
         : lastResult?.error
           ? `Last ${scope} cycle failed: ${lastResult.error}`
           : `No ${scope} autonomy cycle result recorded in this server process yet.`;

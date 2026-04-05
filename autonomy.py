@@ -327,6 +327,35 @@ def record_attempt(level, strategy, outcome, reason_code, reason, **kwargs):
     )
 
 
+def _update_pairs_live_veto_summary(
+    pairs_phase: dict,
+    *,
+    event_name: str,
+    signal_id: int | None,
+    trade_size: float | None,
+    reason_code: str | None,
+    reason: str | None,
+    extra_details: dict | None = None,
+) -> None:
+    veto = {
+        "event": event_name,
+        "signal_id": signal_id,
+        "size_usd": round(float(trade_size), 2) if trade_size is not None else None,
+        "reason_code": reason_code or "live_safeguard_blocked",
+        "reason": reason or "Live safeguard blocked execution.",
+    }
+    if extra_details:
+        veto["details"] = extra_details
+    vetoes = pairs_phase.setdefault("live_vetoes", [])
+    vetoes.append(veto)
+    pairs_phase["live_veto_count"] = len(vetoes)
+    pairs_phase["latest_live_veto"] = veto
+    if pairs_phase.get("trade_execution_status") != "slots_full":
+        pairs_phase["trade_execution_status"] = "blocked_by_live_safeguard"
+    pairs_phase["reason_code"] = veto["reason_code"]
+    pairs_phase["reason"] = veto["reason"]
+
+
 def _record_wallet_event(**kwargs):
     recorder = getattr(db, "record_wallet_monitor_event", None)
     if not callable(recorder):
@@ -591,6 +620,8 @@ def run_cycle(state):
         perplexity_profitable_candidates = sum(
             1 for opp in admitted_signals if opp.get("profitable_candidate_feature")
         )
+        profitable_candidate_positive = perplexity_profitable_candidates
+        profitable_candidate_negative = max(0, len(admitted_signals) - profitable_candidate_positive)
         journal({
             "action": "perplexity_observability",
             "level": level,
@@ -627,9 +658,11 @@ def run_cycle(state):
             "a_trial_rejection_counts": rejection_counts,
             "perplexity_profitable_candidates": perplexity_profitable_candidates,
             "signal_ids": new_signal_ids,
-            "stage3_gate_applied": stage3_gate_applied,
-            "stage3_gate_passed": stage3_gate_passed,
-            "stage3_gate_blocked": stage3_gate_blocked,
+            "stage3_gate_applied": False,
+            "stage3_gate_passed": 0,
+            "stage3_gate_blocked": 0,
+            "profitable_candidate_positive": profitable_candidate_positive,
+            "profitable_candidate_negative": profitable_candidate_negative,
         })
 
         if paper_mode and admitted_signals:
@@ -815,6 +848,8 @@ def run_cycle(state):
                 "admitted": len(admitted_signals),
                 "traded": 0,
             },
+            "live_vetoes": [],
+            "live_veto_count": 0,
         }
         cycle_summary["pairs_phase"] = pairs_phase
 
@@ -964,37 +999,31 @@ def run_cycle(state):
             # Execute
             mode = "paper" if paper_mode else "live"
 
-            # Step 4.5: Brain validation (live-only)
-            # Ask Claude + Perplexity if this signal makes sense in the real world
+            brain_advisory = None
             if mode == "live":
                 try:
                     import brain
                     should_trade, brain_reasoning = brain.validate_signal(opp)
-                    if not should_trade:
-                        log.info("  Brain REJECTED trade: %s", brain_reasoning)
-                        journal({
-                            "action": "brain_reject",
-                            "level": level,
-                            "event": event_name[:60],
-                            "reason": brain_reasoning,
-                        })
-                        record_attempt(
-                            level,
-                            "pairs",
-                            "blocked",
-                            "brain_rejected",
-                            brain_reasoning,
-                            event=event_name,
-                            signal_id=signal_id,
-                            size_usd=trade_size,
-                            phase="step 4.5 brain validation",
-                            details={"live_only_safeguard": mode == "live"},
-                        )
-                        continue
-                    log.info("  Brain VALIDATED trade: %s", brain_reasoning)
+                    brain_advisory = {
+                        "should_trade": bool(should_trade),
+                        "reasoning": brain_reasoning,
+                    }
                     opp["brain_reasoning"] = brain_reasoning
+                    opp["brain_should_trade"] = bool(should_trade)
+                    if should_trade:
+                        log.info("  Brain advisory: validated trade for live execution: %s", brain_reasoning)
+                    else:
+                        log.info("  Brain advisory only: live execution still allowed by parity contract: %s", brain_reasoning)
+                    journal({
+                        "action": "brain_advisory",
+                        "level": level,
+                        "event": event_name[:60],
+                        "signal_id": signal_id,
+                        "advisory": "trade" if should_trade else "caution",
+                        "reason": brain_reasoning,
+                    })
                 except Exception as e:
-                    log.warning("  Brain validation failed (defaulting to math-only): %s", e)
+                    log.warning("  Brain advisory failed (defaulting to math-only parity path): %s", e)
             else:
                 log.debug("  Brain validation skipped in paper mode; trusting math-only filters")
 
@@ -1037,6 +1066,7 @@ def run_cycle(state):
                             "admission_path": opp.get("admission_path"),
                             "experiment_status": opp.get("experiment_status"),
                             "paper_sizing": sizing_decision,
+                            "brain_advisory": brain_advisory,
                             "reason_code": result.get("reason_code"),
                             "entry_execution": result.get("entry_execution"),
                             "pending": result.get("pending"),
@@ -1070,6 +1100,33 @@ def run_cycle(state):
                             "reason": opp.get("experiment_reason") or f"Signal admitted, z={opp.get('z_score', 0):+.2f}",
                         })
                 else:
+                    if mode == "live":
+                        veto_details = {
+                            "grade": opp.get("grade_label"),
+                            "admission_path": opp.get("admission_path"),
+                            "brain_advisory": brain_advisory,
+                            "pending": result.get("pending"),
+                            "slippage": result.get("slippage"),
+                            "balance": result.get("balance"),
+                            "decision": result.get("decision"),
+                            **_stage2_details(result),
+                        }
+                        _update_pairs_live_veto_summary(
+                            pairs_phase,
+                            event_name=event_name,
+                            signal_id=signal_id,
+                            trade_size=trade_size,
+                            reason_code=result.get("reason_code"),
+                            reason=result.get("error"),
+                            extra_details=veto_details,
+                        )
+                        log.warning(
+                            "  Penny cointegration live safeguard veto: signal=%s event=%s reason_code=%s reason=%s",
+                            signal_id,
+                            event_name[:80],
+                            result.get("reason_code"),
+                            result.get("error"),
+                        )
                     record_attempt(
                         level,
                         "pairs",
@@ -1084,15 +1141,20 @@ def run_cycle(state):
                             "grade": opp.get("grade_label"),
                             "paper_sizing": sizing_decision,
                             "mode": mode,
+                            "admission_path": opp.get("admission_path"),
+                            "brain_advisory": brain_advisory,
                             "pending": result.get("pending"),
                             "slippage": result.get("slippage"),
                             "balance": result.get("balance"),
+                            "decision": result.get("decision"),
                             **_stage2_details(result),
                         },
                     )
                     journal({
-                        "action": "trade_rejected",
+                        "action": "live_trade_veto" if mode == "live" else "trade_rejected",
                         "level": level,
+                        "mode": mode,
+                        "signal_id": signal_id,
                         "event": event_name[:60],
                         "grade": opp.get("grade_label", "?"),
                         "admission_path": opp.get("admission_path"),
@@ -1125,6 +1187,10 @@ def run_cycle(state):
                 f"Cointegration candidates were capped by penny max-open usage "
                 f"({slot_usage.get('max_open_usage')})."
             )
+        elif pairs_phase.get("trade_execution_status") == "blocked_by_live_safeguard":
+            latest_veto = pairs_phase.get("latest_live_veto") or {}
+            pairs_phase["reason_code"] = latest_veto.get("reason_code") or "live_safeguard_blocked"
+            pairs_phase["reason"] = latest_veto.get("reason") or "A live safeguard blocked cointegration execution."
         pairs_phase["slot_usage_at_end"] = db.get_runtime_slot_usage(
             runtime_scope=runtime_scope,
             max_open=max_open,
