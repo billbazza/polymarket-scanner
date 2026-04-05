@@ -665,6 +665,106 @@ class RuntimeScopeSplitTests(unittest.TestCase):
         self.assertIsNone(last_result["weather_phase"]["reason_code"])
         self.assertEqual(last_result["weather_phase"]["execution_mode"], "live-auto-trade")
 
+    def test_penny_weather_preflight_blocks_are_removed_from_tradeable_count(self):
+        import autonomy
+
+        autonomy = importlib.reload(autonomy)
+        state = autonomy.default_state("penny")
+        state["level"] = "penny"
+
+        journal_entries = []
+        fake_weather_strategy = types.SimpleNamespace(
+            scan_weather_opportunities=lambda **kwargs: (
+                [{
+                    "event": "Bristol temperature",
+                    "market": "Will Bristol hit 72F?",
+                    "strategy_name": "weather_threshold",
+                    "market_family": "weather_threshold",
+                    "yes_token": "weather-yes",
+                    "no_token": "weather-no",
+                    "market_price": 0.42,
+                    "combined_edge_pct": 9.0,
+                    "hours_ahead": 48,
+                    "timestamp": 1710000000,
+                    "liquidity": 9000,
+                    "action": "BUY_YES",
+                    "tradeable": True,
+                }],
+                {"markets_checked": 1},
+            )
+        )
+        fake_weather_exact = types.SimpleNamespace(
+            exact_temp_enabled=lambda: False,
+            exact_temp_autotrade_enabled=lambda: False,
+        )
+        sizing_decision = {
+            "selected_size_usd": 3.0,
+            "selected_policy": "baseline",
+            "rollout_state": "inactive",
+            "applied": False,
+            "activation_status": {"blocker_codes": [], "blockers": [], "can_apply_confidence": False},
+            "compare_only": False,
+            "confidence_size_usd": None,
+        }
+
+        with patch.object(autonomy.async_scanner, "scan", return_value={
+            "opportunities": [],
+            "pairs_tested": 0,
+            "pairs_cointegrated": 0,
+        }), \
+             patch.object(autonomy, "get_level_config", return_value={
+                 "name": "Penny Trader",
+                 "can_trade": True,
+                 "auto_trade_enabled": True,
+                 "max_open": 3,
+                 "size_usd": 3,
+                 "runtime_controls": {"auto_trade_enabled": True},
+             }), \
+             patch.object(autonomy.db, "save_scan_run"), \
+             patch.object(autonomy.tracker, "refresh_open_trades", return_value=[]), \
+             patch.object(autonomy.execution, "manage_open_orders", return_value={"filled": 0, "cancelled": 0}), \
+             patch.object(autonomy.trade_monitor, "reconcile_open_trades", return_value={"counts": {}, "results": [], "auto_closed_trade_ids": []}), \
+             patch.object(autonomy.tracker, "auto_close_trades", return_value=[]), \
+             patch.object(autonomy.db, "get_trades", return_value=[]), \
+             patch.object(autonomy.db, "get_runtime_account_overview", return_value={"available_balance": 100.0}), \
+             patch.object(autonomy.db, "save_weather_signal", return_value=17), \
+             patch.object(autonomy.db, "inspect_weather_trade_open", return_value={
+                 "ok": False,
+                 "reason_code": "horizon_too_short",
+                 "reason": "Signal horizon now 47.8h, below required 48h minimum.",
+                 "runtime_scope": "penny",
+                 "decision_source": "penny-weather",
+                 "blocker_source": "penny-weather",
+                 "history_source": "penny-weather",
+             }), \
+             patch.object(autonomy.paper_sizing, "build_paper_sizing_decision", return_value=sizing_decision), \
+             patch.object(autonomy.paper_sizing, "record_sizing_decision"), \
+             patch.object(autonomy.execution, "execute_weather_trade", side_effect=AssertionError("execution should not run")), \
+             patch.object(autonomy, "save_state"), \
+             patch.object(autonomy, "journal", side_effect=lambda entry: journal_entries.append(entry)), \
+             patch.dict(sys.modules, {
+                 "weather_strategy": fake_weather_strategy,
+                 "weather_exact_temp_scanner": fake_weather_exact,
+                 "copy_scanner": types.SimpleNamespace(get_positions=lambda address: []),
+                 "wallet_discovery": types.SimpleNamespace(run_discovery=lambda **kwargs: []),
+                 "longshot_scanner": types.SimpleNamespace(scan=lambda **kwargs: ([], {"markets_checked": 0})),
+                 "near_certainty_scanner": types.SimpleNamespace(scan=lambda **kwargs: ([], {"markets_checked": 0})),
+                 "whale_detector": types.SimpleNamespace(scan=lambda **kwargs: ([], {"markets_checked": 0})),
+             }, clear=False):
+            result = autonomy.run_cycle(state)
+
+        weather_phase = (result or {}).get("cycle_summary", {}).get("weather_phase", {})
+        self.assertEqual(weather_phase.get("trade_execution_status"), "blocked_preflight")
+        self.assertEqual(weather_phase.get("reason_code"), "horizon_too_short")
+        self.assertEqual(weather_phase.get("result_counts", {}).get("scan_tradeable"), 1)
+        self.assertEqual(weather_phase.get("result_counts", {}).get("tradeable"), 0)
+        self.assertEqual(weather_phase.get("result_counts", {}).get("preflight_blocked"), 1)
+        self.assertEqual(weather_phase.get("result_counts", {}).get("traded"), 0)
+        self.assertEqual(weather_phase.get("trade_candidates"), 0)
+        skip_entries = [entry for entry in journal_entries if entry.get("action") == "skip_trade"]
+        self.assertEqual(len(skip_entries), 1)
+        self.assertEqual(skip_entries[0]["reason_code"], "horizon_too_short")
+
     def test_penny_a_grade_trial_is_not_filtered_by_perplexity_metadata(self):
         import autonomy
 

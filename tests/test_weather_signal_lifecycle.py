@@ -13,6 +13,7 @@ def _weather_opp(
     yes_token="yes-atl",
     no_token="no-atl",
     target_date="2026-04-03",
+    hours_ahead=72,
 ):
     return {
         "event": f"Highest temperature in {city} on {target_date}?",
@@ -37,7 +38,7 @@ def _weather_opp(
         "combined_edge_pct": 24.0,
         "sources_agree": True,
         "sources_available": 2,
-        "hours_ahead": 48,
+        "hours_ahead": hours_ahead,
         "ev_pct": 8.5,
         "kelly_fraction": 0.12,
         "action": "BUY_YES",
@@ -450,6 +451,27 @@ class WeatherSignalLifecycleTests(unittest.TestCase):
         self.assertEqual(decision["history_strategy"], "weather")
         self.assertEqual(decision["history_source"], "penny-weather")
         self.assertEqual(decision["existing_trade_id"], penny_trade_id)
+
+    def test_weather_preflight_horizon_block_uses_decision_source_not_history_source(self):
+        signal_id = self.db.save_weather_signal(
+            _weather_opp(city="Leeds", market="Will Leeds hit 75F?", yes_token="yes-leeds", no_token="no-leeds")
+        )
+
+        with mock.patch.object(
+            self.db.weather_guard_state,
+            "current_guard",
+            return_value={"min_hours_ahead": 80, "name": "legacy", "tier_index": 2, "max_disagreement": 0.12, "min_liquidity": 10000},
+        ):
+            decision = self.db.inspect_weather_trade_open(signal_id, size_usd=20, mode="paper")
+            rows = {row["id"]: row for row in self.db.get_weather_signals(limit=None) if row["id"] == signal_id}
+
+        self.assertFalse(decision["ok"])
+        self.assertEqual(decision["reason_code"], "horizon_too_short")
+        self.assertEqual(decision["blocker_source"], "paper-weather")
+        row = rows[signal_id]
+        self.assertEqual(row["blocking_reason_code"], "horizon_too_short")
+        self.assertEqual(row["blocking_source"], "paper-weather")
+        self.assertEqual(row["status"], "blocked")
 
     def test_weather_close_trade_uses_single_leg_pnl_and_closes_signal(self):
         signal_id = self.db.save_weather_signal(

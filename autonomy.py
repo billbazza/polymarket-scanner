@@ -1236,12 +1236,15 @@ def run_cycle(state):
             "started_at": weather_phase_started,
             "result_counts": {
                 "opportunities": 0,
+                "scan_tradeable": 0,
                 "tradeable": 0,
+                "preflight_blocked": 0,
                 "saved": 0,
                 "traded": 0,
                 "live_vetoed": 0,
                 "exact_temp_opportunities": 0,
             },
+            "preflight_blocked_reasons": [],
             "live_safeguard_vetoes": [],
             "live_safeguard_reason_counts": [],
         }
@@ -1270,10 +1273,10 @@ def run_cycle(state):
                 verbose=False,
                 include_exact_temp=include_exact_temp,
             )
-            tradeable_weather = [o for o in weather_opps if o.get("tradeable")]
-            executable_weather = list(tradeable_weather)
+            scan_tradeable_weather = [o for o in weather_opps if o.get("tradeable")]
+            executable_weather = list(scan_tradeable_weather)
             weather_phase["result_counts"]["opportunities"] = len(weather_opps)
-            weather_phase["result_counts"]["tradeable"] = len(tradeable_weather)
+            weather_phase["result_counts"]["scan_tradeable"] = len(scan_tradeable_weather)
             weather_phase["exact_temp_enabled"] = bool(include_exact_temp)
             weather_phase["exact_temp_autotrade_enabled"] = bool(exact_temp_autotrade)
             weather_phase["result_counts"]["exact_temp_opportunities"] = sum(
@@ -1293,46 +1296,14 @@ def run_cycle(state):
                 ]
 
             weather_traded = 0
-            weather_phase["trade_candidates"] = len(executable_weather)
-            candidates = executable_weather
-            if weather_policy["auto_trade_enabled"]:
-                if slots_remaining is not None and slots_remaining <= 0:
-                    candidates = []
-                    weather_phase["trade_execution_status"] = "slots_full"
-                    weather_phase["reason_code"] = "max_open_reached_before_weather"
-                    weather_phase["reason"] = f"No weather slots remain for scope={runtime_scope}."
-                    weather_phase["blocking_trades"] = weather_slot_usage.get("consuming_trades") or []
-                elif slots_remaining is not None:
-                    candidates = executable_weather[:slots_remaining]
-                    weather_phase["trade_execution_status"] = (
-                        "limited_by_slots"
-                        if len(executable_weather) > max(slots_remaining, 0)
-                        else "enabled"
-                    )
-                    weather_phase["blocking_trades"] = weather_slot_usage.get("consuming_trades") or []
-                else:
-                    weather_phase["trade_execution_status"] = "enabled"
-            else:
-                candidates = []
-                weather_phase["trade_execution_status"] = "scan_only"
-                weather_phase["reason_code"] = "runtime_auto_trade_disabled"
-                weather_phase["reason"] = f"Weather scanning completed for scope={runtime_scope}; the primary runtime auto-trade control is disabled."
-                journal({
-                    "action": "weather_scan_only",
-                    "level": level,
-                    "runtime_scope": runtime_scope,
-                    "strategy": "weather",
-                    "reason": weather_phase["reason"],
-                })
-
+            preflight_candidates = []
+            preflight_reason_counts = {}
+            weather_phase["trade_candidates"] = 0
+            candidates = []
             for w_opp in executable_weather:
                 try:
                     w_id = db.save_weather_signal(w_opp)
                     weather_phase["result_counts"]["saved"] += 1
-                    if not weather_policy["auto_trade_enabled"]:
-                        continue
-                    if slots_remaining is not None and weather_traded >= max(slots_remaining, 0):
-                        continue
                     trade_size = size_usd if level != "book" else 20
                     sizing_account_overview = (
                         db.get_runtime_account_overview(refresh_unrealized=False, runtime_scope=runtime_scope)
@@ -1353,15 +1324,19 @@ def run_cycle(state):
                     decision = db.inspect_weather_trade_open(
                         w_id,
                         size_usd=trade_size,
-                        max_total_open=max_open if weather_policy["auto_trade_enabled"] else None,
                         mode=weather_policy["trade_mode"],
                         runtime_scope=runtime_scope,
                     )
                     if not decision["ok"]:
+                        reason_code = decision["reason_code"]
+                        preflight_reason_counts[reason_code] = preflight_reason_counts.get(reason_code, 0) + 1
+                        weather_phase["result_counts"]["preflight_blocked"] = int(
+                            weather_phase["result_counts"].get("preflight_blocked") or 0
+                        ) + 1
                         log.info(
-                            "Autonomy weather skip signal=%s reason_code=%s runtime_scope=%s decision_source=%s blocker_source=%s history_source=%s reason=%s",
+                            "Autonomy weather preflight blocked signal=%s reason_code=%s runtime_scope=%s decision_source=%s blocker_source=%s history_source=%s reason=%s",
                             w_id,
-                            decision["reason_code"],
+                            reason_code,
                             decision.get("runtime_scope"),
                             decision.get("decision_source"),
                             decision.get("blocker_source"),
@@ -1372,7 +1347,7 @@ def run_cycle(state):
                             level,
                             "weather",
                             "blocked",
-                            decision["reason_code"],
+                            reason_code,
                             decision["reason"],
                             event=w_opp.get("event", w_opp.get("market", "")),
                             weather_signal_id=w_id,
@@ -1383,6 +1358,7 @@ def run_cycle(state):
                                 "paper_sizing": sizing_decision,
                                 "execution_mode": weather_phase["execution_mode"],
                                 "decision_source": decision.get("decision_source"),
+                                "blocker_source": decision.get("blocker_source"),
                                 "history_source": decision.get("history_source"),
                                 "history_runtime_scope": decision.get("history_runtime_scope"),
                                 "history_strategy": decision.get("history_strategy"),
@@ -1394,11 +1370,75 @@ def run_cycle(state):
                             "trade_type": "weather",
                             "event": w_opp.get("event", w_opp.get("market", ""))[:60],
                             "reason": decision["reason"],
+                            "reason_code": reason_code,
                             "runtime_scope": runtime_scope,
                             "decision_source": decision.get("decision_source"),
+                            "blocker_source": decision.get("blocker_source"),
                             "history_source": decision.get("history_source"),
                         })
                         continue
+                    preflight_candidates.append({
+                        "opp": w_opp,
+                        "weather_signal_id": w_id,
+                        "trade_size": trade_size,
+                        "sizing_decision": sizing_decision,
+                        "decision": decision,
+                    })
+                except Exception as e:
+                    log.warning("Weather preflight failed: %s", e)
+                    record_attempt(
+                        level,
+                        "weather",
+                        "error",
+                        "trade_preflight_failed",
+                        f"Weather trade preflight failed: {e}",
+                        event=w_opp.get("event", w_opp.get("market", "")),
+                        phase=current_stage,
+                    )
+            weather_phase["preflight_blocked_reasons"] = [
+                {"reason_code": code, "count": count}
+                for code, count in sorted(preflight_reason_counts.items(), key=lambda item: (-item[1], item[0]))
+            ]
+            weather_phase["result_counts"]["tradeable"] = len(preflight_candidates)
+            weather_phase["trade_candidates"] = len(preflight_candidates)
+            candidates = list(preflight_candidates)
+            if weather_policy["auto_trade_enabled"]:
+                if slots_remaining is not None and slots_remaining <= 0:
+                    candidates = []
+                    weather_phase["trade_execution_status"] = "slots_full"
+                    weather_phase["reason_code"] = "max_open_reached_before_weather"
+                    weather_phase["reason"] = f"No weather slots remain for scope={runtime_scope}."
+                    weather_phase["blocking_trades"] = weather_slot_usage.get("consuming_trades") or []
+                elif slots_remaining is not None:
+                    candidates = preflight_candidates[:slots_remaining]
+                    weather_phase["trade_execution_status"] = (
+                        "limited_by_slots"
+                        if len(preflight_candidates) > max(slots_remaining, 0)
+                        else "enabled"
+                    )
+                    weather_phase["blocking_trades"] = weather_slot_usage.get("consuming_trades") or []
+                else:
+                    weather_phase["trade_execution_status"] = "enabled"
+            else:
+                candidates = []
+                weather_phase["trade_execution_status"] = "scan_only"
+                weather_phase["reason_code"] = "runtime_auto_trade_disabled"
+                weather_phase["reason"] = f"Weather scanning completed for scope={runtime_scope}; the primary runtime auto-trade control is disabled."
+                journal({
+                    "action": "weather_scan_only",
+                    "level": level,
+                    "runtime_scope": runtime_scope,
+                    "strategy": "weather",
+                    "reason": weather_phase["reason"],
+                })
+
+            for candidate in candidates:
+                try:
+                    w_opp = candidate["opp"]
+                    w_id = candidate["weather_signal_id"]
+                    trade_size = candidate["trade_size"]
+                    sizing_decision = candidate["sizing_decision"]
+                    decision = candidate["decision"]
                     weather_signal_payload = {
                         **w_opp,
                         "id": w_id,
@@ -1501,6 +1541,25 @@ def run_cycle(state):
                     )
             weather_phase["status"] = "completed"
             weather_phase["duration_secs"] = round(time.time() - weather_phase_started, 1)
+            preflight_blocked = int(weather_phase["result_counts"].get("preflight_blocked") or 0)
+            if preflight_blocked and not weather_phase.get("reason_code"):
+                preflight_reason_counts = weather_phase.get("preflight_blocked_reasons") or []
+                primary_preflight_reason = (preflight_reason_counts[0] or {}).get("reason_code") if preflight_reason_counts else None
+                preflight_summary = ", ".join(
+                    f"{item.get('reason_code')} x{item.get('count')}"
+                    for item in preflight_reason_counts
+                    if item.get("reason_code")
+                ) or f"{preflight_blocked} preflight blocks"
+                if weather_phase.get("trade_execution_status") not in {"slots_full", "limited_by_slots", "scan_only"}:
+                    weather_phase["trade_execution_status"] = (
+                        "enabled_with_preflight_blocks"
+                        if weather_phase["result_counts"].get("tradeable")
+                        else "blocked_preflight"
+                    )
+                    weather_phase["reason_code"] = primary_preflight_reason or "weather_preflight_blocked"
+                    weather_phase["reason"] = (
+                        f"Weather admission blocked {preflight_blocked} candidate(s) before execution: {preflight_summary}."
+                    )
             live_vetoed = int(weather_phase["result_counts"].get("live_vetoed") or 0)
             if live_vetoed:
                 veto_reason_counts = weather_phase.get("live_safeguard_reason_counts") or []
@@ -1510,7 +1569,9 @@ def run_cycle(state):
                     if item.get("reason_code")
                 ) or f"{live_vetoed} vetoes"
                 weather_phase["live_safeguard_veto_count"] = live_vetoed
-                weather_phase["reason_code"] = weather_phase.get("reason_code") or "live_safeguard_vetoed"
+                primary_veto_reason = (veto_reason_counts[0] or {}).get("reason_code") if veto_reason_counts else None
+                weather_phase["primary_live_veto_reason_code"] = primary_veto_reason
+                weather_phase["reason_code"] = weather_phase.get("reason_code") or primary_veto_reason or "live_safeguard_vetoed"
                 if weather_phase.get("trade_execution_status") not in {"slots_full", "limited_by_slots"}:
                     weather_phase["trade_execution_status"] = (
                         "enabled_with_live_vetoes"

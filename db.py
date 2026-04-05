@@ -10,6 +10,7 @@ import time
 from pathlib import Path
 
 import runtime_config
+import weather_guard_state
 import weather_risk_review
 
 DB_PATH = runtime_config.get_path("SCANNER_DB_PATH", Path(__file__).parent / "scanner.db")
@@ -3246,6 +3247,52 @@ def _weather_review_mode(mode: str | None, runtime_scope: str | None) -> str | N
     return mode_norm or None
 
 
+def evaluate_weather_signal_horizon(signal_row: dict | None) -> dict:
+    """Evaluate the current weather-horizon guard against a persisted signal row."""
+    if not signal_row:
+        return {
+            "ok": False,
+            "reason_code": "horizon_unknown",
+            "reason": "Signal data unavailable for horizon check.",
+        }
+    strategy = (
+        (signal_row.get("strategy_name") or signal_row.get("market_family") or "")
+        .strip()
+        .lower()
+    )
+    hours_ahead = signal_row.get("hours_ahead")
+    if strategy.startswith("weather_exact_temp"):
+        return {"ok": True, "remaining_hours": hours_ahead if hours_ahead is not None else 0.0}
+    timestamp = signal_row.get("timestamp")
+    if hours_ahead is None or timestamp is None:
+        return {
+            "ok": False,
+            "reason_code": "horizon_unknown",
+            "reason": "Signal missing horizon metadata.",
+        }
+    try:
+        remaining_hours = float(hours_ahead) - ((time.time() - float(timestamp)) / 3600.0)
+    except (TypeError, ValueError):
+        return {
+            "ok": False,
+            "reason_code": "horizon_unknown",
+            "reason": "Signal horizon metadata is invalid.",
+        }
+    guard = weather_guard_state.current_guard()
+    min_hours_required = float(guard["min_hours_ahead"])
+    if remaining_hours < min_hours_required:
+        return {
+            "ok": False,
+            "reason_code": "horizon_too_short",
+            "reason": (
+                f"Signal horizon now {remaining_hours:.1f}h, below required "
+                f"{min_hours_required:.0f}h minimum."
+            ),
+            "remaining_hours": remaining_hours,
+        }
+    return {"ok": True, "remaining_hours": remaining_hours}
+
+
 def _find_latest_weather_history_trade(
     conn,
     *,
@@ -4006,6 +4053,17 @@ def inspect_weather_trade_open(
             signal_row,
             mode=_weather_review_mode(mode, runtime_scope),
         )
+        horizon_check = evaluate_weather_signal_horizon(signal_row)
+        if not horizon_check["ok"]:
+            return {
+                "ok": False,
+                "reason_code": horizon_check.get("reason_code"),
+                "reason": horizon_check.get("reason"),
+                "signal": signal_row,
+                "remaining_hours": horizon_check.get("remaining_hours"),
+                **audit_fields,
+                **_paper_position_policy_dict(),
+            }
 
         action = sig["action"]
         entry_token = sig["yes_token"] if action == "BUY_YES" else sig["no_token"]
@@ -4190,6 +4248,7 @@ def inspect_weather_trade_open(
             "action": action,
             "runtime_scope": runtime_scope,
             "requested_size_usd": round(float(size_usd), 2),
+            "remaining_hours": horizon_check.get("remaining_hours"),
             "reopen_context": reopen_context,
             **audit_fields,
             **_paper_position_policy_dict(),
@@ -4898,9 +4957,9 @@ def get_weather_signals(limit=50, tradeable_only=False, runtime_scope: str | Non
             item["can_open_trade"] = bool(item.get("tradeable")) and decision["ok"]
             item["blocking_reason"] = None if decision["ok"] else decision.get("reason")
             item["blocking_reason_code"] = None if decision["ok"] else decision.get("reason_code")
-            item["blocking_runtime_scope"] = None if decision["ok"] else decision.get("history_runtime_scope")
-            item["blocking_strategy"] = None if decision["ok"] else decision.get("history_strategy")
-            item["blocking_source"] = None if decision["ok"] else decision.get("history_source")
+            item["blocking_runtime_scope"] = None if decision["ok"] else decision.get("blocker_runtime_scope")
+            item["blocking_strategy"] = None if decision["ok"] else decision.get("blocker_strategy")
+            item["blocking_source"] = None if decision["ok"] else decision.get("blocker_source")
             item["entry_token"] = decision.get("entry_token")
             if exact_open_trade_id is not None:
                 item["status"] = "open"

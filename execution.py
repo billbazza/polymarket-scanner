@@ -12,7 +12,6 @@ import api
 import db
 import math_engine
 import runtime_config
-import weather_guard_state
 
 log = logging.getLogger("scanner.execution")
 
@@ -533,49 +532,6 @@ def execute_trade(signal, size_usd, mode=None, runtime_scope: str | None = None)
     return _wrap_result(result)
 
 
-def _revalidate_weather_horizon(signal: dict | None):
-    """Re-check how many hours remain before the weather resolution."""
-    if not signal:
-        return {
-            "ok": False,
-            "reason_code": "horizon_unknown",
-            "reason": "Signal data unavailable for horizon check.",
-        }
-    hours_ahead = signal.get("hours_ahead")
-    timestamp = signal.get("timestamp")
-    strategy = (
-        (signal.get("strategy_name") or signal.get("market_family") or "")
-        .strip()
-        .lower()
-    )
-    if strategy.startswith("weather_exact_temp"):
-        return {"ok": True, "remaining_hours": hours_ahead if hours_ahead is not None else 0.0}
-    if hours_ahead is None or timestamp is None:
-        return {
-            "ok": False,
-            "reason_code": "horizon_unknown",
-            "reason": "Signal missing horizon metadata.",
-        }
-    try:
-        age_hours = (time.time() - float(timestamp)) / 3600
-    except (TypeError, ValueError):
-        age_hours = 0.0
-    remaining_hours = hours_ahead - age_hours
-    guard = weather_guard_state.current_guard()
-    min_hours_required = guard["min_hours_ahead"]
-    if remaining_hours < min_hours_required:
-        return {
-            "ok": False,
-            "reason_code": "horizon_too_short",
-            "reason": (
-                f"Signal horizon now {remaining_hours:.1f}h, below required "
-                f"{min_hours_required}h minimum."
-            ),
-            "remaining_hours": remaining_hours,
-        }
-    return {"ok": True, "remaining_hours": remaining_hours}
-
-
 def execute_weather_trade(signal, size_usd, mode=None, runtime_scope: str | None = None):
     """Execute a weather trade from a saved weather signal."""
     mode = mode or _get_mode()
@@ -608,14 +564,27 @@ def execute_weather_trade(signal, size_usd, mode=None, runtime_scope: str | None
             confidence_meta["confidence_score"],
             confidence_meta["confidence_policy"],
         )
-    log.info(
-        "Executing weather trade: signal=%s strategy=%s size=$%.2f mode=%s runtime_scope=%s",
-        weather_signal_id,
-        strategy_name,
-        size_usd,
-        mode,
-        runtime_scope,
-    )
+    def _blocked(reason_code, error, **extra):
+        payload = {
+            "ok": False,
+            "mode": mode,
+            "reason_code": reason_code,
+            "error": error,
+            "weather_signal_id": weather_signal_id,
+            "strategy_name": strategy_name,
+            "runtime_scope": runtime_scope,
+            **extra,
+        }
+        if mode == "live":
+            log.warning(
+                "Weather live preflight blocked signal=%s strategy=%s runtime_scope=%s reason_code=%s reason=%s",
+                weather_signal_id,
+                strategy_name,
+                runtime_scope,
+                reason_code,
+                error,
+            )
+        return payload
 
     if strategy_name.startswith("weather_exact_temp") and mode != "paper":
         log.warning(
@@ -624,36 +593,14 @@ def execute_weather_trade(signal, size_usd, mode=None, runtime_scope: str | None
             strategy_name,
         )
         return {
-            "ok": False,
-            "mode": mode,
-            "reason_code": "exact_temp_paper_only",
-            "error": "Exact-temperature weather execution remains paper-only.",
-            "strategy_name": strategy_name,
-            "weather_signal_id": weather_signal_id,
-            "runtime_scope": runtime_scope,
+            **_blocked("exact_temp_paper_only", "Exact-temperature weather execution remains paper-only."),
             "blocker_source": f"{runtime_scope}-weather",
-        }
-
-    horizon_check = _revalidate_weather_horizon(signal)
-    if not horizon_check["ok"]:
-        return {
-            "ok": False,
-            "mode": mode,
-            "reason_code": horizon_check.get("reason_code"),
-            "error": horizon_check.get("reason"),
-            "weather_signal_id": weather_signal_id,
-            "remaining_hours": horizon_check.get("remaining_hours"),
         }
 
     bal = check_balance(mode, runtime_scope=runtime_scope)
     if not bal["ok"]:
         return {
-            "ok": False,
-            "mode": mode,
-            "reason_code": "balance_check_failed",
-            "error": f"Balance check failed: {bal.get('error')}",
-            "weather_signal_id": weather_signal_id,
-            "runtime_scope": runtime_scope,
+            **_blocked("balance_check_failed", f"Balance check failed: {bal.get('error')}"),
             "blocker_source": "shared-external" if mode == "live" else f"{runtime_scope}-weather",
         }
     quarter_kelly_capped = False
@@ -668,13 +615,11 @@ def execute_weather_trade(signal, size_usd, mode=None, runtime_scope: str | None
         )
     if bal["balance_usd"] < size_usd:
         return {
-            "ok": False,
-            "mode": mode,
-            "reason_code": "insufficient_cash",
-            "error": f"Insufficient balance: ${bal['balance_usd']:.2f} < ${size_usd:.2f}",
-            "paper_account": bal.get("paper_account"),
-            "weather_signal_id": weather_signal_id,
-            "runtime_scope": runtime_scope,
+            **_blocked(
+                "insufficient_cash",
+                f"Insufficient balance: ${bal['balance_usd']:.2f} < ${size_usd:.2f}",
+                paper_account=bal.get("paper_account"),
+            ),
             "blocker_source": f"{runtime_scope}-weather",
         }
 
@@ -686,29 +631,28 @@ def execute_weather_trade(signal, size_usd, mode=None, runtime_scope: str | None
     )
     if not decision["ok"]:
         return {
-            "ok": False,
-            "mode": mode,
-            "reason_code": decision.get("reason_code"),
-            "error": decision.get("reason"),
-            "decision": decision,
-            "weather_signal_id": weather_signal_id,
-            "strategy_name": strategy_name,
-            "runtime_scope": runtime_scope,
+            **_blocked(
+                decision.get("reason_code"),
+                decision.get("reason"),
+                decision=decision,
+            ),
             "blocker_source": decision.get("blocker_source"),
             "blocker_runtime_scope": decision.get("blocker_runtime_scope"),
         }
 
+    log.info(
+        "Opening weather trade: signal=%s strategy=%s size=$%.2f mode=%s runtime_scope=%s",
+        weather_signal_id,
+        strategy_name,
+        size_usd,
+        mode,
+        runtime_scope,
+    )
+
     if mode == "paper":
         trade_id = db.open_weather_trade(weather_signal_id, size_usd=size_usd, mode=mode, runtime_scope=runtime_scope)
         if not trade_id:
-            return {
-                "ok": False,
-                "mode": "paper",
-                "reason_code": "open_failed",
-                "error": "Weather trade could not be opened after preflight passed.",
-                "weather_signal_id": weather_signal_id,
-                "strategy_name": strategy_name,
-            }
+            return _blocked("open_failed", "Weather trade could not be opened after preflight passed.")
 
         account = db.get_paper_account_state(refresh_unrealized=False, runtime_scope=runtime_scope)
         return {
@@ -741,13 +685,7 @@ def execute_weather_trade(signal, size_usd, mode=None, runtime_scope: str | None
     entry_token = decision.get("entry_token")
     if not entry_token:
         return {
-            "ok": False,
-            "mode": "live",
-            "reason_code": "token_missing",
-            "error": "Weather signal lacks an entry token.",
-            "weather_signal_id": weather_signal_id,
-            "strategy_name": strategy_name,
-            "runtime_scope": runtime_scope,
+            **_blocked("token_missing", "Weather signal lacks an entry token."),
             "blocker_source": f"{runtime_scope}-weather",
         }
 
@@ -758,25 +696,18 @@ def execute_weather_trade(signal, size_usd, mode=None, runtime_scope: str | None
     )
     if not slippage.get("ok"):
         return {
-            "ok": False,
-            "mode": "live",
-            "reason_code": "slippage_block",
-            "error": slippage.get("reason"),
-            "weather_signal_id": weather_signal_id,
-            "strategy_name": strategy_name,
-            "slippage": slippage,
-            "runtime_scope": runtime_scope,
+            **_blocked("slippage_block", slippage.get("reason"), slippage=slippage),
             "blocker_source": "shared-external",
         }
 
     try:
         from py_clob_client.client import ClobClient
     except ImportError:
-        return {"ok": False, "error": "py-clob-client not installed", "mode": "live"}
+        return _blocked("clob_client_unavailable", "py-clob-client not installed")
 
     private_key = runtime_config.get("POLYMARKET_PRIVATE_KEY")
     if not private_key:
-        return {"ok": False, "error": "POLYMARKET_PRIVATE_KEY not set", "mode": "live"}
+        return _blocked("private_key_missing", "POLYMARKET_PRIVATE_KEY not set")
 
     try:
         client = ClobClient(host="https://clob.polymarket.com", key=private_key, chain_id=137)

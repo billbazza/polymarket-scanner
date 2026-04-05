@@ -1924,12 +1924,19 @@ def _build_slot_limit_state(
             reason_code=weather_phase.get("reason_code") or weather_status,
             reason=weather_phase.get("reason") or "Weather candidates were capped by the penny max-open budget in the last cycle.",
         )
+    elif weather_status in {"blocked_preflight", "enabled_with_preflight_blocks"}:
+        state["strategies"]["weather"] = _strategy_slot_limit_status(
+            "weather",
+            status="blocked" if weather_status == "blocked_preflight" else "limited",
+            reason_code=weather_phase.get("reason_code") or weather_status,
+            reason=weather_phase.get("reason") or "Weather admission blocked one or more candidates before execution in the last cycle.",
+        )
     elif int(weather_phase.get("live_safeguard_veto_count") or 0) > 0:
         veto_status = "limited" if int((weather_phase.get("result_counts") or {}).get("traded") or 0) > 0 else "blocked"
         state["strategies"]["weather"] = _strategy_slot_limit_status(
             "weather",
             status=veto_status,
-            reason_code=weather_phase.get("reason_code") or "live_safeguard_vetoed",
+            reason_code=weather_phase.get("primary_live_veto_reason_code") or weather_phase.get("reason_code") or "live_safeguard_vetoed",
             reason=weather_phase.get("reason") or "Weather live safeguards vetoed one or more penny trade attempts in the last cycle.",
         )
     if any(item.get("status") in {"blocked", "limited"} for item in state["strategies"].values()):
