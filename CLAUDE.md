@@ -45,7 +45,7 @@ Monitoring:    log_setup.py → logs/scanner.log + logs/journal.jsonl (trade aud
 ## Key Conventions
 
 ### Module Pattern
-Every module follows: docstring → imports → `log = logging.getLogger("scanner.<name>")` → functions. Entry points call `init_logging()` and `load_dotenv()`. Library modules do neither.
+Every module follows: docstring → imports → `log = logging.getLogger("scanner.<name>")` → functions. Entry points call `init_logging()` and `runtime_config.log_runtime_status(...)`. Library modules do neither.
 
 ### API Clients
 - `api.py` — synchronous (requests), used by scanner.py and cron_scan.py
@@ -57,7 +57,7 @@ Every opportunity flows: scanner finds pair → `math_engine.score_opportunity()
 
 ### Trading Modes
 - **Paper** (default): simulates against current prices, tracks in SQLite. There are no limits on numbers of trades while in paper mode. Autonomy now derives `mode="paper"` explicitly from the normalized `level` string so paper-level cointegration trades never invoke `brain.validate_signal()`; the system logs a `brain_validation_skipped` journal entry for each admitted A+ cohort signal, making the math-only trade path auditable while still enforcing slippage and balance checks.
-- **Live**: requires `POLYMARKET_PRIVATE_KEY` in `.env`, uses py-clob-client
+- **Live**: requires `POLYMARKET_PRIVATE_KEY` in the macOS Keychain (or an explicit per-process env override), uses py-clob-client
 
 ### Database
 SQLite at `scanner.db`. Schema auto-migrates on import via `db.init_db()`. New columns added via ALTER TABLE with try/except. `get_trades()`/`get_trade()` use LEFT JOIN to both `signals` and `weather_signals` so both trade types are returned correctly.
@@ -65,7 +65,7 @@ SQLite at `scanner.db`. Schema auto-migrates on import via `db.init_db()`. New c
 ## Rules
 
 ### Never Do
-- Hardcode API keys or private keys anywhere. Always use `.env` via python-dotenv.
+- Hardcode API keys or private keys anywhere. Use the macOS Keychain via `runtime_config.py`; only use process env overrides for tests or short-lived operator runs.
 - Use `eval()` for JSON parsing. Always `json.loads()`.
 - Skip error recovery on API calls. Every external call needs try/except.
 - Commit `.env` or `scanner.db` to git.
@@ -149,8 +149,9 @@ launchctl load ~/Library/LaunchAgents/com.polymarket.scanner.plist
 - When adding new API endpoints → read `guides/api-patterns.md`
 - When debugging scan failures → check `logs/scanner.log` first, then `logs/cron.log`
 
-## Environment Variables
-All in `.env` (see `.env.example`):
+## Runtime Config
+Primary source: macOS Keychain service `polymarket-scanner` (override with `SCANNER_KEYCHAIN_SERVICE`).
+Process environment variables with the same names remain valid as explicit one-shot overrides for tests, CI, or emergency local runs.
 - `BRAIN_PROVIDER` — `auto` prefers Anthropic while credits remain, then falls forward to OpenAI and finally xAI/Grok; `anthropic`, `openai`, or `xai` pins the provider.
 - `ANTHROPIC_API_KEY` — enables Anthropic as the current/default brain provider
 - `OPENAI_API_KEY` — enables OpenAI/Codex as warm standby or cutover provider for brain.py

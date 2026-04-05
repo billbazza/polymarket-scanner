@@ -39,22 +39,22 @@ echo "[4/7] Installing Python dependencies..."
 cd "$INSTALL_DIR"
 pip3 install -r requirements.txt
 
-# Set up .env
-echo "[5/7] Setting up environment file..."
+# Set up fallback environment file for non-Keychain/systemd deploys
+echo "[5/7] Setting up fallback environment file..."
 if [ ! -f "$INSTALL_DIR/.env" ]; then
     if [ -f "$INSTALL_DIR/.env.example" ]; then
         cp "$INSTALL_DIR/.env.example" "$INSTALL_DIR/.env"
         chown scanner:scanner "$INSTALL_DIR/.env"
         chmod 600 "$INSTALL_DIR/.env"
-        echo "       Copied .env.example to .env"
+        echo "       Copied Keychain migration reference to .env (env overrides still work)"
     else
         touch "$INSTALL_DIR/.env"
         chown scanner:scanner "$INSTALL_DIR/.env"
         chmod 600 "$INSTALL_DIR/.env"
-        echo "       Created empty .env"
+        echo "       Created empty .env override file"
     fi
 else
-    echo "       .env already exists, skipping"
+    echo "       .env override file already exists, skipping"
 fi
 
 # Install systemd services
@@ -75,7 +75,8 @@ echo ""
 echo "=== Setup complete ==="
 echo ""
 echo "Next steps:"
-echo "  1. Edit /opt/polymarket-scanner/.env with your API keys and config"
+echo "  1. Preferred on macOS: store runtime config in the Keychain service polymarket-scanner"
+echo "     Fallback for systemd/Linux: export env vars or populate /opt/polymarket-scanner/.env"
 echo "  2. Start the API server:   systemctl start polymarket-scanner"
 echo "  3. Start the cron timer:   systemctl start polymarket-cron.timer"
 echo "  4. Check status:           systemctl status polymarket-scanner"

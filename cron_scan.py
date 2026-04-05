@@ -7,8 +7,6 @@ Usage:
 
 Called by cron every 30 minutes. Logs to logs/scanner.log.
 """
-from dotenv import load_dotenv
-load_dotenv()
 
 import json
 import sys
@@ -21,9 +19,11 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from log_setup import init_logging
 import logging
+import runtime_config
 
 init_logging()
 log = logging.getLogger("scanner.cron")
+runtime_config.log_runtime_status("cron_scan.py")
 
 import db
 import scanner

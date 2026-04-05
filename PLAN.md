@@ -4,7 +4,7 @@
 Tiers 1-3 built. All modules import clean. Cron scanning every 30min via launchd.
 23 signals in DB from 2 scans. Dashboard live on :8899.
 
-To activate live features: set keys in `.env` (see `.env.example`).
+To activate live features: store keys in the macOS Keychain service `polymarket-scanner` or inject matching env vars explicitly for non-Keychain deployments.
 
 ---
 
@@ -30,7 +30,7 @@ To activate live features: set keys in `.env` (see `.env.example`).
 ## Tier 3 — Execution (DONE — needs keys to activate)
 - [x] execution.py — paper/live trading, GTC orders, balance pre-checks
 - [x] blockchain.py — web3.py + Polygon RPC (Alchemy), USDC.e balance
-- [x] python-dotenv — all entry points load .env
+- [x] runtime_config — entry points log redacted Keychain/env runtime status
 - [x] tracker.py — live price refresh, snapshot saving, auto-close on reversion
 - [x] deploy/ — systemd service + timer + VPS setup script
 

@@ -361,8 +361,8 @@ def run_discovery(
 
 if __name__ == "__main__":
     from log_setup import init_logging
-    from dotenv import load_dotenv
-    load_dotenv()
+    import runtime_config
     init_logging()
+    runtime_config.log_runtime_status("wallet_discovery.py")
     result = run_discovery(n_markets=30, auto_add=False, verbose=True)
     print(result)

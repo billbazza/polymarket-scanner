@@ -8,8 +8,6 @@ Usage:
     python scan.py --top 5                  # show top 5 only
     python scan.py --min-liquidity 10000    # higher liquidity filter
 """
-from dotenv import load_dotenv
-load_dotenv()
 
 import argparse
 import json
@@ -17,9 +15,11 @@ import sys
 from datetime import datetime
 
 from log_setup import init_logging
+import runtime_config
 from scanner import scan, format_opportunity
 
 init_logging()
+runtime_config.log_runtime_status("scan.py")
 
 
 def main():

@@ -7,11 +7,11 @@ unit/precision regime. It does not alter the existing threshold scanner.
 import json
 import logging
 import math
-import os
 import time
 from datetime import date
 
 import api
+import runtime_config
 import weather_scanner
 import weather_sources
 import weather_settlement
@@ -29,7 +29,7 @@ AUTOTRADE_ENV = "WEATHER_EXACT_TEMP_AUTOTRADE"
 
 def exact_temp_enabled(default=False):
     """Return True when exact-temperature scans are explicitly enabled."""
-    raw = os.environ.get(ENABLE_ENV)
+    raw = runtime_config.get_raw(ENABLE_ENV)
     if raw is None:
         return bool(default)
     return str(raw).strip().lower() in {"1", "true", "yes", "on"}
@@ -37,7 +37,7 @@ def exact_temp_enabled(default=False):
 
 def exact_temp_autotrade_enabled(default=False):
     """Return True when autonomy may paper-trade exact-temperature signals."""
-    raw = os.environ.get(AUTOTRADE_ENV)
+    raw = runtime_config.get_raw(AUTOTRADE_ENV)
     if raw is None:
         return bool(default)
     return str(raw).strip().lower() in {"1", "true", "yes", "on"}

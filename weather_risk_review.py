@@ -3,10 +3,11 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
+
+import runtime_config
 
 log = logging.getLogger("scanner.weather_review")
 
@@ -15,7 +16,7 @@ _DEFAULT_CONFIG_PATH = Path(__file__).resolve().parent / "reports" / "diagnostic
 
 
 def _config_path() -> Path:
-    env_path = os.environ.get(_CONFIG_ENV)
+    env_path = runtime_config.get_raw(_CONFIG_ENV)
     if env_path:
         return Path(env_path)
     return _DEFAULT_CONFIG_PATH

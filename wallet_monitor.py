@@ -843,9 +843,9 @@ def get_status() -> dict:
 
 if __name__ == "__main__":
     import log_setup
-    from dotenv import load_dotenv
-    load_dotenv()
+    import runtime_config
     log_setup.init_logging()
+    runtime_config.log_runtime_status("wallet_monitor.py")
 
     print("Scoring watched wallets...\n")
     for address, label in _get_active_wallets().items():

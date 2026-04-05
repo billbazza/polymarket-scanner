@@ -1,6 +1,4 @@
 """FastAPI backend — REST API + serves dashboard."""
-from dotenv import load_dotenv
-load_dotenv()
 
 import asyncio
 import json
@@ -22,11 +20,13 @@ import scanner
 import brain
 import cointegration_trial
 import perplexity
+import runtime_config
 import trade_monitor
 from log_setup import init_logging
 
 init_logging()
 log = logging.getLogger("scanner.server")
+runtime_config.log_runtime_status("server.py")
 
 
 @asynccontextmanager

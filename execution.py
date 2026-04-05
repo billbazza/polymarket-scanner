@@ -4,12 +4,12 @@ Paper mode (default): simulates orders against current midpoint prices.
 Live mode: uses py-clob-client for real orders on Polymarket (requires POLYMARKET_PRIVATE_KEY).
 """
 import logging
-import os
 import time
 
 import api
 import db
 import math_engine
+import runtime_config
 import weather_guard_state
 
 log = logging.getLogger("scanner.execution")
@@ -20,7 +20,7 @@ WHALE_MAX_SLIPPAGE_PCT = 2.0
 
 # Execution mode: "maker" (GTC limit orders, 0% fee) or "taker" (market orders, 2% fee).
 # Default is maker — post inside the spread, pay no fees, capture better prices.
-EXECUTION_MODE = os.environ.get("EXECUTION_MODE", "maker")
+EXECUTION_MODE = runtime_config.get("EXECUTION_MODE", "maker")
 
 # How far inside the spread we post our limit (fraction of half-spread).
 # 0.5 = halfway between mid and best bid/ask.
@@ -32,9 +32,7 @@ ORDER_TTL_HOURS = 4
 
 def _stage2_enabled():
     """Return True when Stage 2 polygon gating instrumentation is active."""
-    return os.environ.get("STAGE2_POLYGON_GATING", "").strip().lower() in {
-        "1", "true", "yes", "on",
-    }
+    return runtime_config.get_bool("STAGE2_POLYGON_GATING", default=False)
 
 
 def _fetch_stage2_rollout():
@@ -52,7 +50,7 @@ def _fetch_stage2_rollout():
 
 def _get_mode():
     """Determine trading mode from environment."""
-    key = os.environ.get("POLYMARKET_PRIVATE_KEY", "")
+    key = runtime_config.get("POLYMARKET_PRIVATE_KEY")
     if key:
         return "live"
     return "paper"
@@ -858,7 +856,7 @@ def _execute_live(signal, size_usd, price_a, price_b,
         log.error("py-clob-client not installed. Run: pip install py-clob-client")
         return {"ok": False, "error": "py-clob-client not installed", "mode": "live"}
 
-    private_key = os.environ.get("POLYMARKET_PRIVATE_KEY", "")
+    private_key = runtime_config.get("POLYMARKET_PRIVATE_KEY")
     if not private_key:
         log.error("POLYMARKET_PRIVATE_KEY not set")
         return {"ok": False, "error": "POLYMARKET_PRIVATE_KEY not set", "mode": "live"}
@@ -1006,7 +1004,7 @@ def place_gtc_order(token_id, side, price, size_shares, mode=None):
     except ImportError:
         return {"ok": False, "error": "py-clob-client not installed", "mode": "live"}
 
-    private_key = os.environ.get("POLYMARKET_PRIVATE_KEY", "")
+    private_key = runtime_config.get("POLYMARKET_PRIVATE_KEY")
     if not private_key:
         return {"ok": False, "error": "POLYMARKET_PRIVATE_KEY not set", "mode": "live"}
 
@@ -1062,7 +1060,7 @@ def cancel_order(order_id, mode=None):
     except ImportError:
         return {"ok": False, "error": "py-clob-client not installed", "mode": "live"}
 
-    private_key = os.environ.get("POLYMARKET_PRIVATE_KEY", "")
+    private_key = runtime_config.get("POLYMARKET_PRIVATE_KEY")
     if not private_key:
         return {"ok": False, "error": "POLYMARKET_PRIVATE_KEY not set", "mode": "live"}
 
@@ -1127,7 +1125,7 @@ def manage_open_orders():
         else:  # live mode — query exchange for fill status
             try:
                 from py_clob_client.client import ClobClient
-                private_key = os.environ.get("POLYMARKET_PRIVATE_KEY", "")
+                private_key = runtime_config.get("POLYMARKET_PRIVATE_KEY")
                 client = ClobClient("https://clob.polymarket.com",
                                     key=private_key, chain_id=137)
                 order_data = client.get_order(order["order_id"])

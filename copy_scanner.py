@@ -221,9 +221,9 @@ def _print_analysis(r: dict) -> None:
 
 if __name__ == "__main__":
     import log_setup
-    from dotenv import load_dotenv
-    load_dotenv()
+    import runtime_config
     log_setup.init_logging()
+    runtime_config.log_runtime_status("copy_scanner.py")
 
     parser = argparse.ArgumentParser(description="Polymarket copy trader — wallet analysis")
     parser.add_argument("--wallet", help="Single wallet address to analyse")

@@ -1,13 +1,13 @@
 """Route-level authorization helpers for the FastAPI server."""
-import os
-
 from fastapi import Header, HTTPException, Request, status
+
+import runtime_config
 
 _LOCAL_HOSTS = {"127.0.0.1", "::1", "localhost", None}
 
 
 def _configured_keys():
-    raw = os.environ.get("SCANNER_API_KEYS", "").strip()
+    raw = runtime_config.get("SCANNER_API_KEYS", "")
     if raw:
         keys = {}
         for chunk in raw.split(","):
@@ -21,7 +21,7 @@ def _configured_keys():
             keys[key.strip()] = scope.strip()
         return keys
 
-    fallback = os.environ.get("SCANNER_API_KEY", "").strip()
+    fallback = runtime_config.get("SCANNER_API_KEY", "")
     return {fallback: "admin"} if fallback else {}
 
 
@@ -33,7 +33,7 @@ def _scope_allows(actual_scope: str, required_scope: str) -> bool:
 def _authorize(request: Request, provided_key: str | None, required_scope: str) -> None:
     allowed_cf_emails = {
         email.strip().lower()
-        for email in os.environ.get("SCANNER_CF_ACCESS_EMAILS", "").split(",")
+        for email in runtime_config.get("SCANNER_CF_ACCESS_EMAILS", "").split(",")
         if email.strip()
     }
     cf_email = (request.headers.get("CF-Access-Authenticated-User-Email") or "").strip().lower()

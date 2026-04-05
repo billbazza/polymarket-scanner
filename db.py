@@ -2,15 +2,15 @@
 import json
 import logging
 import math
-import os
 import sqlite3
 import threading
 import time
 from pathlib import Path
 
+import runtime_config
 import weather_risk_review
 
-DB_PATH = Path(os.environ.get("SCANNER_DB_PATH", Path(__file__).parent / "scanner.db"))
+DB_PATH = runtime_config.get_path("SCANNER_DB_PATH", Path(__file__).parent / "scanner.db")
 _INIT_LOCK = threading.Lock()
 _DB_INITIALIZED = False
 log = logging.getLogger("scanner.db")

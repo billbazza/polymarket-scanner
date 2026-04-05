@@ -5,13 +5,12 @@ import argparse
 import json
 from pathlib import Path
 
-from dotenv import load_dotenv
-
 from log_setup import init_logging
+import runtime_config
 import weather_correction
 
-load_dotenv()
 init_logging()
+runtime_config.log_runtime_status("weather_backtest.py")
 
 
 def main():

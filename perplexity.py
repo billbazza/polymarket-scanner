@@ -11,9 +11,10 @@ Degrades gracefully if PERPLEXITY_API_KEY is not set.
 import hashlib
 import json
 import logging
-import os
 import time
 from pathlib import Path
+
+import runtime_config
 
 log = logging.getLogger("scanner.perplexity")
 
@@ -83,7 +84,7 @@ _PERPLEXITY_CACHE = _load_cache()
 
 def _get_client():
     """Get OpenAI-compatible client pointed at Perplexity. Returns None if no key."""
-    api_key = os.environ.get("PERPLEXITY_API_KEY")
+    api_key = runtime_config.get("PERPLEXITY_API_KEY")
     if not api_key:
         log.debug("No PERPLEXITY_API_KEY set — research disabled")
         return None
@@ -184,7 +185,7 @@ def research_signal(signal):
 
 def is_available():
     """Check if Perplexity is configured and usable."""
-    return bool(os.environ.get("PERPLEXITY_API_KEY"))
+    return bool(runtime_config.get("PERPLEXITY_API_KEY"))
 
 
 def _build_evaluation_prompt(signal, research_context):

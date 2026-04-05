@@ -20,8 +20,6 @@ Usage:
 
 Called by LaunchAgent every 30 minutes alongside the scan.
 """
-from dotenv import load_dotenv
-load_dotenv()
 
 import argparse
 import json
@@ -32,11 +30,14 @@ import time
 from datetime import datetime
 from pathlib import Path
 
+import runtime_config
+
 sys.path.insert(0, str(Path(__file__).parent))
 
 from log_setup import init_logging
 init_logging()
 log = logging.getLogger("scanner.autonomy")
+runtime_config.log_runtime_status("autonomy.py")
 
 import asyncio
 import db
@@ -1656,7 +1657,7 @@ def promote(state):
     if next_level in ("penny", "book"):
         print(f"\n{'!'*60}")
         print(f"  WARNING: {next_config['name']} uses REAL MONEY (${next_config.get('size_usd', 'Kelly')} per trade)")
-        print(f"  Requires POLYMARKET_PRIVATE_KEY in .env")
+        print(f"  Requires POLYMARKET_PRIVATE_KEY in the macOS Keychain or an explicit env override")
         print(f"{'!'*60}")
 
     if not can_graduate:

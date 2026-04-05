@@ -5,8 +5,9 @@ when web3 is not installed or keys are not configured.
 """
 import json
 import logging
-import os
 import requests
+
+import runtime_config
 
 log = logging.getLogger("scanner.blockchain")
 
@@ -42,7 +43,7 @@ ERC20_ABI = [
 
 def _get_rpc_url():
     """Get the Alchemy RPC URL."""
-    api_key = os.environ.get("ALCHEMY_API_KEY", "")
+    api_key = runtime_config.get("ALCHEMY_API_KEY")
     if not api_key:
         return None
     return f"https://polygon-mainnet.g.alchemy.com/v2/{api_key}"
@@ -157,7 +158,7 @@ def get_wallet_address():
     Returns:
         Checksummed address string, or None if key not configured.
     """
-    private_key = os.environ.get("POLYMARKET_PRIVATE_KEY", "")
+    private_key = runtime_config.get("POLYMARKET_PRIVATE_KEY")
     if not private_key:
         log.debug("POLYMARKET_PRIVATE_KEY not set, no wallet address available")
         return None
@@ -221,7 +222,7 @@ def approve_token(spender, amount):
     if not w3:
         return {"ok": False, "error": "Web3 not available"}
 
-    private_key = os.environ.get("POLYMARKET_PRIVATE_KEY", "")
+    private_key = runtime_config.get("POLYMARKET_PRIVATE_KEY")
     if not private_key:
         return {"ok": False, "error": "POLYMARKET_PRIVATE_KEY not set"}
 

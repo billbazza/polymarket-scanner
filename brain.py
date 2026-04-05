@@ -8,8 +8,9 @@ Supports staged provider migration:
 """
 import json
 import logging
-import os
 from pathlib import Path
+
+import runtime_config
 
 log = logging.getLogger("scanner.brain")
 
@@ -38,8 +39,8 @@ DEFAULT_MODEL_ALIASES = {
 
 
 def _env_value(name: str) -> str:
-    """Read an env var once and normalize surrounding whitespace."""
-    return (os.environ.get(name) or "").strip()
+    """Read runtime config once and normalize surrounding whitespace."""
+    return runtime_config.get(name)
 
 
 def _model_aliases() -> dict[str, dict[str, str]]:

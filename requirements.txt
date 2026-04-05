@@ -8,5 +8,4 @@ fastapi
 uvicorn
 anthropic
 openai
-python-dotenv
 xai_sdk
