@@ -90,6 +90,51 @@ class RuntimeScopeSplitTests(unittest.TestCase):
         )
         return signal_id, paper_trade_id, penny_trade_id
 
+    def _weather_signal(self, yes_token: str, no_token: str, market: str) -> dict:
+        return {
+            "event": f"{market} event",
+            "market": market,
+            "strategy_name": "weather_threshold",
+            "market_family": "weather_threshold",
+            "market_id": market.lower().replace(" ", "-"),
+            "yes_token": yes_token,
+            "no_token": no_token,
+            "city": "new york",
+            "lat": 40.7128,
+            "lon": -74.0060,
+            "target_date": "2026-04-06",
+            "threshold_f": 80.0,
+            "direction": "above",
+            "resolution_source": "wunderground_history",
+            "station_id": "KNYC",
+            "station_label": "New York City",
+            "settlement_unit": "F",
+            "settlement_precision": 1.0,
+            "station_timezone": "America/New_York",
+            "outcome_label": "80F or higher",
+            "market_price": 0.35,
+            "hours_ahead": 72,
+            "timestamp": 1710000000,
+            "liquidity": 8000,
+            "ev_pct": 8.0,
+            "kelly_fraction": 0.08,
+            "action": "BUY_YES",
+            "tradeable": True,
+            "noaa_forecast_f": 81.0,
+            "noaa_prob": 0.52,
+            "noaa_sigma_f": 2.1,
+            "om_forecast_f": 80.0,
+            "om_prob": 0.54,
+            "combined_prob": 0.53,
+            "combined_edge": 0.18,
+            "combined_edge_pct": 18.0,
+            "selected_prob": 0.53,
+            "selected_edge": 0.18,
+            "selected_edge_pct": 18.0,
+            "sources_agree": True,
+            "sources_available": 2,
+        }
+
     def test_scoped_trade_open_checks_and_accounting_are_isolated(self):
         signal_id, paper_trade_id, penny_trade_id = self._seed_scoped_pairs_trades()
 
@@ -713,6 +758,7 @@ class RuntimeScopeSplitTests(unittest.TestCase):
         self.assertIn("runtimeScopedUrl('/api/trades', { status: 'closed', limit: 500 }, scope)", html)
         self.assertIn("fetch(API + runtimeScopedUrl('/api/autonomy/runtime', {}, scope))", html)
         self.assertIn("fetch(API + runtimeScopedUrl('/api/runtime/account', {}, scope))", html)
+        self.assertIn("fetch(API + runtimeScopedUrl('/api/weather', { limit: 100, tradeable_only: tradeable }, ACTIVE_RUNTIME_SCOPE))", html)
         self.assertIn("if (requestId !== SCOPE_REQUEST_SEQ.history || scope !== ACTIVE_RUNTIME_SCOPE) return;", html)
         self.assertIn("if (requestId !== SCOPE_REQUEST_SEQ.stats || scope !== ACTIVE_RUNTIME_SCOPE) return;", html)
         self.assertIn("LIVE / POLYGON WALLET VERIFIED", html)
@@ -725,6 +771,28 @@ class RuntimeScopeSplitTests(unittest.TestCase):
         self.assertIn("Penny Max Open Trades", html)
         self.assertIn("Changes save immediately to the live penny scope and are appended to the audit journal.", html)
         self.assertIn("const auditAction = data?.audit_entry?.action === 'runtime_controls_update_noop'", html)
+
+    def test_weather_api_annotations_are_runtime_scoped(self):
+        paper_signal_id = self.db.save_weather_signal(self._weather_signal("scope-yes", "scope-no", "Paper weather"))
+        paper_trade_id = self.db.open_weather_trade(
+            paper_signal_id,
+            size_usd=20,
+            runtime_scope=self.db.RUNTIME_SCOPE_PAPER,
+        )
+        self.assertIsNotNone(paper_trade_id)
+        self.db.close_trade(paper_trade_id, exit_price_a=1.0, notes="Paper weather close")
+
+        penny_signal_id = self.db.save_weather_signal(self._weather_signal("scope-yes", "scope-no", "Penny weather"))
+        paper_rows = self.client.get("/api/weather?runtime_scope=paper").json()
+        penny_rows = self.client.get("/api/weather?runtime_scope=penny").json()
+
+        paper_row = next(row for row in paper_rows if row["id"] == penny_signal_id)
+        penny_row = next(row for row in penny_rows if row["id"] == penny_signal_id)
+
+        self.assertEqual(paper_row["blocking_reason_code"], "token_already_closed")
+        self.assertEqual(paper_row["blocking_source"], "paper-weather")
+        self.assertIsNone(penny_row["blocking_reason_code"])
+        self.assertIsNone(penny_row["blocking_source"])
 
 
 if __name__ == "__main__":

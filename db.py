@@ -952,6 +952,48 @@ def _migration_018_weather_token_probation(conn):
     """)
 
 
+def _migration_023_weather_token_probation_runtime_scope(conn):
+    if not _table_exists(conn, "weather_token_probation"):
+        _migration_018_weather_token_probation(conn)
+    columns = {row["name"] for row in conn.execute("PRAGMA table_info(weather_token_probation)").fetchall()}
+    if "runtime_scope" in columns:
+        conn.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_weather_token_probation_scope
+            ON weather_token_probation(token_id, runtime_scope)
+            """
+        )
+        return
+    conn.executescript(
+        f"""
+        ALTER TABLE weather_token_probation RENAME TO weather_token_probation_legacy;
+        CREATE TABLE weather_token_probation (
+            token_id TEXT NOT NULL,
+            runtime_scope TEXT NOT NULL DEFAULT '{RUNTIME_SCOPE_PAPER}',
+            reopen_count INTEGER DEFAULT 0,
+            last_reopened_at REAL,
+            last_closed_at REAL,
+            last_exit_reason TEXT,
+            PRIMARY KEY (token_id, runtime_scope)
+        );
+        INSERT INTO weather_token_probation (
+            token_id, runtime_scope, reopen_count, last_reopened_at, last_closed_at, last_exit_reason
+        )
+        SELECT
+            token_id,
+            '{RUNTIME_SCOPE_PAPER}',
+            reopen_count,
+            last_reopened_at,
+            last_closed_at,
+            last_exit_reason
+        FROM weather_token_probation_legacy;
+        DROP TABLE weather_token_probation_legacy;
+        CREATE UNIQUE INDEX idx_weather_token_probation_scope
+            ON weather_token_probation(token_id, runtime_scope);
+        """
+    )
+
+
 def _migration_019_signal_grade_field(conn):
     _add_column_if_missing(conn, "signals", "grade", "INTEGER")
 
@@ -996,6 +1038,7 @@ _MIGRATIONS = [
     ("019_signal_grade_field", _migration_019_signal_grade_field),
     ("021_runtime_scope_split", _migration_021_runtime_scope_split),
     ("022_live_trade_execution_fields", _migration_022_live_trade_execution_fields),
+    ("023_weather_token_probation_runtime_scope", _migration_023_weather_token_probation_runtime_scope),
 ]
 
 
@@ -2490,7 +2533,11 @@ def _decode_json_field(value):
         return value
 
 
-def _resolve_trade_state_fields(metadata: dict | None = None) -> dict:
+def _resolve_trade_state_fields(
+    metadata: dict | None = None,
+    *,
+    runtime_scope: str | None = None,
+) -> dict:
     metadata = metadata or {}
     default_scope = (
         RUNTIME_SCOPE_PENNY
@@ -2500,7 +2547,10 @@ def _resolve_trade_state_fields(metadata: dict | None = None) -> dict:
     return {
         "trade_state_mode": _normalize_trade_state_mode(metadata.get("trade_state_mode")),
         "reconciliation_mode": _normalize_reconciliation_mode(metadata.get("reconciliation_mode")),
-        "runtime_scope": normalize_runtime_scope(metadata.get("runtime_scope"), default=default_scope),
+        "runtime_scope": normalize_runtime_scope(
+            runtime_scope if runtime_scope is not None else metadata.get("runtime_scope"),
+            default=default_scope,
+        ),
         "canonical_ref": metadata.get("canonical_ref"),
         "external_position_id": metadata.get("external_position_id"),
         "external_order_id_a": metadata.get("external_order_id_a"),
@@ -2534,6 +2584,19 @@ def record_paper_trade_attempt(
         if not _table_exists(conn, "paper_trade_attempts"):
             log.warning("paper_trade_attempts table unavailable; skipping attempt log write")
             return 0
+        normalized_scope = normalize_runtime_scope(
+            runtime_scope,
+            default=(
+                RUNTIME_SCOPE_PENNY
+                if (autonomy_level or "").lower() in {"penny", "book"}
+                else RUNTIME_SCOPE_PAPER
+            ),
+        )
+        attempt_details = dict(details or {})
+        attempt_details.setdefault("attempt_runtime_scope", normalized_scope)
+        attempt_details.setdefault("attempt_strategy", strategy)
+        attempt_details.setdefault("attempt_source", f"{normalized_scope}-{strategy}")
+        attempt_details.setdefault("attempt_outcome", outcome)
 
         conn.execute(
             """
@@ -2558,17 +2621,10 @@ def record_paper_trade_attempt(
                 wallet.lower() if wallet else None,
                 condition_id,
                 autonomy_level,
-                normalize_runtime_scope(
-                    runtime_scope,
-                    default=(
-                        RUNTIME_SCOPE_PENNY
-                        if (autonomy_level or "").lower() in {"penny", "book"}
-                        else RUNTIME_SCOPE_PAPER
-                    ),
-                ),
+                normalized_scope,
                 phase,
                 round(float(size_usd), 2) if size_usd is not None else None,
-                json.dumps(details) if details else None,
+                json.dumps(attempt_details) if attempt_details else None,
             ),
         )
         row_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
@@ -3147,11 +3203,37 @@ def _paper_position_policy_dict() -> dict:
     }
 
 
+def _decision_audit_fields(
+    *,
+    runtime_scope: str | None,
+    decision_strategy: str,
+    history_trade: dict | None = None,
+) -> dict:
+    decision_scope = normalize_runtime_scope(runtime_scope)
+    history_scope = normalize_runtime_scope(
+        (history_trade or {}).get("runtime_scope"),
+        default=decision_scope,
+    )
+    history_strategy = _trade_strategy_key(history_trade) if history_trade else decision_strategy
+    return {
+        "runtime_scope": decision_scope,
+        "decision_strategy": decision_strategy,
+        "decision_source": f"{decision_scope}-{decision_strategy}",
+        "history_runtime_scope": history_scope,
+        "history_strategy": history_strategy,
+        "history_source": f"{history_scope}-{history_strategy}",
+    }
+
+
 def inspect_pairs_trade_open(signal_id, size_usd=100, conn=None, runtime_scope: str = RUNTIME_SCOPE_PAPER):
     """Return a structured pairs-trade open decision."""
     owns_conn = conn is None
     conn = conn or get_conn()
     runtime_scope = normalize_runtime_scope(runtime_scope)
+    audit_fields = _decision_audit_fields(
+        runtime_scope=runtime_scope,
+        decision_strategy="cointegration",
+    )
     try:
         sig = conn.execute("SELECT * FROM signals WHERE id=?", (signal_id,)).fetchone()
         if not sig:
@@ -3159,6 +3241,7 @@ def inspect_pairs_trade_open(signal_id, size_usd=100, conn=None, runtime_scope: 
                 "ok": False,
                 "reason_code": "signal_not_found",
                 "reason": f"Signal {signal_id} not found.",
+                **audit_fields,
                 **_paper_position_policy_dict(),
             }
 
@@ -3174,6 +3257,11 @@ def inspect_pairs_trade_open(signal_id, size_usd=100, conn=None, runtime_scope: 
                 "reason_code": "signal_already_open",
                 "reason": f"Signal {signal_id} is already open as trade #{trade_id}.",
                 "existing_trade_id": trade_id,
+                **_decision_audit_fields(
+                    runtime_scope=runtime_scope,
+                    decision_strategy="cointegration",
+                    history_trade=existing,
+                ),
                 **_paper_position_policy_dict(),
             }
 
@@ -3191,6 +3279,7 @@ def inspect_pairs_trade_open(signal_id, size_usd=100, conn=None, runtime_scope: 
                     "requested_size_usd": account_check["requested_size_usd"],
                     "shortfall_usd": account_check["shortfall_usd"],
                     "account": account_check["account"],
+                    **audit_fields,
                     **_paper_position_policy_dict(),
                 }
 
@@ -3204,6 +3293,7 @@ def inspect_pairs_trade_open(signal_id, size_usd=100, conn=None, runtime_scope: 
             "admission_path": sig["admission_path"],
             "experiment_name": sig["experiment_name"],
             "experiment_status": sig["experiment_status"],
+            **audit_fields,
             **_paper_position_policy_dict(),
         }
     finally:
@@ -3669,87 +3759,90 @@ def count_open_trades(runtime_scope: str | None = None) -> int:
     )
 
 
-def _fetch_weather_token_probation(conn, token_id):
+def _fetch_weather_token_probation(conn, token_id, runtime_scope: str | None = None):
     if not token_id:
         return None
+    scope = normalize_runtime_scope(runtime_scope)
     row = conn.execute(
         """
-        SELECT token_id, reopen_count, last_reopened_at, last_closed_at, last_exit_reason
+        SELECT token_id, runtime_scope, reopen_count, last_reopened_at, last_closed_at, last_exit_reason
         FROM weather_token_probation
-        WHERE token_id=?
+        WHERE token_id=? AND runtime_scope=?
         """,
-        (token_id,),
+        (token_id, scope),
     ).fetchone()
     return dict(row) if row else None
 
 
-def get_weather_token_probation(token_id, conn=None):
+def get_weather_token_probation(token_id, conn=None, runtime_scope: str | None = None):
     owns_conn = conn is None
     conn = conn or get_conn()
     try:
-        return _fetch_weather_token_probation(conn, token_id)
+        return _fetch_weather_token_probation(conn, token_id, runtime_scope=runtime_scope)
     finally:
         if owns_conn:
             conn.close()
 
 
-def _record_weather_token_close(conn, token_id, exit_reason, closed_at=None):
+def _record_weather_token_close(conn, token_id, exit_reason, closed_at=None, runtime_scope: str | None = None):
     if not token_id:
         return
+    scope = normalize_runtime_scope(runtime_scope)
     timestamp = closed_at if closed_at is not None else time.time()
     conn.execute(
         """
-        INSERT INTO weather_token_probation (token_id, last_closed_at, last_exit_reason)
-        VALUES (?, ?, ?)
-        ON CONFLICT(token_id) DO UPDATE SET
+        INSERT INTO weather_token_probation (token_id, runtime_scope, last_closed_at, last_exit_reason)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(token_id, runtime_scope) DO UPDATE SET
             last_closed_at=excluded.last_closed_at,
             last_exit_reason=excluded.last_exit_reason
         """,
-        (token_id, timestamp, exit_reason),
+        (token_id, scope, timestamp, exit_reason),
     )
 
 
-def record_weather_token_close(token_id, exit_reason):
+def record_weather_token_close(token_id, exit_reason, runtime_scope: str | None = None):
     conn = get_conn()
-    _record_weather_token_close(conn, token_id, exit_reason)
+    _record_weather_token_close(conn, token_id, exit_reason, runtime_scope=runtime_scope)
     conn.commit()
     conn.close()
 
 
-def _record_weather_token_reopen(conn, token_id, reopened_at=None):
+def _record_weather_token_reopen(conn, token_id, reopened_at=None, runtime_scope: str | None = None):
     if not token_id:
         return 0
+    scope = normalize_runtime_scope(runtime_scope)
     timestamp = reopened_at if reopened_at is not None else time.time()
     conn.execute(
         """
-        INSERT INTO weather_token_probation (token_id, reopen_count, last_reopened_at)
-        VALUES (?, 1, ?)
-        ON CONFLICT(token_id) DO UPDATE SET
+        INSERT INTO weather_token_probation (token_id, runtime_scope, reopen_count, last_reopened_at)
+        VALUES (?, ?, 1, ?)
+        ON CONFLICT(token_id, runtime_scope) DO UPDATE SET
             reopen_count = weather_token_probation.reopen_count + 1,
             last_reopened_at = excluded.last_reopened_at
         """,
-        (token_id, timestamp),
+        (token_id, scope, timestamp),
     )
-    row = _fetch_weather_token_probation(conn, token_id)
+    row = _fetch_weather_token_probation(conn, token_id, runtime_scope=scope)
     return int(row["reopen_count"] or 0) if row else 0
 
 
-def increment_weather_token_reopen(token_id):
+def increment_weather_token_reopen(token_id, runtime_scope: str | None = None):
     conn = get_conn()
-    count = _record_weather_token_reopen(conn, token_id)
+    count = _record_weather_token_reopen(conn, token_id, runtime_scope=runtime_scope)
     conn.commit()
     conn.close()
     return count
 
 
-def _evaluate_weather_token_reopen(conn, token_id, review):
+def _evaluate_weather_token_reopen(conn, token_id, review, runtime_scope: str | None = None):
     if not token_id or not review or not review.get("relax_token_guard"):
         return {"allowed": False}
     try:
         limit = int(review.get("probation_limit", DEFAULT_WEATHER_REOPEN_PROBATION_LIMIT))
     except (TypeError, ValueError):
         limit = DEFAULT_WEATHER_REOPEN_PROBATION_LIMIT
-    probation = _fetch_weather_token_probation(conn, token_id)
+    probation = _fetch_weather_token_probation(conn, token_id, runtime_scope=runtime_scope)
     reopen_count = int(probation.get("reopen_count") or 0) if probation else 0
     if reopen_count >= limit:
         return {
@@ -3788,6 +3881,10 @@ def inspect_weather_trade_open(
     owns_conn = conn is None
     conn = conn or get_conn()
     runtime_scope = normalize_runtime_scope(runtime_scope)
+    audit_fields = _decision_audit_fields(
+        runtime_scope=runtime_scope,
+        decision_strategy="weather",
+    )
     try:
         max_total_open = _normalize_optional_cap(max_total_open)
         sig = conn.execute(
@@ -3798,6 +3895,7 @@ def inspect_weather_trade_open(
                 "ok": False,
                 "reason_code": "signal_not_found",
                 "reason": f"Weather signal {weather_signal_id} not found.",
+                **audit_fields,
                 **_paper_position_policy_dict(),
             }
 
@@ -3808,9 +3906,9 @@ def inspect_weather_trade_open(
         entry_token = sig["yes_token"] if action == "BUY_YES" else sig["no_token"]
         existing_signal_trade_rows = conn.execute(
             """
-            SELECT id, status, trade_state_mode, reconciliation_mode, runtime_scope
+            SELECT id, status, trade_type, strategy_name, trade_state_mode, reconciliation_mode, runtime_scope
             FROM trades
-            WHERE weather_signal_id=? AND status='open' AND runtime_scope=?
+            WHERE weather_signal_id=? AND trade_type='weather' AND status='open' AND runtime_scope=?
             ORDER BY opened_at DESC, id DESC
             """,
             (weather_signal_id, runtime_scope),
@@ -3824,14 +3922,20 @@ def inspect_weather_trade_open(
                 "reason": f"Weather signal {weather_signal_id} is already open as trade #{trade_id}.",
                 "existing_trade_id": trade_id,
                 "entry_token": entry_token,
+                **_decision_audit_fields(
+                    runtime_scope=runtime_scope,
+                    decision_strategy="weather",
+                    history_trade=existing_signal_trade,
+                ),
                 **_paper_position_policy_dict(),
             }
 
         latest_signal_trade_rows = conn.execute(
             """
-            SELECT id, status, closed_at, exit_reason, trade_state_mode, reconciliation_mode, runtime_scope
+            SELECT id, status, trade_type, strategy_name, closed_at, exit_reason, trade_state_mode, reconciliation_mode, runtime_scope
             FROM trades
             WHERE weather_signal_id=?
+              AND trade_type='weather'
               AND runtime_scope=?
             ORDER BY opened_at DESC, id DESC
             """,
@@ -3849,6 +3953,11 @@ def inspect_weather_trade_open(
                 "latest_trade_status": "closed",
                 "latest_trade_exit_reason": detail,
                 "entry_token": entry_token,
+                **_decision_audit_fields(
+                    runtime_scope=runtime_scope,
+                    decision_strategy="weather",
+                    history_trade=latest_signal_trade,
+                ),
                 **_paper_position_policy_dict(),
             }
 
@@ -3856,7 +3965,7 @@ def inspect_weather_trade_open(
         if entry_token:
             existing_token_trade_rows = conn.execute(
                 """
-                SELECT id, weather_signal_id, status, trade_state_mode, reconciliation_mode, runtime_scope
+                SELECT id, weather_signal_id, trade_type, strategy_name, status, trade_state_mode, reconciliation_mode, runtime_scope
                 FROM trades
                 WHERE trade_type='weather' AND token_id_a=? AND status='open'
                   AND runtime_scope=?
@@ -3876,13 +3985,18 @@ def inspect_weather_trade_open(
                 "existing_trade_id": trade_id,
                 "existing_signal_id": other_signal_id,
                 "entry_token": entry_token,
+                **_decision_audit_fields(
+                    runtime_scope=runtime_scope,
+                    decision_strategy="weather",
+                    history_trade=existing_token_trade,
+                ),
                 **_paper_position_policy_dict(),
             }
         closed_token_trade = None
         if entry_token:
             closed_token_trade_rows = conn.execute(
                 """
-                SELECT id, weather_signal_id, closed_at, exit_reason, status,
+                SELECT id, weather_signal_id, trade_type, strategy_name, closed_at, exit_reason, status,
                        trade_state_mode, reconciliation_mode, runtime_scope
                 FROM trades
                 WHERE trade_type='weather' AND token_id_a=? AND status='closed'
@@ -3897,7 +4011,12 @@ def inspect_weather_trade_open(
             trade_id = int(closed_token_trade["id"])
             other_signal_id = closed_token_trade["weather_signal_id"]
             latest_reason = closed_token_trade["exit_reason"] or "Weather contract already completed."
-            reopen_decision = _evaluate_weather_token_reopen(conn, entry_token, review)
+            reopen_decision = _evaluate_weather_token_reopen(
+                conn,
+                entry_token,
+                review,
+                runtime_scope=runtime_scope,
+            )
             if not reopen_decision["allowed"]:
                 reason_code = reopen_decision.get("reason_code") or "token_already_closed"
                 reason = reopen_decision.get(
@@ -3917,6 +4036,11 @@ def inspect_weather_trade_open(
                     "latest_trade_status": "closed",
                     "latest_trade_exit_reason": latest_reason,
                     "entry_token": entry_token,
+                    **_decision_audit_fields(
+                        runtime_scope=runtime_scope,
+                        decision_strategy="weather",
+                        history_trade=closed_token_trade,
+                    ),
                     **_paper_position_policy_dict(),
                 }
             reopen_context = {
@@ -3926,14 +4050,17 @@ def inspect_weather_trade_open(
                 "review_name": reopen_decision.get("review_name"),
                 "reopen_count": reopen_decision.get("reopen_count"),
                 "probation_limit": reopen_decision.get("probation_limit"),
+                "runtime_scope": runtime_scope,
             }
             log.info(
-                "Weather token %s reopened on probation (%d/%d) review=%s mode=%s",
+                "Weather token %s reopened on probation (%d/%d) review=%s mode=%s runtime_scope=%s source=%s",
                 entry_token,
                 reopen_decision.get("reopen_count"),
                 reopen_decision.get("probation_limit"),
                 reopen_decision.get("review_id") or "approved",
                 mode,
+                runtime_scope,
+                f"{runtime_scope}-weather",
             )
 
         current_open = count_open_trades(runtime_scope=runtime_scope)
@@ -3943,6 +4070,7 @@ def inspect_weather_trade_open(
                 "reason_code": "max_open_reached",
                 "reason": f"At max open trades ({current_open}/{max_total_open}).",
                 "entry_token": entry_token,
+                **audit_fields,
                 **_paper_position_policy_dict(),
             }
 
@@ -3960,6 +4088,7 @@ def inspect_weather_trade_open(
                     "account": account_check["account"],
                     "available_cash": account_check["available_cash"],
                     "requested_size_usd": account_check["requested_size_usd"],
+                    **audit_fields,
                     **_paper_position_policy_dict(),
                 }
 
@@ -3975,6 +4104,7 @@ def inspect_weather_trade_open(
             "runtime_scope": runtime_scope,
             "requested_size_usd": round(float(size_usd), 2),
             "reopen_context": reopen_context,
+            **audit_fields,
             **_paper_position_policy_dict(),
         }
     finally:
@@ -4083,7 +4213,7 @@ def open_weather_trade(
     """
     conn = get_conn()
     metadata = metadata or {}
-    state_fields = _resolve_trade_state_fields(metadata)
+    state_fields = _resolve_trade_state_fields(metadata, runtime_scope=runtime_scope)
     decision = inspect_weather_trade_open(
         weather_signal_id,
         size_usd=size_usd,
@@ -4149,7 +4279,7 @@ def open_weather_trade(
     conn.execute("UPDATE weather_signals SET status='traded' WHERE id=?", (weather_signal_id,))
     reopen_context = decision.get("reopen_context")
     if reopen_context and token:
-        _record_weather_token_reopen(conn, token)
+        _record_weather_token_reopen(conn, token, runtime_scope=state_fields["runtime_scope"])
     conn.commit()
     conn.close()
     return trade_id
@@ -4234,7 +4364,7 @@ def close_trade(trade_id, exit_price_a, exit_price_b=None, notes="", metadata: d
             (trade["weather_signal_id"],),
         )
         if token_id:
-            _record_weather_token_close(conn, token_id, exit_reason)
+            _record_weather_token_close(conn, token_id, exit_reason, runtime_scope=trade["runtime_scope"])
     conn.commit()
     conn.close()
 
@@ -4597,9 +4727,10 @@ def save_weather_signal(opp):
     return row_id
 
 
-def get_weather_signals(limit=50, tradeable_only=False):
+def get_weather_signals(limit=50, tradeable_only=False, runtime_scope: str | None = None):
     """Fetch recent weather-edge opportunities, annotated with open trade id if one exists."""
     limit = _normalize_query_limit(limit, "get_weather_signals")
+    runtime_scope = normalize_runtime_scope(runtime_scope)
     base = """
         SELECT ws.*
         FROM weather_signals ws
@@ -4627,25 +4758,30 @@ def get_weather_signals(limit=50, tradeable_only=False):
             item = _deserialize_weather_signal_row(row)
             latest_trade = conn.execute(
                 """
-                SELECT id, status, closed_at, exit_reason
+                SELECT id, status, closed_at, exit_reason, runtime_scope, trade_type, strategy_name
                 FROM trades
-                WHERE weather_signal_id=?
+                WHERE weather_signal_id=? AND trade_type='weather' AND runtime_scope=?
                 ORDER BY opened_at DESC, id DESC
                 LIMIT 1
                 """,
-                (item["id"],),
+                (item["id"], runtime_scope),
             ).fetchone()
             exact_open_trade = conn.execute(
                 """
                 SELECT id
                 FROM trades
-                WHERE weather_signal_id=? AND status='open'
+                WHERE weather_signal_id=? AND trade_type='weather' AND status='open' AND runtime_scope=?
                 ORDER BY opened_at DESC, id DESC
                 LIMIT 1
                 """,
-                (item["id"],),
+                (item["id"], runtime_scope),
             ).fetchone()
-            decision = inspect_weather_trade_open(item["id"], size_usd=20, conn=conn)
+            decision = inspect_weather_trade_open(
+                item["id"],
+                size_usd=20,
+                conn=conn,
+                runtime_scope=runtime_scope,
+            )
             exact_open_trade_id = int(exact_open_trade["id"]) if exact_open_trade else None
             latest_trade_id = int(latest_trade["id"]) if latest_trade else None
             latest_trade_status = latest_trade["status"] if latest_trade else None
@@ -4672,6 +4808,9 @@ def get_weather_signals(limit=50, tradeable_only=False):
             item["can_open_trade"] = bool(item.get("tradeable")) and decision["ok"]
             item["blocking_reason"] = None if decision["ok"] else decision.get("reason")
             item["blocking_reason_code"] = None if decision["ok"] else decision.get("reason_code")
+            item["blocking_runtime_scope"] = None if decision["ok"] else decision.get("history_runtime_scope")
+            item["blocking_strategy"] = None if decision["ok"] else decision.get("history_strategy")
+            item["blocking_source"] = None if decision["ok"] else decision.get("history_source")
             item["entry_token"] = decision.get("entry_token")
             if exact_open_trade_id is not None:
                 item["status"] = "open"

@@ -1219,7 +1219,14 @@ def run_cycle(state):
                             token_id=decision.get("entry_token"),
                             size_usd=trade_size,
                             phase=current_stage,
-                            details={"paper_sizing": sizing_decision, "execution_mode": weather_phase["execution_mode"]},
+                            details={
+                                "paper_sizing": sizing_decision,
+                                "execution_mode": weather_phase["execution_mode"],
+                                "decision_source": decision.get("decision_source"),
+                                "history_source": decision.get("history_source"),
+                                "history_runtime_scope": decision.get("history_runtime_scope"),
+                                "history_strategy": decision.get("history_strategy"),
+                            },
                         )
                         journal({
                             "action": "skip_trade",
@@ -1228,6 +1235,8 @@ def run_cycle(state):
                             "event": w_opp.get("event", w_opp.get("market", ""))[:60],
                             "reason": decision["reason"],
                             "runtime_scope": runtime_scope,
+                            "decision_source": decision.get("decision_source"),
+                            "history_source": decision.get("history_source"),
                         })
                         continue
                     weather_signal_payload = {

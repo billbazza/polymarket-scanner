@@ -198,6 +198,181 @@ class WeatherSignalLifecycleTests(unittest.TestCase):
         self.assertFalse(final_decision["ok"])
         self.assertEqual(final_decision["reason_code"], "token_probation_blocked")
 
+    def test_penny_weather_history_is_isolated_from_paper_weather_history(self):
+        paper_signal_id = self.db.save_weather_signal(
+            _weather_opp(city="Chicago", market="Will Chicago hit 71F?", yes_token="yes-chi", no_token="no-chi")
+        )
+        paper_trade_id = self.db.open_weather_trade(
+            paper_signal_id,
+            size_usd=20,
+            runtime_scope=self.db.RUNTIME_SCOPE_PAPER,
+        )
+        self.assertIsNotNone(paper_trade_id)
+        self.db.close_trade(paper_trade_id, exit_price_a=1.0, notes="Paper close")
+
+        penny_signal_id = self.db.save_weather_signal(
+            _weather_opp(city="Chicago", market="Will Chicago hit 71F live?", yes_token="yes-chi", no_token="no-chi")
+        )
+        penny_decision = self.db.inspect_weather_trade_open(
+            penny_signal_id,
+            size_usd=3,
+            mode="live",
+            runtime_scope=self.db.RUNTIME_SCOPE_PENNY,
+        )
+
+        self.assertTrue(penny_decision["ok"])
+        self.assertEqual(penny_decision["runtime_scope"], self.db.RUNTIME_SCOPE_PENNY)
+        self.assertEqual(penny_decision["decision_source"], "penny-weather")
+        self.assertEqual(penny_decision["history_source"], "penny-weather")
+
+        paper_duplicate_signal_id = self.db.save_weather_signal(
+            _weather_opp(city="Chicago", market="Will Chicago hit 71F paper again?", yes_token="yes-chi", no_token="no-chi")
+        )
+        paper_decision = self.db.inspect_weather_trade_open(
+            paper_duplicate_signal_id,
+            size_usd=20,
+            mode="paper",
+            runtime_scope=self.db.RUNTIME_SCOPE_PAPER,
+        )
+
+        self.assertFalse(paper_decision["ok"])
+        self.assertEqual(paper_decision["reason_code"], "token_already_closed")
+        self.assertEqual(paper_decision["history_source"], "paper-weather")
+        self.assertEqual(paper_decision["existing_trade_id"], paper_trade_id)
+
+        penny_rows = {
+            row["id"]: row
+            for row in self.db.get_weather_signals(limit=None, runtime_scope=self.db.RUNTIME_SCOPE_PENNY)
+            if row["id"] in {paper_signal_id, penny_signal_id}
+        }
+        self.assertIsNone(penny_rows[penny_signal_id]["blocking_reason_code"])
+        self.assertIsNone(penny_rows[penny_signal_id]["blocked_by_trade_id"])
+
+    def test_weather_probation_isolated_per_runtime_scope(self):
+        token = "yes-la"
+        no_token = "no-la"
+        for attempt in (1, 2):
+            signal_id = self.db.save_weather_signal(
+                _weather_opp(
+                    city="Los Angeles",
+                    market=f"Will Los Angeles hit 80F on April 4 (paper reopen {attempt})?",
+                    yes_token=token,
+                    no_token=no_token,
+                    target_date="2026-04-04",
+                )
+            )
+            if attempt == 1:
+                trade_id = self.db.open_weather_trade(
+                    signal_id,
+                    size_usd=20,
+                    mode="paper",
+                    runtime_scope=self.db.RUNTIME_SCOPE_PAPER,
+                )
+                self.assertIsNotNone(trade_id)
+            else:
+                decision = self.db.inspect_weather_trade_open(
+                    signal_id,
+                    size_usd=20,
+                    mode="paper",
+                    runtime_scope=self.db.RUNTIME_SCOPE_PAPER,
+                )
+                self.assertTrue(decision["ok"])
+                trade_id = self.db.open_weather_trade(
+                    signal_id,
+                    size_usd=20,
+                    mode="paper",
+                    runtime_scope=self.db.RUNTIME_SCOPE_PAPER,
+                )
+                self.assertIsNotNone(trade_id)
+            self.db.close_trade(trade_id, exit_price_a=0.45, notes=f"Paper close {attempt}")
+
+        paper_probation = self.db.get_weather_token_probation(token, runtime_scope=self.db.RUNTIME_SCOPE_PAPER)
+        self.assertEqual(paper_probation["reopen_count"], 1)
+
+        penny_signal_id = self.db.save_weather_signal(
+            _weather_opp(
+                city="Los Angeles",
+                market="Will Los Angeles hit 80F on April 4 (penny baseline close)?",
+                yes_token=token,
+                no_token=no_token,
+                target_date="2026-04-04",
+            )
+        )
+        penny_trade_id = self.db.open_weather_trade(
+            penny_signal_id,
+            size_usd=3,
+            mode="live",
+            runtime_scope=self.db.RUNTIME_SCOPE_PENNY,
+        )
+        self.assertIsNotNone(penny_trade_id)
+        self.db.close_trade(penny_trade_id, exit_price_a=0.45, notes="Penny close")
+
+        penny_reopen_signal_id = self.db.save_weather_signal(
+            _weather_opp(
+                city="Los Angeles",
+                market="Will Los Angeles hit 80F on April 4 (penny reopen)?",
+                yes_token=token,
+                no_token=no_token,
+                target_date="2026-04-04",
+            )
+        )
+        penny_decision = self.db.inspect_weather_trade_open(
+            penny_reopen_signal_id,
+            size_usd=3,
+            mode="live",
+            runtime_scope=self.db.RUNTIME_SCOPE_PENNY,
+        )
+        self.assertTrue(penny_decision["ok"])
+        penny_probation = self.db.get_weather_token_probation(token, runtime_scope=self.db.RUNTIME_SCOPE_PENNY)
+        self.assertEqual(penny_probation["reopen_count"], 0)
+
+    def test_weather_history_ignores_cointegration_trades(self):
+        pairs_signal_id = self.db.save_signal({
+            "event": "Token overlap",
+            "market_a": "Market A",
+            "market_b": "Market B",
+            "price_a": 0.44,
+            "price_b": 0.58,
+            "z_score": 1.8,
+            "coint_pvalue": 0.04,
+            "beta": 1.0,
+            "half_life": 7.0,
+            "spread_mean": 0.0,
+            "spread_std": 0.07,
+            "current_spread": 0.11,
+            "liquidity": 18000,
+            "volume_24h": 9000,
+            "action": "SELL A / BUY B",
+            "grade_label": "A+",
+            "tradeable": True,
+            "paper_tradeable": True,
+            "token_id_a": "yes-overlap",
+            "token_id_b": "tok-b",
+            "ev": {"ev_pct": 2.1},
+            "sizing": {"recommended_size": 20.0},
+            "filters": {"ev_pass": True},
+        })
+        pairs_trade_id = self.db.open_trade(
+            pairs_signal_id,
+            size_usd=3,
+            metadata={"runtime_scope": self.db.RUNTIME_SCOPE_PENNY},
+        )
+        self.assertIsNotNone(pairs_trade_id)
+
+        weather_signal_id = self.db.save_weather_signal(
+            _weather_opp(city="Boston", market="Will Boston hit 68F?", yes_token="yes-overlap", no_token="no-overlap")
+        )
+        decision = self.db.inspect_weather_trade_open(
+            weather_signal_id,
+            size_usd=3,
+            mode="live",
+            runtime_scope=self.db.RUNTIME_SCOPE_PENNY,
+        )
+
+        self.assertTrue(decision["ok"])
+        self.assertEqual(decision["decision_source"], "penny-weather")
+        self.assertEqual(decision["history_source"], "penny-weather")
+
     def test_weather_close_trade_uses_single_leg_pnl_and_closes_signal(self):
         signal_id = self.db.save_weather_signal(
             _weather_opp(city="Miami", market="Will Miami hit 87F?", yes_token="yes-mia", no_token="no-mia")

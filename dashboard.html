@@ -2071,7 +2071,7 @@ async function loadLocked() {
 async function loadWeather() {
   try {
     const tradeable = document.getElementById('weatherTradeableOnly').checked;
-    const r = await fetch(API + `/api/weather?limit=100&tradeable_only=${tradeable}`);
+    const r = await fetch(API + runtimeScopedUrl('/api/weather', { limit: 100, tradeable_only: tradeable }, ACTIVE_RUNTIME_SCOPE));
     const rows = await r.json();
     document.getElementById('cntWeather').textContent = rows.length;
     document.getElementById('statWeather').textContent = rows.length;

@@ -1115,9 +1115,17 @@ async def run_weather_scan(
 
 
 @app.get("/api/weather")
-async def list_weather_signals(limit: int = 50, tradeable_only: bool = False):
+async def list_weather_signals(
+    limit: int = 50,
+    tradeable_only: bool = False,
+    runtime_scope: str | None = None,
+):
     """Return recent weather-edge opportunities from the database."""
-    return db.get_weather_signals(limit=limit, tradeable_only=tradeable_only)
+    return db.get_weather_signals(
+        limit=limit,
+        tradeable_only=tradeable_only,
+        runtime_scope=_runtime_scope_param(runtime_scope),
+    )
 
 
 # --- Locked Market Arb ---
@@ -1601,7 +1609,13 @@ async def open_weather_trade(signal_id: int, size_usd: float = 20, runtime_scope
             weather_signal_id=signal_id,
             token_id=decision.get("entry_token"),
             size_usd=size_usd,
-            details={"path": "/api/weather/{signal_id}/trade"},
+            details={
+                "path": "/api/weather/{signal_id}/trade",
+                "decision_source": decision.get("decision_source"),
+                "history_source": decision.get("history_source"),
+                "history_runtime_scope": decision.get("history_runtime_scope"),
+                "history_strategy": decision.get("history_strategy"),
+            },
         )
         status_code = 404 if decision["reason_code"] == "signal_not_found" else 409
         if decision["reason_code"] == "insufficient_cash":
