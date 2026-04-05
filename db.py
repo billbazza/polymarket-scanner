@@ -3225,6 +3225,44 @@ def _decision_audit_fields(
     }
 
 
+def _weather_review_mode(mode: str | None, runtime_scope: str | None) -> str | None:
+    scope = normalize_runtime_scope(runtime_scope)
+    mode_norm = (mode or "").strip().lower()
+    if scope == RUNTIME_SCOPE_PENNY or mode_norm in {"live", "penny"}:
+        return "penny"
+    if scope == RUNTIME_SCOPE_PAPER or mode_norm == "paper":
+        return "paper"
+    return mode_norm or None
+
+
+def _find_latest_weather_history_trade(
+    conn,
+    *,
+    runtime_scope: str | None,
+    where_sql: str,
+    params: tuple,
+    status: str | None = None,
+) -> dict | None:
+    """Return the newest weather trade in the active runtime lane for a history lookup."""
+    query = f"""
+        SELECT id, weather_signal_id, trade_type, strategy_name, status, closed_at, exit_reason,
+               trade_state_mode, reconciliation_mode, runtime_scope
+        FROM trades
+        WHERE trade_type='weather' AND runtime_scope=? AND {where_sql}
+        ORDER BY
+            CASE WHEN status='open' THEN opened_at ELSE COALESCE(closed_at, opened_at) END DESC,
+            id DESC
+    """
+    rows = conn.execute(query, (normalize_runtime_scope(runtime_scope), *params)).fetchall()
+    status_norm = (status or "").strip().lower()
+    for row in rows or []:
+        trade = dict(row)
+        if status_norm and (trade.get("status") or "").strip().lower() != status_norm:
+            continue
+        return trade
+    return None
+
+
 def inspect_pairs_trade_open(signal_id, size_usd=100, conn=None, runtime_scope: str = RUNTIME_SCOPE_PAPER):
     """Return a structured pairs-trade open decision."""
     owns_conn = conn is None
@@ -3944,20 +3982,20 @@ def inspect_weather_trade_open(
             }
 
         signal_row = dict(sig)
-        review = weather_risk_review.get_review_for_signal(signal_row, mode=mode)
+        review = weather_risk_review.get_review_for_signal(
+            signal_row,
+            mode=_weather_review_mode(mode, runtime_scope),
+        )
 
         action = sig["action"]
         entry_token = sig["yes_token"] if action == "BUY_YES" else sig["no_token"]
-        existing_signal_trade_rows = conn.execute(
-            """
-            SELECT id, status, trade_type, strategy_name, trade_state_mode, reconciliation_mode, runtime_scope
-            FROM trades
-            WHERE weather_signal_id=? AND trade_type='weather' AND status='open' AND runtime_scope=?
-            ORDER BY opened_at DESC, id DESC
-            """,
-            (weather_signal_id, runtime_scope),
-        ).fetchall()
-        existing_signal_trade = _find_runtime_scoped_trade(existing_signal_trade_rows, runtime_scope, status="open")
+        existing_signal_trade = _find_latest_weather_history_trade(
+            conn,
+            runtime_scope=runtime_scope,
+            where_sql="weather_signal_id=? AND status='open'",
+            params=(weather_signal_id,),
+            status="open",
+        )
         if existing_signal_trade:
             trade_id = int(existing_signal_trade["id"])
             return {
@@ -3974,18 +4012,12 @@ def inspect_weather_trade_open(
                 **_paper_position_policy_dict(),
             }
 
-        latest_signal_trade_rows = conn.execute(
-            """
-            SELECT id, status, trade_type, strategy_name, closed_at, exit_reason, trade_state_mode, reconciliation_mode, runtime_scope
-            FROM trades
-            WHERE weather_signal_id=?
-              AND trade_type='weather'
-              AND runtime_scope=?
-            ORDER BY opened_at DESC, id DESC
-            """,
-            (weather_signal_id, runtime_scope),
-        ).fetchall()
-        latest_signal_trade = _find_runtime_scoped_trade(latest_signal_trade_rows, runtime_scope)
+        latest_signal_trade = _find_latest_weather_history_trade(
+            conn,
+            runtime_scope=runtime_scope,
+            where_sql="weather_signal_id=?",
+            params=(weather_signal_id,),
+        )
         if latest_signal_trade and latest_signal_trade["status"] == "closed":
             trade_id = int(latest_signal_trade["id"])
             detail = latest_signal_trade["exit_reason"] or "Weather signal already completed."
@@ -4007,17 +4039,13 @@ def inspect_weather_trade_open(
 
         existing_token_trade = None
         if entry_token:
-            existing_token_trade_rows = conn.execute(
-                """
-                SELECT id, weather_signal_id, trade_type, strategy_name, status, trade_state_mode, reconciliation_mode, runtime_scope
-                FROM trades
-                WHERE trade_type='weather' AND token_id_a=? AND status='open'
-                  AND runtime_scope=?
-                ORDER BY opened_at DESC, id DESC
-                """,
-                (entry_token, runtime_scope),
-            ).fetchall()
-            existing_token_trade = _find_runtime_scoped_trade(existing_token_trade_rows, runtime_scope, status="open")
+            existing_token_trade = _find_latest_weather_history_trade(
+                conn,
+                runtime_scope=runtime_scope,
+                where_sql="token_id_a=? AND status='open'",
+                params=(entry_token,),
+                status="open",
+            )
         if existing_token_trade:
             trade_id = int(existing_token_trade["id"])
             other_signal_id = existing_token_trade["weather_signal_id"]
@@ -4038,18 +4066,13 @@ def inspect_weather_trade_open(
             }
         closed_token_trade = None
         if entry_token:
-            closed_token_trade_rows = conn.execute(
-                """
-                SELECT id, weather_signal_id, trade_type, strategy_name, closed_at, exit_reason, status,
-                       trade_state_mode, reconciliation_mode, runtime_scope
-                FROM trades
-                WHERE trade_type='weather' AND token_id_a=? AND status='closed'
-                  AND runtime_scope=?
-                ORDER BY closed_at DESC, id DESC
-                """,
-                (entry_token, runtime_scope),
-            ).fetchall()
-            closed_token_trade = _find_runtime_scoped_trade(closed_token_trade_rows, runtime_scope, status="closed")
+            closed_token_trade = _find_latest_weather_history_trade(
+                conn,
+                runtime_scope=runtime_scope,
+                where_sql="token_id_a=? AND status='closed'",
+                params=(entry_token,),
+                status="closed",
+            )
         reopen_context = None
         if closed_token_trade:
             trade_id = int(closed_token_trade["id"])
@@ -4267,9 +4290,12 @@ def open_weather_trade(
     )
     if not decision["ok"]:
         log.info(
-            "Weather trade blocked for signal %s: %s",
+            "Weather trade blocked for signal %s: %s runtime_scope=%s decision_source=%s history_source=%s",
             weather_signal_id,
             decision["reason"],
+            decision.get("runtime_scope"),
+            decision.get("decision_source"),
+            decision.get("history_source"),
         )
         conn.close()
         return None

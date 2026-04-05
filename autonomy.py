@@ -1267,6 +1267,15 @@ def run_cycle(state):
                         runtime_scope=runtime_scope,
                     )
                     if not decision["ok"]:
+                        log.info(
+                            "Autonomy weather skip signal=%s reason_code=%s runtime_scope=%s decision_source=%s history_source=%s reason=%s",
+                            w_id,
+                            decision["reason_code"],
+                            decision.get("runtime_scope"),
+                            decision.get("decision_source"),
+                            decision.get("history_source"),
+                            decision["reason"],
+                        )
                         record_attempt(
                             level,
                             "weather",

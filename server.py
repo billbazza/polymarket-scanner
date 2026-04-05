@@ -1618,6 +1618,15 @@ async def open_weather_trade(signal_id: int, size_usd: float = 20, runtime_scope
             mode=mode,
             runtime_scope=runtime_scope,
         )
+        log.info(
+            "Manual weather trade blocked signal=%s reason_code=%s runtime_scope=%s decision_source=%s history_source=%s reason=%s",
+            signal_id,
+            result.get("reason_code") or decision["reason_code"],
+            runtime_scope,
+            decision.get("decision_source"),
+            decision.get("history_source"),
+            result.get("error") or decision["reason"],
+        )
         _safe_record_paper_trade_attempt(
             source="manual_api",
             strategy="weather",
