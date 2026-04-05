@@ -13,7 +13,7 @@ System is operationally healthy with 67.3% win rate and $252.53 total PnL from 1
 - Scanner infrastructure stable with consistent 1.8-2.0 second scan times
 - Paper trading system functioning with proper position tracking and risk management
 - Whale detection actively identifying suspicious market activity with 65-69 suspicion scores
-- Stage 2 polygon gating instrumentation now snapshots Polygon block metadata and dual-leg slippage whenever `STAGE2_POLYGON_GATING=1`, giving every paper-run attempt an on-chain reference (see `fix_logs/2026-04-03-stage2-polygon-gating.md`).
+- Polygon audit instrumentation now snapshots block metadata and dual-leg slippage whenever `STAGE2_POLYGON_GATING=1`, giving every paper-run attempt an on-chain reference without creating a separate penny gate (see `fix_logs/2026-04-03-stage2-polygon-gating.md`).
 - [x] Daily report workflow is consolidated into this single Markdown file per date; redundant needed/create splits have been retired and the UI now keeps one saved entry.
 
 ## Not Working
@@ -29,18 +29,18 @@ System is operationally healthy with 67.3% win rate and $252.53 total PnL from 1
 - [x] Tighten weather strategy stop-losses or improve entry timing to reduce frequency of stopped trades (`fix_logs/2026-04-03-weather-stop-noise.md`).
 - [x] Add concrete exit criteria for whale positions (per-position loss limit, max hold time, volatility trigger) or retire the strategy, since the $54.52 unrealized loss on three live trades shows the current guardrails are ineffective and weather already carries the win-rate lead (`fix_logs/2026-04-03-whale-exit-controls.md`).
 - [x] Disable or refine copy strategy filters as current implementation is unprofitable despite decent win rate - or remove it altogether - not worth developing vs weather (`fix_logs/2026-04-03-copy-strategy-filter-rework.md` & `fix_logs/2026-04-03-copy-strategy-filter-tuning.md`).
-- [x] Stage 2 Perplexity Validation – Perplexity verdicts now annotate each profitable candidate and fallback metadata is logged alongside `perplexity_json` in the database (`fix_logs/2026-04-04-stage2-perplexity-validation.md`).
-- [x] Stage 3 Perplexity gating now trusts the cached verdict so only profitable candidate features progress toward the live bucket (`fix_logs/2026-04-04-stage3-perplexity-gating.md`).
+- [x] Perplexity signal metadata is now cached alongside `perplexity_json`, with fallback metadata logged for audit and operator context (`fix_logs/2026-04-04-stage2-perplexity-validation.md`).
+- [x] Historical Stage 3 Perplexity gating has been retired as active policy; cached verdicts remain available for dashboard/audit context only (`fix_logs/2026-04-04-stage3-perplexity-gating.md`).
 
 ## Status Summary
 - All previously flagged “Not Working” items have corresponding fix logs and are stable; cointegration now admits trades, the copy wallet gate is stricter, whale positions auto-exit, weather guards lean on liquidity/noise filters, and confidence-based sizing drives fills.
-- Stage 2 Perplexity validation is now integrated (cached verdicts + fallback metadata) and recorded in `fix_logs/2026-04-04-stage2-perplexity-validation.md`; Stage 2 polygon gating instrumentation now logs block metadata/slippage (`fix_logs/2026-04-03-stage2-polygon-gating.md`); the remaining Stage 2/3 live-test work is sequenced via the Kanban tasks below.
-- Stage 3 readiness now depends on the cached Perplexity verdict so only profitable candidates reach the live bucket (`fix_logs/2026-04-04-stage3-perplexity-gating.md`).
+- Perplexity metadata is now integrated (cached verdicts + fallback metadata) and recorded in `fix_logs/2026-04-04-stage2-perplexity-validation.md`; Polygon audit instrumentation now logs block metadata/slippage (`fix_logs/2026-04-03-stage2-polygon-gating.md`).
+- Historical Stage 2/3 framing in this report is archived. Active repo policy is penny-paper parity with only explicit live safeguards allowed to veto a penny trade.
 
 ## Kanban Tasks
-- `Stage 2 Polygon Gating` – capture Polygon rollouts for block/chain parity, liquidity gate, and slippage checks so stage 2 paper runs can log block metadata before trading (`fix_logs/2026-04-03-stage2-polygon-gating.md`).
-- `Stage 2 Perplexity Validation` – evaluation now runs during scans, the verdict is cached in `perplexity_json`, and fallback paths are logged per `fix_logs/2026-04-04-stage2-perplexity-validation.md`; remaining Kanban work now focuses on Polygon gating + Stage 3 readiness.
-- `Stage 3 Live Readiness` – readiness checklist now lives in `reports/2026-04-04-stage3-live-readiness.md` and records the balance, slippage, quarter-Kelly cap, and `POLYMARKET_PRIVATE_KEY`/`ALCHEMY_API_KEY` gating before any $1–5 live fill is allowed.
+- `Polygon Audit Instrumentation` – capture block/chain parity, liquidity context, and slippage checks so attempts log block metadata before trading (`fix_logs/2026-04-03-stage2-polygon-gating.md`).
+- `Perplexity Metadata` – evaluation now runs during scans, the verdict is cached in `perplexity_json`, and fallback paths are logged per `fix_logs/2026-04-04-stage2-perplexity-validation.md`.
+- `Penny Live Safeguards` – safeguard checklist lives in `reports/2026-04-04-stage3-live-readiness.md` and records the wallet, slippage, quarter-Kelly cap, and execution-reporting requirements that may veto a live fill.
 
-## Stage 2/3 Live-Test Plan
-- Outline and requirements for Polygon + Perplexity live integration, including the risk checklist and paper-to-live test matrix, are recorded in `fix_logs/2026-04-03-stage2-3-live-tests.md` so our Daily Report references the same actionable plan.
+## Historical Plan
+- The older Stage 2/3 rollout plan remains archived in `fix_logs/2026-04-03-stage2-3-live-tests.md`, but active policy is now the parity-first contract documented in `fix_logs/2026-04-05-penny-parity-guidance-contract.md`.

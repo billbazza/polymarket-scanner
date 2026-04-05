@@ -1,11 +1,13 @@
 # A-Grade Cointegration Paper Trial Review
 
+Historical review. The paper-only trial restriction discussed here is superseded by the 2026-04-05 penny-parity updates.
+
 Date: 2026-04-01
 Decision: keep_experimental
 
 ## Scope
-- Review whether grade A cointegration signals should be promoted beyond A+ in paper trading.
-- This review is limited to the new explicit paper-trial path and does not change live-trading rules.
+- Review whether grade A cointegration signals should be promoted beyond A+ in the trial path.
+- This review predates the parity-first repo contract and should not be used to justify a paper-only restriction.
 
 ## Current Readout
 - Historical DB snapshot on 2026-04-01:
@@ -26,7 +28,7 @@ Decision: keep_experimental
 - Because of that, there is not enough evidence yet to promote or reject A-grade cointegration trading on performance grounds.
 
 ## Trial Guardrails Added
-- A-grade trades are paper-only.
+- Historical note: A-grade trades were paper-only at the time of this review. That restriction is no longer active.
 - Size is reduced relative to the standard paper position.
 - Liquidity and slippage gates are stricter than the A+ default path.
 - Trial trades now carry explicit:
@@ -46,4 +48,4 @@ Decision: keep_experimental
 
 ## Recommendation
 - Keep experimental.
-- Revisit after a fresh paper sample is collected through `admission_path=paper_a_trial` and reviewed via `GET /api/cointegration/trial`.
+- Revisit after a fresh parity sample is collected through the A-trial path and reviewed via `GET /api/cointegration/trial`.

@@ -9,7 +9,7 @@
 - Renamed the active admission path to `a_grade_trial`, kept legacy `paper_a_trial` reads in summaries for historical continuity, and renamed the active experiment label to `cointegration_a_grade_parity_trial`.
 - Applied the grade-weighted A-trial sizing path in live autonomy as well as paper so admitted grade-A entries keep the same reduced-size behavior across runtimes.
 - Expanded strategy-admission audit logging in `autonomy.py` so penny/book now emit the same blocked-at-admission records and `cointegration_trial_blocked` journal entries that paper already produced.
-- Kept live-only safeguards intact: Stage 3 Perplexity gating, brain validation, balance checks, and execution/slippage vetoes still block trades individually and must surface their reasons explicitly.
+- Kept explicit live safeguards intact: wallet/balance checks, execution/slippage vetoes, exchange/order failures, and other concrete live preflight/runtime blockers still veto trades individually and must surface their reasons explicitly. Historical Stage 3/Perplexity-only gating is no longer part of the active policy.
 
 ## Verification
 - `python3 -m unittest tests.test_cointegration_trial tests.test_runtime_scope_split`

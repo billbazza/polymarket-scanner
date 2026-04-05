@@ -1,17 +1,18 @@
 # A-Grade Cointegration Paper Trial
 
+Historical filename retained. The paper-only restriction described here is superseded by `fix_logs/2026-04-05-penny-a-grade-parity.md`.
+
 Date: 2026-04-01
 
 ## Summary
-- Added an explicit paper-only A-grade cointegration trial path.
-- Kept live-trading behavior unchanged: only the paper autonomy path can auto-admit eligible A-grade cointegration trades.
+- Added the initial explicit A-grade cointegration trial path.
+- At the time of this change, the trial was paper-only. That restriction is now historical and must not be reintroduced.
 - Instrumented signals and trades so operators can compare A-trial vs A+ cohorts through the DB and API.
 
 ## Behavior Change
 - `autonomy.py` now annotates every cointegration opportunity with a trial admission decision before saving it.
 - A+ signals remain the control cohort and continue to open normally.
-- A-grade signals can only open through `admission_path=paper_a_trial` when all of these hold:
-  - paper mode
+- A-grade signals originally opened through `admission_path=paper_a_trial` when all of these held:
   - trial enabled
   - single allowed miss is `ev_pass`
   - tighter `|z|`, half-life, liquidity, and slippage guardrails pass
@@ -48,9 +49,9 @@ Date: 2026-04-01
   - grouped rejection reasons
 
 ## Safety Notes
-- No live-trading path was widened.
+- Historical note: no live-trading path was widened in this initial patch. Active policy now requires the same trial path to be available in penny/book unless a live safeguard vetoes the specific trade.
 - `execution.py` still preserves existing live balance/HMRC/slippage behavior.
-- Trial stop/max-hold logic only applies to paper cointegration trades that carry explicit trial guardrails.
+- Trial stop/max-hold logic applies to cointegration trades that carry explicit trial guardrails.
 
 ## Verification
 - `python3 -m unittest tests.test_cointegration_trial`
@@ -59,4 +60,4 @@ Date: 2026-04-01
 
 ## Follow-Up
 - Historical rows are not backfilled with the new cohort metadata, so old trades/signals are visible as legacy history rather than clean A-trial vs A+ comparisons.
-- Promotion decisions should wait for fresh post-rollout paper samples.
+- Promotion decisions should use fresh post-rollout samples across both paper and penny parity lanes.

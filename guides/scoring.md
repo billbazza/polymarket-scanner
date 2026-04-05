@@ -24,7 +24,7 @@ Every opportunity from the scanner runs through `math_engine.score_opportunity()
 - **D** = 4/8
 - **F** = 0/8
 
-Only A+ signals have `tradeable = True`. A-grade rows can still be operator-meaningful when the only miss is `ev_pass`; those are the paper-trial near misses. Lower-quality rows are rejected with structured blocker metadata.
+Only A+ signals have `tradeable = True`. A-grade rows can still be operator-meaningful when the only miss is `ev_pass`; those are the controlled near-miss trial cohort. If that cohort is admitted in paper, penny/book must use the same default trial admission path unless an explicit live safeguard vetoes the specific trade. Lower-quality rows are rejected with structured blocker metadata.
 
 ## EV Calculation
 
