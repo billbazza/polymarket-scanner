@@ -6,9 +6,11 @@ Supports staged provider migration:
 - `BRAIN_PROVIDER=auto` falls forward to OpenAI when Anthropic is unavailable
   or exhausted, preserving operational continuity.
 """
+from datetime import datetime, timezone
 import json
 import logging
 from pathlib import Path
+import re
 
 import runtime_config
 
@@ -35,6 +37,15 @@ DEFAULT_MODEL_ALIASES = {
         PROVIDER_OPENAI: "gpt-5",
         PROVIDER_XAI: "grok-4.20-beta-latest-reasoning",
     },
+}
+
+_CREDIT_VALUE_RE = re.compile(r"(?i)(?:credit|balance|remaining)[^0-9-]*(-?\d+(?:\.\d+)?)")
+
+_RUNTIME_OBSERVATIONS = {
+    "active_provider": None,
+    "active_provider_at": None,
+    "last_fallback": None,
+    "providers": {},
 }
 
 
@@ -71,6 +82,158 @@ def _provider_api_key_name(provider: str) -> str:
 
 def _provider_is_configured(provider: str) -> bool:
     return bool(_env_value(_provider_api_key_name(provider)))
+
+
+def _utc_now() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+
+
+def _provider_runtime_record(provider: str) -> dict:
+    providers = _RUNTIME_OBSERVATIONS["providers"]
+    if provider not in providers:
+        providers[provider] = {
+            "last_success_at": None,
+            "last_error_at": None,
+            "last_error_reason": None,
+            "last_error_kind": None,
+            "last_request_id": None,
+            "quota_observation": None,
+            "credit_observation": None,
+        }
+    return providers[provider]
+
+
+def _headers_to_dict(headers) -> dict[str, str]:
+    if not headers:
+        return {}
+    try:
+        items = headers.items()
+    except Exception:
+        return {}
+    normalized = {}
+    for key, value in items:
+        normalized[str(key).lower()] = str(value)
+    return normalized
+
+
+def _coerce_number(raw: str | None):
+    if raw in (None, ""):
+        return None
+    text = str(raw).strip()
+    try:
+        if "." in text:
+            return float(text)
+        return int(text)
+    except ValueError:
+        return text
+
+
+def _extract_credit_value(message: str):
+    if not message:
+        return None
+    match = _CREDIT_VALUE_RE.search(message)
+    if not match:
+        return None
+    return _coerce_number(match.group(1))
+
+
+def _extract_quota_observation(headers, source: str) -> dict | None:
+    data = _headers_to_dict(headers)
+    if not data:
+        return None
+
+    observation = {
+        "observed_at": _utc_now(),
+        "source": source,
+        "requests_remaining": _coerce_number(data.get("x-ratelimit-remaining-requests")),
+        "tokens_remaining": _coerce_number(data.get("x-ratelimit-remaining-tokens")),
+        "requests_limit": _coerce_number(data.get("x-ratelimit-limit-requests")),
+        "tokens_limit": _coerce_number(data.get("x-ratelimit-limit-tokens")),
+        "requests_reset": data.get("x-ratelimit-reset-requests"),
+        "tokens_reset": data.get("x-ratelimit-reset-tokens"),
+        "retry_after": _coerce_number(data.get("retry-after")),
+    }
+    if not any(
+        observation[key] is not None
+        for key in (
+            "requests_remaining",
+            "tokens_remaining",
+            "requests_limit",
+            "tokens_limit",
+            "requests_reset",
+            "tokens_reset",
+            "retry_after",
+        )
+    ):
+        return None
+    return observation
+
+
+def _extract_request_id(headers) -> str | None:
+    data = _headers_to_dict(headers)
+    return data.get("request-id") or data.get("x-request-id")
+
+
+def _extract_exception_headers(exc: Exception):
+    response = getattr(exc, "response", None)
+    return getattr(response, "headers", None)
+
+
+def _classify_provider_error(exc: Exception) -> str:
+    message = str(exc).lower()
+    if "credit" in message or "billing" in message or "insufficient funds" in message:
+        return "credits_exhausted"
+    if "quota" in message or "rate limit" in message or "429" in message:
+        return "quota_exhausted"
+    if "401" in message or "authentication" in message or "api key" in message:
+        return "auth_error"
+    if "model" in message and ("not found" in message or "unavailable" in message):
+        return "model_unavailable"
+    return "runtime_error"
+
+
+def _record_provider_success(provider: str, headers=None) -> None:
+    now = _utc_now()
+    record = _provider_runtime_record(provider)
+    record["last_success_at"] = now
+    record["last_request_id"] = _extract_request_id(headers) or record["last_request_id"]
+    quota = _extract_quota_observation(headers, source="response_headers")
+    if quota:
+        record["quota_observation"] = quota
+    _RUNTIME_OBSERVATIONS["active_provider"] = provider
+    _RUNTIME_OBSERVATIONS["active_provider_at"] = now
+
+
+def _record_provider_failure(provider: str, exc: Exception, fallback_to: str | None = None) -> None:
+    now = _utc_now()
+    record = _provider_runtime_record(provider)
+    record["last_error_at"] = now
+    record["last_error_reason"] = str(exc)
+    record["last_error_kind"] = _classify_provider_error(exc)
+
+    headers = _extract_exception_headers(exc)
+    record["last_request_id"] = _extract_request_id(headers) or record["last_request_id"]
+    quota = _extract_quota_observation(headers, source="error_headers")
+    if quota:
+        record["quota_observation"] = quota
+
+    credit_value = _extract_credit_value(str(exc))
+    if credit_value is not None:
+        record["credit_observation"] = {
+            "observed_at": now,
+            "source": "error_message",
+            "remaining": credit_value,
+            "unit": "unknown",
+        }
+
+    if fallback_to:
+        _RUNTIME_OBSERVATIONS["last_fallback"] = {
+            "at": now,
+            "from_provider": provider,
+            "to_provider": fallback_to,
+            "reason": str(exc),
+            "reason_kind": record["last_error_kind"],
+        }
 
 
 def _load_prompt():
@@ -178,6 +341,23 @@ def _get_provider_client(provider: str):
     raise ValueError(f"Unknown provider {provider}")
 
 
+def _provider_availability_state(provider: str, client_ready: bool, active_provider: str | None) -> str:
+    if not _provider_is_configured(provider):
+        return "missing_config"
+    if not client_ready:
+        return "client_unavailable"
+
+    record = _provider_runtime_record(provider)
+    last_error_at = record.get("last_error_at")
+    last_success_at = record.get("last_success_at")
+    has_unrecovered_error = bool(last_error_at and (not last_success_at or last_error_at >= last_success_at))
+    if has_unrecovered_error and record.get("last_error_kind") in {"credits_exhausted", "quota_exhausted"}:
+        return record["last_error_kind"]
+    if provider == active_provider:
+        return "active"
+    return "available"
+
+
 def get_runtime_status() -> dict:
     """Return provider/runtime status for reversible operator cutover."""
     aliases = _model_aliases()
@@ -187,29 +367,65 @@ def get_runtime_status() -> dict:
         if _get_provider_client(provider):
             client_ready_order.append(provider)
 
+    observed_active_provider = _RUNTIME_OBSERVATIONS.get("active_provider")
+    if observed_active_provider in client_ready_order:
+        active_provider = observed_active_provider
+        active_provider_source = "last_success"
+    elif client_ready_order:
+        active_provider = client_ready_order[0]
+        active_provider_source = "configured_preference"
+    else:
+        active_provider = None
+        active_provider_source = None
+
     status = {
         "mode": _brain_provider(),
         "configured_order": configured_order,
         "client_ready_order": client_ready_order,
         "fallback_enabled": _brain_provider() == PROVIDER_AUTO and len(configured_order) > 1,
         "brain_enabled": bool(client_ready_order),
+        "active_provider": active_provider,
+        "active_provider_source": active_provider_source,
+        "active_provider_at": _RUNTIME_OBSERVATIONS.get("active_provider_at") if active_provider_source == "last_success" else None,
+        "last_fallback": _RUNTIME_OBSERVATIONS.get("last_fallback"),
         "providers": {
             PROVIDER_ANTHROPIC: {
                 "configured": _provider_is_configured(PROVIDER_ANTHROPIC),
+                "client_ready": PROVIDER_ANTHROPIC in client_ready_order,
+                "availability": _provider_availability_state(
+                    PROVIDER_ANTHROPIC,
+                    PROVIDER_ANTHROPIC in client_ready_order,
+                    active_provider,
+                ),
                 "default_model": aliases[DEFAULT_MODEL][PROVIDER_ANTHROPIC],
                 "complex_model": aliases[OPUS_MODEL][PROVIDER_ANTHROPIC],
+                **_provider_runtime_record(PROVIDER_ANTHROPIC),
             },
             PROVIDER_OPENAI: {
                 "configured": _provider_is_configured(PROVIDER_OPENAI),
+                "client_ready": PROVIDER_OPENAI in client_ready_order,
+                "availability": _provider_availability_state(
+                    PROVIDER_OPENAI,
+                    PROVIDER_OPENAI in client_ready_order,
+                    active_provider,
+                ),
                 "default_model": aliases[DEFAULT_MODEL][PROVIDER_OPENAI],
                 "complex_model": aliases[OPUS_MODEL][PROVIDER_OPENAI],
                 "base_url": _env_value("OPENAI_BASE_URL") or None,
+                **_provider_runtime_record(PROVIDER_OPENAI),
             },
             PROVIDER_XAI: {
                 "configured": _provider_is_configured(PROVIDER_XAI),
+                "client_ready": PROVIDER_XAI in client_ready_order,
+                "availability": _provider_availability_state(
+                    PROVIDER_XAI,
+                    PROVIDER_XAI in client_ready_order,
+                    active_provider,
+                ),
                 "default_model": aliases[DEFAULT_MODEL][PROVIDER_XAI],
                 "complex_model": aliases[OPUS_MODEL][PROVIDER_XAI],
                 "base_url": _env_value("XAI_BASE_URL") or None,
+                **_provider_runtime_record(PROVIDER_XAI),
             },
         },
     }
@@ -322,7 +538,7 @@ def _extract_openai_text(response) -> str:
     return _normalise_text_response(str(content))
 
 
-def _anthropic_message_text(client, prompt: str, model: str, max_tokens: int) -> tuple[str, str]:
+def _anthropic_message_text(client, prompt: str, model: str, max_tokens: int) -> tuple[str, str, object | None]:
     """Call Anthropic and retry with a known-good provider-local fallback model if needed."""
     tried = []
     for candidate in _resolve_model_candidates(PROVIDER_ANTHROPIC, model):
@@ -330,14 +546,25 @@ def _anthropic_message_text(client, prompt: str, model: str, max_tokens: int) ->
             continue
         tried.append(candidate)
         try:
-            response = client.messages.create(
-                model=candidate,
-                max_tokens=max_tokens,
-                messages=[{"role": "user", "content": prompt}],
-            )
+            headers = None
+            raw_create = getattr(getattr(client.messages, "with_raw_response", None), "create", None)
+            if callable(raw_create):
+                raw_response = raw_create(
+                    model=candidate,
+                    max_tokens=max_tokens,
+                    messages=[{"role": "user", "content": prompt}],
+                )
+                headers = getattr(raw_response, "headers", None)
+                response = raw_response.parse()
+            else:
+                response = client.messages.create(
+                    model=candidate,
+                    max_tokens=max_tokens,
+                    messages=[{"role": "user", "content": prompt}],
+                )
             if candidate != model:
                 log.warning("Brain model fallback: %s -> %s", model, candidate)
-            return _normalise_text_response(response.content[0].text), candidate
+            return _normalise_text_response(response.content[0].text), candidate, headers
         except Exception as e:
             if _anthropic_should_fallback(e):
                 log.warning("Brain model unavailable: %s (%s)", candidate, e)
@@ -346,7 +573,7 @@ def _anthropic_message_text(client, prompt: str, model: str, max_tokens: int) ->
     raise RuntimeError(f"No available brain model for requested model {model}")
 
 
-def _openai_message_text(client, prompt: str, model: str, max_tokens: int) -> tuple[str, str]:
+def _openai_message_text(client, prompt: str, model: str, max_tokens: int) -> tuple[str, str, object | None]:
     """Call OpenAI using the installed client surface."""
     tried = []
     for candidate in _resolve_model_candidates(PROVIDER_OPENAI, model):
@@ -354,28 +581,58 @@ def _openai_message_text(client, prompt: str, model: str, max_tokens: int) -> tu
             continue
         tried.append(candidate)
         try:
+            headers = None
             if hasattr(client, "responses"):
-                response = client.responses.create(
-                    model=candidate,
-                    input=prompt,
-                    max_output_tokens=max_tokens,
-                )
+                raw_create = getattr(getattr(client.responses, "with_raw_response", None), "create", None)
+                if callable(raw_create):
+                    raw_response = raw_create(
+                        model=candidate,
+                        input=prompt,
+                        max_output_tokens=max_tokens,
+                    )
+                    headers = getattr(raw_response, "headers", None)
+                    response = raw_response.parse()
+                else:
+                    response = client.responses.create(
+                        model=candidate,
+                        input=prompt,
+                        max_output_tokens=max_tokens,
+                    )
             else:
                 try:
-                    response = client.chat.completions.create(
-                        model=candidate,
-                        messages=[{"role": "user", "content": prompt}],
-                        max_completion_tokens=max_tokens,
-                    )
+                    raw_create = getattr(getattr(client.chat.completions, "with_raw_response", None), "create", None)
+                    if callable(raw_create):
+                        raw_response = raw_create(
+                            model=candidate,
+                            messages=[{"role": "user", "content": prompt}],
+                            max_completion_tokens=max_tokens,
+                        )
+                        headers = getattr(raw_response, "headers", None)
+                        response = raw_response.parse()
+                    else:
+                        response = client.chat.completions.create(
+                            model=candidate,
+                            messages=[{"role": "user", "content": prompt}],
+                            max_completion_tokens=max_tokens,
+                        )
                 except TypeError:
-                    response = client.chat.completions.create(
-                        model=candidate,
-                        messages=[{"role": "user", "content": prompt}],
-                        max_tokens=max_tokens,
-                    )
+                    if callable(raw_create):
+                        raw_response = raw_create(
+                            model=candidate,
+                            messages=[{"role": "user", "content": prompt}],
+                            max_tokens=max_tokens,
+                        )
+                        headers = getattr(raw_response, "headers", None)
+                        response = raw_response.parse()
+                    else:
+                        response = client.chat.completions.create(
+                            model=candidate,
+                            messages=[{"role": "user", "content": prompt}],
+                            max_tokens=max_tokens,
+                        )
             if candidate != model:
                 log.warning("Brain model fallback: %s -> %s", model, candidate)
-            return _extract_openai_text(response), candidate
+            return _extract_openai_text(response), candidate, headers
         except Exception as e:
             if _openai_should_fallback(e):
                 log.warning("Brain model unavailable: %s (%s)", candidate, e)
@@ -422,7 +679,7 @@ def _extract_xai_text(response) -> str:
     return _normalise_text_response(str(response))
 
 
-def _xai_message_text(client, prompt: str, model: str, max_tokens: int) -> tuple[str, str]:
+def _xai_message_text(client, prompt: str, model: str, max_tokens: int) -> tuple[str, str, object | None]:
     """Call Grok via the xai_sdk client."""
     tried = []
     for candidate in _resolve_model_candidates(PROVIDER_XAI, model):
@@ -430,14 +687,25 @@ def _xai_message_text(client, prompt: str, model: str, max_tokens: int) -> tuple
             continue
         tried.append(candidate)
         try:
-            response = client.responses.create(
-                model=candidate,
-                input=[{"role": "user", "content": prompt}],
-                max_output_tokens=max_tokens,
-            )
+            headers = None
+            raw_create = getattr(getattr(client.responses, "with_raw_response", None), "create", None)
+            if callable(raw_create):
+                raw_response = raw_create(
+                    model=candidate,
+                    input=[{"role": "user", "content": prompt}],
+                    max_output_tokens=max_tokens,
+                )
+                headers = getattr(raw_response, "headers", None)
+                response = raw_response.parse()
+            else:
+                response = client.responses.create(
+                    model=candidate,
+                    input=[{"role": "user", "content": prompt}],
+                    max_output_tokens=max_tokens,
+                )
             if candidate != model:
                 log.warning("Brain model fallback: %s -> %s", model, candidate)
-            return _extract_xai_text(response), candidate
+            return _extract_xai_text(response), candidate, headers
         except Exception as e:
             if _xai_should_fallback(e):
                 log.warning("Brain model unavailable: %s (%s)", candidate, e)
@@ -453,16 +721,18 @@ def _brain_request(prompt: str, model: str, max_tokens: int) -> dict | None:
         return None
 
     last_error = None
-    for candidate in candidates:
+    for index, candidate in enumerate(candidates):
         provider = candidate["provider"]
         client = candidate["client"]
+        fallback_to = candidates[index + 1]["provider"] if index + 1 < len(candidates) else None
         try:
             if provider == PROVIDER_ANTHROPIC:
-                text, used_model = _anthropic_message_text(client, prompt, model=model, max_tokens=max_tokens)
+                text, used_model, headers = _anthropic_message_text(client, prompt, model=model, max_tokens=max_tokens)
             elif provider == PROVIDER_OPENAI:
-                text, used_model = _openai_message_text(client, prompt, model=model, max_tokens=max_tokens)
+                text, used_model, headers = _openai_message_text(client, prompt, model=model, max_tokens=max_tokens)
             else:
-                text, used_model = _xai_message_text(client, prompt, model=model, max_tokens=max_tokens)
+                text, used_model, headers = _xai_message_text(client, prompt, model=model, max_tokens=max_tokens)
+            _record_provider_success(provider, headers=headers)
             return {
                 "provider": provider,
                 "model": used_model,
@@ -476,8 +746,10 @@ def _brain_request(prompt: str, model: str, max_tokens: int) -> dict | None:
                 else _xai_should_fallback(e)
             )
             if should_fallback:
+                _record_provider_failure(provider, e, fallback_to=fallback_to)
                 log.warning("Brain provider fallback: %s failed (%s)", provider, e)
                 continue
+            _record_provider_failure(provider, e)
             raise
 
     if last_error:
