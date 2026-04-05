@@ -632,6 +632,103 @@ class RuntimeScopeSplitTests(unittest.TestCase):
         self.assertIsNone(last_result["weather_phase"]["reason_code"])
         self.assertEqual(last_result["weather_phase"]["execution_mode"], "live-auto-trade")
 
+    def test_penny_a_grade_trial_is_not_filtered_by_perplexity_metadata(self):
+        import autonomy
+
+        autonomy = importlib.reload(autonomy)
+        journal_entries = []
+        a_grade_signal = _signal()
+        a_grade_signal.update({
+            "event": "A-grade parity candidate",
+            "grade_label": "A",
+            "grade": 7,
+            "tradeable": False,
+            "paper_tradeable": False,
+            "ev": {"ev_pct": 1.2},
+            "filters": {
+                "ev_pass": True,
+                "kelly_pass": True,
+                "z_pass": True,
+                "coint_pass": True,
+                "hl_pass": True,
+                "momentum_pass": False,
+                "price_pass": True,
+                "spread_std_pass": True,
+            },
+        })
+        fake_weather_strategy = types.SimpleNamespace(scan_weather_opportunities=lambda **kwargs: ([], {}))
+        fake_weather_exact = types.SimpleNamespace(
+            exact_temp_enabled=lambda: False,
+            exact_temp_autotrade_enabled=lambda: False,
+        )
+        fake_copy_scanner = types.SimpleNamespace(run_copy_trader=lambda **kwargs: {"executed": 0})
+        fake_wallet_discovery = types.SimpleNamespace(run=lambda **kwargs: {"found": 0})
+        fake_longshot = types.SimpleNamespace(scan=lambda **kwargs: ([], {"markets_checked": 0}))
+        fake_near_certainty = types.SimpleNamespace(scan=lambda **kwargs: ([], {"markets_checked": 0}))
+        fake_whale = types.SimpleNamespace(scan=lambda **kwargs: ([], {"markets_checked": 0}))
+        fake_brain = types.SimpleNamespace(validate_signal=lambda opp: (True, "brain ok"))
+
+        with patch.object(autonomy.async_scanner, "scan", return_value={
+            "opportunities": [a_grade_signal],
+            "pairs_tested": 1,
+            "pairs_cointegrated": 1,
+        }), \
+             patch.object(autonomy, "get_level_config", return_value={
+                 "name": "Penny Trader",
+                 "can_trade": True,
+                 "auto_trade_enabled": True,
+                 "max_open": 3,
+                 "size_usd": 3,
+                 "runtime_controls": {
+                     "auto_trade_enabled": True,
+                     "weather_auto_trade_enabled": True,
+                 },
+             }), \
+             patch.object(autonomy.db, "save_scan_run"), \
+             patch.object(autonomy.tracker, "refresh_open_trades", return_value=[]), \
+             patch.object(autonomy.execution, "manage_open_orders", return_value={"filled": 0, "cancelled": 0}), \
+             patch.object(autonomy.trade_monitor, "reconcile_open_trades", return_value={"counts": {}, "results": [], "auto_closed_trade_ids": []}), \
+             patch.object(autonomy.tracker, "auto_close_trades", return_value=[]), \
+             patch.object(autonomy.db, "get_runtime_slot_usage", return_value={
+                 "open_positions": 0,
+                 "slots_remaining": 3,
+                 "max_open_usage": "0/3",
+                 "consuming_trade_ids": [],
+                 "consuming_trades": [],
+             }), \
+             patch.object(autonomy.cointegration_trial.math_engine, "check_slippage", side_effect=[
+                 {"ok": True, "slippage_pct": 0.4, "reason": None},
+                 {"ok": True, "slippage_pct": 0.5, "reason": None},
+             ]), \
+             patch.object(autonomy.perplexity, "annotate_profitable_candidate", side_effect=lambda opp: opp.update({
+                 "perplexity": {"status": "complete", "profitable_candidate": False, "reason": "observability only", "confidence": 0.2},
+                 "profitable_candidate_feature": False,
+                 "profitable_candidate_reason": "observability only",
+             })), \
+             patch.object(autonomy.execution, "execute_trade", return_value={
+                 "ok": False,
+                 "reason_code": "balance_check_failed",
+                 "error": "Balance check failed: test live veto",
+             }) as execute_trade_mock, \
+             patch.object(autonomy, "save_state"), \
+             patch.object(autonomy, "journal", side_effect=lambda entry: journal_entries.append(entry)), \
+             patch.dict(sys.modules, {
+                 "weather_strategy": fake_weather_strategy,
+                 "weather_exact_temp_scanner": fake_weather_exact,
+                 "copy_scanner": fake_copy_scanner,
+                 "wallet_discovery": fake_wallet_discovery,
+                 "longshot_scanner": fake_longshot,
+                 "near_certainty_scanner": fake_near_certainty,
+                 "whale_detector": fake_whale,
+                 "brain": fake_brain,
+             }, clear=False):
+            result = autonomy.run_cycle({"level": "penny", "runtime_scope": "penny"})
+
+        self.assertEqual(execute_trade_mock.call_count, 1)
+        self.assertEqual(result["cycle_summary"]["pairs_phase"]["result_counts"]["admitted"], 1)
+        self.assertTrue(any(entry.get("action") == "perplexity_observability" for entry in journal_entries))
+        self.assertFalse(any(entry.get("action") == "stage3_perplexity_gate" for entry in journal_entries))
+
     def test_autonomy_runtime_api_returns_scoped_state_and_limits(self):
         import autonomy
 

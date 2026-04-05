@@ -583,42 +583,21 @@ def run_cycle(state):
                     "max_allowed_failed_filters": trial_settings["max_allowed_failed_filters"],
                 })
 
-        stage3_gate_applied = not paper_mode
+        # Perplexity remains observability-only. It can enrich logs/UI context, but it
+        # must not silently narrow penny/book admission after paper has admitted a signal.
+        stage3_gate_applied = False
         stage3_gate_blocked = 0
-        if stage3_gate_applied and admitted_signals:
-            filtered_signals = []
-            for opp in admitted_signals:
-                if opp.get("profitable_candidate_feature"):
-                    filtered_signals.append(opp)
-                    continue
-                stage3_gate_blocked += 1
-                reason = opp.get("profitable_candidate_reason") or "Perplexity rejected this feature."
-                profile = opp.get("perplexity") or {}
-                record_attempt(
-                    level,
-                    "pairs",
-                    "blocked",
-                    "stage3_perplexity_reject",
-                    reason,
-                    event=opp.get("event"),
-                    signal_id=opp.get("id"),
-                    size_usd=config.get("size_usd"),
-                    phase="stage3_perplexity_gate",
-                    details={
-                        "perplexity_status": profile.get("status"),
-                        "confidence": profile.get("confidence"),
-                    },
-                )
-            admitted_signals = filtered_signals
-
-        stage3_gate_passed = len(admitted_signals) if stage3_gate_applied else 0
-        if stage3_gate_applied:
-            journal({
-                "action": "stage3_perplexity_gate",
-                "level": level,
-                "passed": stage3_gate_passed,
-                "blocked": stage3_gate_blocked,
-            })
+        stage3_gate_passed = 0
+        perplexity_profitable_candidates = sum(
+            1 for opp in admitted_signals if opp.get("profitable_candidate_feature")
+        )
+        journal({
+            "action": "perplexity_observability",
+            "level": level,
+            "admitted_signals": len(admitted_signals),
+            "profitable_candidates": perplexity_profitable_candidates,
+            "gate_applied": False,
+        })
 
         tradeable = [o for o in opportunities if o.get("tradeable")]
         log.info(
@@ -646,6 +625,7 @@ def run_cycle(state):
             "a_trial_eligible": a_trial_eligible,
             "a_trial_rejected": a_trial_rejected,
             "a_trial_rejection_counts": rejection_counts,
+            "perplexity_profitable_candidates": perplexity_profitable_candidates,
             "signal_ids": new_signal_ids,
             "stage3_gate_applied": stage3_gate_applied,
             "stage3_gate_passed": stage3_gate_passed,
