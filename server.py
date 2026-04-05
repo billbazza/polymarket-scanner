@@ -635,9 +635,28 @@ async def stats(runtime_scope: str | None = None):
 @app.get("/api/runtime/account")
 async def runtime_account(runtime_scope: str | None = None):
     runtime_scope = _runtime_scope_param(runtime_scope)
+    import autonomy
+
+    state = autonomy.load_state(runtime_scope=runtime_scope)
+    level_key = str((state or {}).get("level") or "").strip().lower()
+    level_config = autonomy.get_level_config(level_key, runtime_scope)
+    max_open = level_config.get("max_open")
+    slot_usage = db.get_runtime_slot_usage(runtime_scope=runtime_scope, max_open=max_open)
     overview = db.get_runtime_account_overview(
         refresh_unrealized=True,
         runtime_scope=runtime_scope,
+    )
+    overview["max_open"] = max_open
+    overview["max_open_label"] = "No hard cap (cash-limited)" if max_open is None else str(max_open)
+    overview["open_positions"] = int(slot_usage.get("open_positions") or 0)
+    overview["max_open_usage"] = slot_usage.get("max_open_usage")
+    overview["slots_remaining"] = slot_usage.get("slots_remaining")
+    overview["slot_usage"] = slot_usage
+    overview["slot_limit_state"] = _build_slot_limit_state(
+        runtime_scope,
+        max_open=max_open,
+        slot_usage=slot_usage,
+        last_result=_autonomy_status[runtime_scope]["last_result"],
     )
     if runtime_scope == db.RUNTIME_SCOPE_PENNY and not overview.get("verified_live_ledger"):
         log.error(

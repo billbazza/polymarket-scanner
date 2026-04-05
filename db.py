@@ -3738,33 +3738,11 @@ def count_open_copy_trades(wallet: str | None = None, runtime_scope: str | None 
 
 
 def count_open_trades(runtime_scope: str | None = None) -> int:
-    scope = normalize_runtime_scope(runtime_scope, default="")
-    conn = get_conn()
-    params: list = []
-    query = """
-        SELECT id, status, notes, trade_state_mode, reconciliation_mode, runtime_scope
-        FROM trades
-        WHERE status='open'
-    """
-    if scope in {RUNTIME_SCOPE_PAPER, RUNTIME_SCOPE_PENNY}:
-        query += " AND runtime_scope=?"
-        params.append(scope)
-    rows = conn.execute(query, params).fetchall()
-    conn.close()
-    return sum(
-        1
-        for row in rows
-        if not _should_skip_reporting_trade(dict(row))
-        and _is_trade_in_runtime_ledger(dict(row), scope)
-    )
+    return len(_get_runtime_slot_consumers(runtime_scope=runtime_scope))
 
 
-def get_runtime_slot_usage(
-    runtime_scope: str | None = None,
-    *,
-    max_open: int | None = None,
-) -> dict:
-    """Return the canonical scoped slot usage and the open trades consuming it."""
+def _get_runtime_slot_consumers(runtime_scope: str | None = None) -> list[dict]:
+    """Return the canonical open trades that consume slot capacity for a runtime."""
     scope = normalize_runtime_scope(runtime_scope, default="")
     open_trades = get_trades(status="open", limit=None, runtime_scope=scope)
     open_trades = sorted(
@@ -3793,6 +3771,17 @@ def get_runtime_slot_usage(
                 "reconciliation_mode": trade.get("reconciliation_mode"),
             }
         )
+    return consumers
+
+
+def get_runtime_slot_usage(
+    runtime_scope: str | None = None,
+    *,
+    max_open: int | None = None,
+) -> dict:
+    """Return the canonical scoped slot usage and the open trades consuming it."""
+    scope = normalize_runtime_scope(runtime_scope, default="")
+    consumers = _get_runtime_slot_consumers(runtime_scope=scope)
     open_positions = len(consumers)
     slots_remaining = None if max_open is None else max(0, int(max_open) - open_positions)
     return {
