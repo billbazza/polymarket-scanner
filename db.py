@@ -1103,6 +1103,112 @@ def _deserialize_weather_signal_row(row):
     return item
 
 
+def _is_threshold_weather_signal(signal_row: dict) -> bool:
+    strategy_name = (signal_row.get("strategy_name") or signal_row.get("market_family") or "").strip().lower()
+    return not strategy_name.startswith("weather_exact_temp")
+
+
+def _evaluate_weather_threshold_admission(signal_row: dict):
+    if not _is_threshold_weather_signal(signal_row):
+        return None
+    timestamp = signal_row.get("timestamp")
+    if signal_row.get("hours_ahead") is None or timestamp is None:
+        return None
+    try:
+        elapsed_hours = (time.time() - float(timestamp)) / 3600.0
+    except (TypeError, ValueError):
+        return None
+    return weather_admission.evaluate_persisted_threshold_signal(
+        signal_row,
+        elapsed_hours=elapsed_hours,
+        min_trade_edge=weather_admission.DEFAULT_MIN_TRADE_EDGE,
+        min_trade_price=weather_admission.DEFAULT_MIN_TRADE_PRICE,
+    )
+
+
+def _persist_weather_threshold_tradeable_correction(
+    conn,
+    signal_row: dict,
+    admission_check: dict,
+    *,
+    runtime_scope: str | None,
+):
+    signal_id = signal_row["id"]
+    source_meta = dict(signal_row.get("source_meta") or {})
+    scan_admission = source_meta.get("scan_threshold_admission") or source_meta.get("threshold_admission") or {}
+    source_meta["scan_threshold_admission"] = scan_admission or None
+    corrected_admission = {
+        **admission_check,
+        "tradeable": False,
+        "retention_corrected": True,
+        "retention_correction_reason_code": "scan_tradeable_retention_corrected",
+        "retention_correction_reason": (
+            "Persisted weather signal tradeable flag was demoted because shared admission "
+            "now blocks the signal."
+        ),
+    }
+    evidence = {
+        "runtime_scope": runtime_scope,
+        "scan_tradeable": admission_check.get("scan_tradeable"),
+        "stored_tradeable": admission_check.get("stored_tradeable"),
+        "blocking_filters": admission_check.get("blocking_filters"),
+        "scan_blocking_filters": admission_check.get("scan_blocking_filters"),
+        "stored_blocking_filters": admission_check.get("stored_blocking_filters"),
+        "new_blocking_filters": admission_check.get("new_blocking_filters"),
+        "material_state_change": admission_check.get("material_state_change"),
+        "state_change_reason_code": admission_check.get("state_change_reason_code"),
+        "state_change_summary": admission_check.get("state_change_summary"),
+        "scan_hours_ahead_cmp": admission_check.get("scan_hours_ahead_cmp"),
+        "stored_hours_ahead_cmp": admission_check.get("stored_hours_ahead_cmp"),
+        "current_hours_ahead_cmp": admission_check.get("hours_ahead_cmp"),
+    }
+    source_meta["threshold_admission"] = corrected_admission
+    source_meta["tradeable_retention_correction"] = {
+        "applied_at": time.time(),
+        "reason_code": corrected_admission["retention_correction_reason_code"],
+        "reason": corrected_admission["retention_correction_reason"],
+        "evidence": evidence,
+    }
+    conn.execute(
+        "UPDATE weather_signals SET tradeable=0, source_meta_json=? WHERE id=?",
+        (json.dumps(source_meta), signal_id),
+    )
+    signal_row["tradeable"] = 0
+    signal_row["source_meta"] = source_meta
+
+
+def _reconcile_weather_signal_tradeable_retention(
+    conn,
+    signal_row: dict,
+    *,
+    runtime_scope: str | None,
+):
+    admission_check = _evaluate_weather_threshold_admission(signal_row)
+    if not admission_check:
+        return signal_row, admission_check
+    if signal_row.get("tradeable") and not admission_check.get("tradeable"):
+        _persist_weather_threshold_tradeable_correction(
+            conn,
+            signal_row,
+            admission_check,
+            runtime_scope=runtime_scope,
+        )
+        log.warning(
+            "Weather admission corrected retained tradeable signal=%s runtime_scope=%s blocker=%s blocking_filters=%s "
+            "scan_blockers=%s material_state_change=%s state_change_reason=%s scan_hours=%s current_hours=%s",
+            signal_row.get("id"),
+            runtime_scope,
+            admission_check.get("primary_reason_code"),
+            "/".join(admission_check.get("blocking_filters") or []),
+            "/".join(admission_check.get("scan_blocking_filters") or []),
+            admission_check.get("material_state_change"),
+            admission_check.get("state_change_reason_code"),
+            admission_check.get("scan_hours_ahead_cmp"),
+            admission_check.get("hours_ahead_cmp"),
+        )
+    return signal_row, admission_check
+
+
 def _deserialize_signal_row(row):
     d = dict(row)
     if d.get("ev_json"):
@@ -1636,6 +1742,7 @@ def find_open_copy_trade(
         return dict(row) if row else None
     finally:
         if owns_conn:
+            conn.commit()
             conn.close()
 
 
@@ -4056,61 +4163,40 @@ def inspect_weather_trade_open(
             }
 
         signal_row = _deserialize_weather_signal_row(sig)
+        signal_row, admission_check = _reconcile_weather_signal_tradeable_retention(
+            conn,
+            signal_row,
+            runtime_scope=runtime_scope,
+        )
         review = weather_risk_review.get_review_for_signal(
             signal_row,
             mode=_weather_review_mode(mode, runtime_scope),
         )
-        admission_check = None
-        if not (
-            (signal_row.get("strategy_name") or signal_row.get("market_family") or "")
-            .strip()
-            .lower()
-            .startswith("weather_exact_temp")
-        ):
-            timestamp = signal_row.get("timestamp")
-            if signal_row.get("hours_ahead") is not None and timestamp is not None:
-                try:
-                    elapsed_hours = (time.time() - float(timestamp)) / 3600.0
-                except (TypeError, ValueError):
-                    elapsed_hours = None
-                if elapsed_hours is not None:
-                    admission_check = weather_admission.evaluate_persisted_threshold_signal(
-                        signal_row,
-                        elapsed_hours=elapsed_hours,
-                        min_trade_edge=weather_admission.DEFAULT_MIN_TRADE_EDGE,
-                        min_trade_price=weather_admission.DEFAULT_MIN_TRADE_PRICE,
-                    )
         horizon_check = evaluate_weather_signal_horizon(signal_row)
         if admission_check and not admission_check["tradeable"]:
-            if admission_check.get("stored_tradeable") and not admission_check.get("material_state_change"):
-                log.warning(
-                    "Weather admission retained scan tradeable signal=%s runtime_scope=%s blocker=%s without material change proof "
-                    "[scan_hours=%s current_hours=%s]",
-                    weather_signal_id,
-                    runtime_scope,
-                    admission_check.get("primary_reason_code"),
-                    admission_check.get("stored_hours_ahead_cmp"),
-                    admission_check.get("hours_ahead_cmp"),
-                )
-            else:
-                return {
-                    "ok": False,
-                    "reason_code": admission_check.get("primary_reason_code"),
-                    "reason": admission_check.get("primary_reason"),
-                    "signal": signal_row,
-                    "remaining_hours": horizon_check.get("remaining_hours") if horizon_check else None,
-                    "remaining_hours_cmp": admission_check.get("hours_ahead_cmp"),
-                    "stored_hours_ahead_cmp": admission_check.get("stored_hours_ahead_cmp"),
-                    "min_hours_required_cmp": admission_check.get("min_hours_required_cmp"),
-                    "material_state_change": admission_check.get("material_state_change"),
-                    "state_change_reason_code": admission_check.get("state_change_reason_code"),
-                    "state_change_summary": admission_check.get("state_change_summary"),
-                    "guard_thresholds_changed": admission_check.get("guard_thresholds_changed"),
-                    "stored_tradeable": admission_check.get("stored_tradeable"),
-                    "blocking_filters": admission_check.get("blocking_filters"),
-                    **audit_fields,
-                    **_paper_position_policy_dict(),
-                }
+            return {
+                "ok": False,
+                "reason_code": admission_check.get("primary_reason_code"),
+                "reason": admission_check.get("primary_reason"),
+                "signal": signal_row,
+                "remaining_hours": horizon_check.get("remaining_hours") if horizon_check else None,
+                "remaining_hours_cmp": admission_check.get("hours_ahead_cmp"),
+                "scan_hours_ahead_cmp": admission_check.get("scan_hours_ahead_cmp"),
+                "stored_hours_ahead_cmp": admission_check.get("stored_hours_ahead_cmp"),
+                "min_hours_required_cmp": admission_check.get("min_hours_required_cmp"),
+                "material_state_change": admission_check.get("material_state_change"),
+                "state_change_reason_code": admission_check.get("state_change_reason_code"),
+                "state_change_summary": admission_check.get("state_change_summary"),
+                "guard_thresholds_changed": admission_check.get("guard_thresholds_changed"),
+                "scan_tradeable": admission_check.get("scan_tradeable"),
+                "stored_tradeable": admission_check.get("stored_tradeable"),
+                "scan_blocking_filters": admission_check.get("scan_blocking_filters"),
+                "stored_blocking_filters": admission_check.get("stored_blocking_filters"),
+                "blocking_filters": admission_check.get("blocking_filters"),
+                "new_blocking_filters": admission_check.get("new_blocking_filters"),
+                **audit_fields,
+                **_paper_position_policy_dict(),
+            }
         elif not horizon_check["ok"]:
             return {
                 "ok": False,
@@ -4887,6 +4973,11 @@ def update_pairs_trade_metrics(
 
 def save_weather_signal(opp):
     """Save a weather-edge opportunity."""
+    source_meta = dict(opp.get("source_meta") or {})
+    threshold_admission = opp.get("threshold_admission") or source_meta.get("threshold_admission")
+    if threshold_admission:
+        source_meta.setdefault("scan_threshold_admission", threshold_admission)
+        source_meta["threshold_admission"] = threshold_admission
     conn = get_conn()
     conn.execute("""
         INSERT INTO weather_signals (
@@ -4927,7 +5018,7 @@ def save_weather_signal(opp):
         opp.get("selected_edge_pct", opp.get("combined_edge_pct")),
         opp.get("correction_mode"),
         json.dumps(opp.get("correction")) if opp.get("correction") else None,
-        json.dumps(opp.get("source_meta")) if opp.get("source_meta") else None,
+        json.dumps(source_meta) if source_meta else None,
         1 if opp.get("sources_agree") else 0,
         opp.get("sources_available", 0),
         opp.get("hours_ahead"), opp.get("ev_pct"), opp.get("kelly_fraction"),
@@ -4949,15 +5040,7 @@ def get_weather_signals(limit=50, tradeable_only=False, runtime_scope: str | Non
         FROM weather_signals ws
     """
     conn = get_conn()
-    if tradeable_only and limit is None:
-        rows = conn.execute(
-            base + " WHERE ws.tradeable=1 ORDER BY ws.timestamp DESC"
-        ).fetchall()
-    elif tradeable_only:
-        rows = conn.execute(
-            base + " WHERE ws.tradeable=1 ORDER BY ws.timestamp DESC LIMIT ?", (limit,)
-        ).fetchall()
-    elif limit is None:
+    if tradeable_only or limit is None:
         rows = conn.execute(
             base + " ORDER BY ws.timestamp DESC"
         ).fetchall()
@@ -4969,6 +5052,13 @@ def get_weather_signals(limit=50, tradeable_only=False, runtime_scope: str | Non
     try:
         for row in rows:
             item = _deserialize_weather_signal_row(row)
+            item, _ = _reconcile_weather_signal_tradeable_retention(
+                conn,
+                item,
+                runtime_scope=runtime_scope,
+            )
+            if tradeable_only and not item.get("tradeable"):
+                continue
             latest_trade = conn.execute(
                 """
                 SELECT id, status, closed_at, exit_reason, runtime_scope, trade_type, strategy_name
@@ -5038,6 +5128,9 @@ def get_weather_signals(limit=50, tradeable_only=False, runtime_scope: str | Non
                 item["status"] = item.get("status") or "new"
                 item["status_detail"] = None
             results.append(item)
+            if limit is not None and len(results) >= limit:
+                break
+        conn.commit()
     finally:
         conn.close()
     return results
@@ -5047,8 +5140,16 @@ def get_weather_signal_by_id(signal_id):
     """Fetch a single weather signal by id."""
     conn = get_conn()
     row = conn.execute("SELECT * FROM weather_signals WHERE id=?", (signal_id,)).fetchone()
+    item = _deserialize_weather_signal_row(row) if row else None
+    if item:
+        item, _ = _reconcile_weather_signal_tradeable_retention(
+            conn,
+            item,
+            runtime_scope=None,
+        )
+        conn.commit()
     conn.close()
-    return _deserialize_weather_signal_row(row) if row else None
+    return item
 
 
 # --- Locked Arb ---

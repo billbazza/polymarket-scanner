@@ -1132,14 +1132,17 @@ def execute_weather_trade(signal, size_usd, mode=None, runtime_scope: str | None
         if signal.get("tradeable"):
             log.warning(
                 "Weather shared preflight blocked stored tradeable signal=%s strategy=%s runtime_scope=%s "
-                "reason_code=%s material_state_change=%s state_change_reason=%s scan_hours=%s current_hours=%s reason=%s",
+                "reason_code=%s scan_blockers=%s current_blockers=%s material_state_change=%s state_change_reason=%s "
+                "scan_hours=%s current_hours=%s reason=%s",
                 weather_signal_id,
                 strategy_name,
                 runtime_scope,
                 decision.get("reason_code"),
+                decision.get("scan_blocking_filters"),
+                decision.get("blocking_filters"),
                 decision.get("material_state_change"),
                 decision.get("state_change_reason_code"),
-                decision.get("stored_hours_ahead_cmp"),
+                decision.get("scan_hours_ahead_cmp") or decision.get("stored_hours_ahead_cmp"),
                 decision.get("remaining_hours_cmp"),
                 decision.get("reason"),
             )

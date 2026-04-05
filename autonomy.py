@@ -1335,16 +1335,19 @@ def run_cycle(state):
                         ) + 1
                         log.info(
                             "Autonomy weather preflight blocked signal=%s reason_code=%s runtime_scope=%s decision_source=%s blocker_source=%s "
-                            "history_source=%s material_state_change=%s state_change_reason=%s scan_hours=%s current_hours=%s reason=%s",
+                            "history_source=%s scan_blockers=%s current_blockers=%s material_state_change=%s "
+                            "state_change_reason=%s scan_hours=%s current_hours=%s reason=%s",
                             w_id,
                             reason_code,
                             decision.get("runtime_scope"),
                             decision.get("decision_source"),
                             decision.get("blocker_source"),
                             decision.get("history_source"),
+                            decision.get("scan_blocking_filters"),
+                            decision.get("blocking_filters"),
                             decision.get("material_state_change"),
                             decision.get("state_change_reason_code"),
-                            decision.get("stored_hours_ahead_cmp"),
+                            decision.get("scan_hours_ahead_cmp") or decision.get("stored_hours_ahead_cmp"),
                             decision.get("remaining_hours_cmp"),
                             decision["reason"],
                         )
@@ -1370,8 +1373,10 @@ def run_cycle(state):
                                 "material_state_change": decision.get("material_state_change"),
                                 "state_change_reason_code": decision.get("state_change_reason_code"),
                                 "state_change_summary": decision.get("state_change_summary"),
-                                "scan_hours_ahead_cmp": decision.get("stored_hours_ahead_cmp"),
+                                "scan_hours_ahead_cmp": decision.get("scan_hours_ahead_cmp") or decision.get("stored_hours_ahead_cmp"),
                                 "current_hours_ahead_cmp": decision.get("remaining_hours_cmp"),
+                                "scan_blocking_filters": decision.get("scan_blocking_filters"),
+                                "current_blocking_filters": decision.get("blocking_filters"),
                             },
                         )
                         journal({
@@ -1387,6 +1392,8 @@ def run_cycle(state):
                             "history_source": decision.get("history_source"),
                             "material_state_change": decision.get("material_state_change"),
                             "state_change_reason_code": decision.get("state_change_reason_code"),
+                            "scan_blocking_filters": decision.get("scan_blocking_filters"),
+                            "current_blocking_filters": decision.get("blocking_filters"),
                         })
                         continue
                     preflight_candidates.append({

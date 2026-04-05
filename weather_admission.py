@@ -161,8 +161,9 @@ def evaluate_persisted_threshold_signal(
     guard: dict | None = None,
 ):
     source_meta = signal_row.get("source_meta") or {}
-    stored_admission = source_meta.get("threshold_admission") or {}
-    stored_thresholds = stored_admission.get("guard_thresholds") or {}
+    scan_admission = source_meta.get("scan_threshold_admission") or source_meta.get("threshold_admission") or {}
+    stored_admission = source_meta.get("threshold_admission") or scan_admission
+    scan_thresholds = scan_admission.get("guard_thresholds") or {}
     current_hours = _safe_float(signal_row.get("hours_ahead"))
     if current_hours is not None:
         current_hours -= float(elapsed_hours or 0.0)
@@ -192,38 +193,53 @@ def evaluate_persisted_threshold_signal(
         guard=guard,
     )
     stored_tradeable = bool(stored_admission.get("tradeable", signal_row.get("tradeable")))
+    scan_tradeable = bool(scan_admission.get("tradeable", stored_tradeable))
+    scan_hours_cmp = _quantize_hours(
+        scan_admission.get("hours_ahead_cmp", scan_admission.get("hours_ahead", signal_row.get("hours_ahead")))
+    )
     stored_hours_cmp = _quantize_hours(
-        stored_admission.get("hours_ahead_cmp", stored_admission.get("hours_ahead", signal_row.get("hours_ahead")))
+        stored_admission.get("hours_ahead_cmp", stored_admission.get("hours_ahead", scan_admission.get("hours_ahead", signal_row.get("hours_ahead"))))
     )
     current_hours_cmp = admission.get("hours_ahead_cmp")
-    guard_thresholds_changed = bool(stored_thresholds) and stored_thresholds != admission["guard_thresholds"]
+    scan_blocking_filters = list(scan_admission.get("blocking_filters") or [])
+    stored_blocking_filters = list(stored_admission.get("blocking_filters") or scan_blocking_filters)
+    new_blocking_filters = [
+        name for name in admission["blocking_filters"] if name not in scan_blocking_filters
+    ]
+    guard_thresholds_changed = bool(scan_thresholds) and scan_thresholds != admission["guard_thresholds"]
     state_change_reason_code = None
     state_change_summary = None
     material_state_change = False
-    if stored_tradeable and not admission["tradeable"]:
+    if scan_tradeable and not admission["tradeable"]:
         if guard_thresholds_changed:
             material_state_change = True
             state_change_reason_code = "guard_thresholds_changed"
             state_change_summary = (
                 "Weather guard thresholds changed after scan: "
-                f"scan={stored_thresholds} current={admission['guard_thresholds']}."
+                f"scan={scan_thresholds} current={admission['guard_thresholds']}."
             )
         elif (
             admission.get("primary_blocker") == "horizon"
-            and stored_hours_cmp is not None
+            and scan_hours_cmp is not None
             and current_hours_cmp is not None
-            and current_hours_cmp < stored_hours_cmp
+            and current_hours_cmp < scan_hours_cmp
         ):
             material_state_change = True
             state_change_reason_code = "horizon_aged_below_threshold"
             state_change_summary = (
-                f"Signal horizon decayed from {stored_hours_cmp:.1f}h at scan to "
+                f"Signal horizon decayed from {scan_hours_cmp:.1f}h at scan to "
                 f"{current_hours_cmp:.1f}h at preflight."
             )
     admission.update({
+        "scan_tradeable": scan_tradeable,
         "stored_tradeable": stored_tradeable,
+        "scan_threshold_admission": scan_admission or None,
         "stored_threshold_admission": stored_admission or None,
+        "scan_hours_ahead_cmp": scan_hours_cmp,
         "stored_hours_ahead_cmp": stored_hours_cmp,
+        "scan_blocking_filters": scan_blocking_filters,
+        "stored_blocking_filters": stored_blocking_filters,
+        "new_blocking_filters": new_blocking_filters,
         "guard_thresholds_changed": guard_thresholds_changed,
         "material_state_change": material_state_change,
         "state_change_reason_code": state_change_reason_code,
