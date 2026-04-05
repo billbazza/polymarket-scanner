@@ -326,6 +326,20 @@ def _weather_error_context(signal: dict | None, decision: dict | None = None, or
         "order_request": order_request,
     }
 
+class LiveOrderSubmissionError(RuntimeError):
+    """Wrap live order failures with the failing leg and normalized input."""
+
+    def __init__(self, leg: str, order_input: dict, cause: Exception):
+        self.leg = leg
+        self.order_input = order_input
+        self.cause = cause
+        detail = (
+            f"Live order submission failed on leg {leg}: {cause} | "
+            f"token_id={order_input.get('token_id')} side={order_input.get('side')} "
+            f"price={order_input.get('price')} size={order_input.get('size')}"
+        )
+        super().__init__(detail)
+
 
 def _failure_result(mode: str, reason_code: str, error: str, **extra) -> dict:
     runtime_scope = extra.pop("runtime_scope", None)
@@ -479,6 +493,118 @@ def _create_live_clob_client(runtime_scope: str, *, blocker_source: str):
             blocker_source=blocker_source,
         )
     return client, None
+
+
+def _normalize_live_order_input(
+    *,
+    token_id,
+    side,
+    price,
+    size_shares,
+    leg: str,
+    market: str | None = None,
+    purpose: str = "open",
+):
+    normalized_token = api.normalize_token_id(token_id) or str(token_id or "").strip()
+    normalized = {
+        "token_id": normalized_token,
+        "raw_token_id": token_id,
+        "market": market,
+        "side": str(side or "").upper(),
+        "price": round(_safe_float(price), 4),
+        "size": round(_safe_float(size_shares), 4),
+        "leg": leg,
+        "purpose": purpose,
+        "order_type": "GTC",
+    }
+    if not normalized["token_id"]:
+        raise ValueError(f"Missing token_id for leg {leg}")
+    if normalized["price"] <= 0:
+        raise ValueError(f"Invalid live order price for leg {leg}: {price}")
+    if normalized["size"] <= 0:
+        raise ValueError(f"Invalid live order size for leg {leg}: {size_shares}")
+    if normalized["side"] not in {"BUY", "SELL"}:
+        raise ValueError(f"Invalid live order side for leg {leg}: {side}")
+    return normalized
+
+
+def _build_live_order_args(
+    *,
+    token_id,
+    side,
+    price,
+    size_shares,
+    leg: str,
+    market: str | None = None,
+    purpose: str = "open",
+):
+    from py_clob_client.clob_types import OrderArgs
+
+    order_input = _normalize_live_order_input(
+        token_id=token_id,
+        side=side,
+        price=price,
+        size_shares=size_shares,
+        leg=leg,
+        market=market,
+        purpose=purpose,
+    )
+    return OrderArgs(
+        token_id=order_input["token_id"],
+        price=order_input["price"],
+        size=order_input["size"],
+        side=order_input["side"],
+    ), order_input
+
+
+def _submit_live_order(
+    client,
+    *,
+    token_id,
+    side,
+    price,
+    size_shares,
+    leg: str,
+    market: str | None = None,
+    purpose: str = "open",
+):
+    try:
+        order_args, order_input = _build_live_order_args(
+            token_id=token_id,
+            side=side,
+            price=price,
+            size_shares=size_shares,
+            leg=leg,
+            market=market,
+            purpose=purpose,
+        )
+        raw_order = client.create_and_post_order(order_args)
+        return raw_order, order_input
+    except Exception as exc:
+        if "order_input" not in locals():
+            order_input = {
+                "token_id": api.normalize_token_id(token_id) or str(token_id or "").strip(),
+                "raw_token_id": token_id,
+                "market": market,
+                "side": str(side or "").upper(),
+                "price": round(_safe_float(price), 4),
+                "size": round(_safe_float(size_shares), 4),
+                "leg": leg,
+                "purpose": purpose,
+                "order_type": "GTC",
+            }
+        log.error(
+            "Live order submission failed leg=%s purpose=%s token_id=%s market=%s side=%s price=%.4f size=%.4f error=%s",
+            leg,
+            purpose,
+            order_input.get("token_id"),
+            order_input.get("market"),
+            order_input.get("side"),
+            order_input.get("price") or 0.0,
+            order_input.get("size") or 0.0,
+            exc,
+        )
+        raise LiveOrderSubmissionError(leg, order_input, exc) from exc
 
 
 def execute_trade(signal, size_usd, mode=None, runtime_scope: str | None = None):
@@ -934,8 +1060,15 @@ def execute_weather_trade(signal, size_usd, mode=None, runtime_scope: str | None
         price = _get_single_leg_price(entry_token, side, exec_mode=exec_mode)
         shares = round(size_usd / max(price, 0.0001), 4)
         order_request = _build_live_order_request(entry_token, side, price, shares)
-        raw_order = client.create_and_post_order(
-            _build_live_order_args(entry_token, side, price, shares)
+        raw_order, order_input = _submit_live_order(
+            client,
+            token_id=entry_token,
+            side=side,
+            price=price,
+            size_shares=shares,
+            leg="a",
+            market=signal.get("market"),
+            purpose="open",
         )
         order_payload = _order_response_dict(raw_order)
         order_id = _extract_order_id(order_payload) or str(raw_order)
@@ -966,6 +1099,7 @@ def execute_weather_trade(signal, size_usd, mode=None, runtime_scope: str | None
                     "price": price,
                     "size_shares": shares,
                     "size_usd": round(size_usd, 2),
+                    "order_input": order_input,
                     "response": order_payload,
                 },
             },
@@ -1059,6 +1193,17 @@ def execute_weather_trade(signal, size_usd, mode=None, runtime_scope: str | None
             "confidence_compare_only": confidence_meta.get("compare_only") if confidence_meta else None,
             "confidence_rollout_state": confidence_meta.get("rollout_state") if confidence_meta else None,
             "quarter_kelly_capped": bool(quarter_kelly_capped),
+        }
+    except LiveOrderSubmissionError as exc:
+        return {
+            "ok": False,
+            "mode": "live",
+            "reason_code": "exchange_order_failed",
+            "error": str(exc),
+            "weather_signal_id": weather_signal_id,
+            "strategy_name": strategy_name,
+            "order_leg": exc.leg,
+            "order_input": exc.order_input,
         }
     except Exception as exc:
         error_context = _weather_error_context(
@@ -1413,8 +1558,15 @@ def close_live_trade(trade: dict, notes: str = "") -> dict:
             current_a = api.get_midpoint(token_a)
             close_side_a = "SELL" if "BUY" in str(trade.get("side_a") or "").upper() else "BUY"
             shares_a = round((_safe_float(trade.get("size_usd")) / max(_safe_float(trade.get("entry_price_a")), 0.0001)), 4)
-            raw_order_a = client.create_and_post_order(
-                _build_live_order_args(token_a, close_side_a, current_a, shares_a)
+            raw_order_a, _ = _submit_live_order(
+                client,
+                token_id=token_a,
+                side=close_side_a,
+                price=current_a,
+                size_shares=shares_a,
+                leg="a",
+                market=trade.get("market_a"),
+                purpose="close",
             )
             order_a = _order_response_dict(raw_order_a)
             exit_execution["orders"]["a"] = {
@@ -1460,11 +1612,25 @@ def close_live_trade(trade: dict, notes: str = "") -> dict:
         half_size = _safe_float(trade.get("size_usd")) / 2
         shares_a = round(half_size / max(_safe_float(trade.get("entry_price_a")), 0.0001), 4)
         shares_b = round(half_size / max(_safe_float(trade.get("entry_price_b")), 0.0001), 4)
-        raw_order_a = client.create_and_post_order(
-            _build_live_order_args(token_a, close_side_a, current_a, shares_a)
+        raw_order_a, _ = _submit_live_order(
+            client,
+            token_id=token_a,
+            side=close_side_a,
+            price=current_a,
+            size_shares=shares_a,
+            leg="a",
+            market=trade.get("market_a"),
+            purpose="close",
         )
-        raw_order_b = client.create_and_post_order(
-            _build_live_order_args(token_b, close_side_b, current_b, shares_b)
+        raw_order_b, _ = _submit_live_order(
+            client,
+            token_id=token_b,
+            side=close_side_b,
+            price=current_b,
+            size_shares=shares_b,
+            leg="b",
+            market=trade.get("market_b"),
+            purpose="close",
         )
         order_a = _order_response_dict(raw_order_a)
         order_b = _order_response_dict(raw_order_b)
@@ -1544,14 +1710,28 @@ def _execute_live(signal, size_usd, price_a, price_b,
         token_a = signal.get("token_id_a") or signal["market_a"]
         token_b = signal.get("token_id_b") or signal["market_b"]
         order_type = "GTC"
-        size_shares_a = round(half_size / price_a, 4) if price_a > 0 else 0
-        size_shares_b = round(half_size / price_b, 4) if price_b > 0 else 0
+        shares_a = round(half_size / price_a, 4) if price_a > 0 else 0
+        shares_b = round(half_size / price_b, 4) if price_b > 0 else 0
 
-        raw_order_a = client.create_and_post_order(
-            _build_live_order_args(token_a, side_a, price_a, size_shares_a)
+        raw_order_a, order_input_a = _submit_live_order(
+            client,
+            token_id=token_a,
+            side=side_a,
+            price=price_a,
+            size_shares=shares_a,
+            leg="a",
+            market=signal.get("market_a"),
+            purpose="open",
         )
-        raw_order_b = client.create_and_post_order(
-            _build_live_order_args(token_b, side_b, price_b, size_shares_b)
+        raw_order_b, order_input_b = _submit_live_order(
+            client,
+            token_id=token_b,
+            side=side_b,
+            price=price_b,
+            size_shares=shares_b,
+            leg="b",
+            market=signal.get("market_b"),
+            purpose="open",
         )
         order_a = _order_response_dict(raw_order_a)
         order_b = _order_response_dict(raw_order_b)
@@ -1586,8 +1766,9 @@ def _execute_live(signal, size_usd, price_a, price_b,
                     "token_id": api.normalize_token_id(token_a),
                     "side": side_a,
                     "price": price_a,
-                    "size_shares": size_shares_a,
+                    "size_shares": shares_a,
                     "size_usd": round(half_size, 2),
+                    "order_input": order_input_a,
                     "response": order_a,
                 },
                 "b": {
@@ -1596,8 +1777,9 @@ def _execute_live(signal, size_usd, price_a, price_b,
                     "token_id": api.normalize_token_id(token_b),
                     "side": side_b,
                     "price": price_b,
-                    "size_shares": size_shares_b,
+                    "size_shares": shares_b,
                     "size_usd": round(half_size, 2),
+                    "order_input": order_input_b,
                     "response": order_b,
                 },
             },
@@ -1631,7 +1813,7 @@ def _execute_live(signal, size_usd, price_a, price_b,
                 "side":        side,
                 "leg":         leg,
                 "limit_price": price,
-                "size_shares": size_shares_a if leg == "a" else size_shares_b,
+                "size_shares": shares_a if leg == "a" else shares_b,
                 "size_usd":    half_size,
                 "status":      "pending",
                 "mode":        "live",
@@ -1676,6 +1858,22 @@ def _execute_live(signal, size_usd, price_a, price_b,
             "quarter_kelly_capped": bool(quarter_kelly_capped),
         }
 
+    except LiveOrderSubmissionError as exc:
+        return _failure_result(
+            "live",
+            "exchange_order_failed",
+            str(exc),
+            runtime_scope=runtime_scope,
+            blocker_source="shared-external",
+            order_leg=exc.leg,
+            order_input=exc.order_input,
+            signal_context={
+                "signal_id": signal.get("id"),
+                "event": signal.get("event"),
+                "market_a": signal.get("market_a"),
+                "market_b": signal.get("market_b"),
+            },
+        )
     except Exception as e:
         log.error("Live execution failed: %s", e)
         return _failure_result(
@@ -1730,8 +1928,14 @@ def place_gtc_order(token_id, side, price, size_shares, mode=None):
         return client_error
 
     try:
-        result = client.create_and_post_order(
-            _build_live_order_args(token_id, side, price, size_shares)
+        result, _ = _submit_live_order(
+            client,
+            token_id=token_id,
+            side=side,
+            price=price,
+            size_shares=size_shares,
+            leg="single",
+            purpose="manual",
         )
         log.info("LIVE GTC: order=%s placed", result)
         return {
