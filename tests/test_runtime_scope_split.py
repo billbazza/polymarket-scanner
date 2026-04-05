@@ -260,6 +260,65 @@ class RuntimeScopeSplitTests(unittest.TestCase):
         )
         self.assertTrue(penny_stats["acceptance_checks"]["all_passed"])
 
+    def test_penny_scope_excludes_paper_state_rows_from_live_ledger_views(self):
+        signal_id = self.db.save_signal(_signal())
+        stray_trade_id = self.db.open_trade(
+            signal_id,
+            size_usd=9,
+            metadata={
+                "runtime_scope": self.db.RUNTIME_SCOPE_PENNY,
+                "trade_state_mode": self.db.TRADE_STATE_PAPER,
+                "reconciliation_mode": self.db.RECONCILIATION_INTERNAL,
+            },
+        )
+        live_trade_id = self.db.open_trade(
+            signal_id,
+            size_usd=3,
+            metadata={
+                "runtime_scope": self.db.RUNTIME_SCOPE_PENNY,
+                "trade_state_mode": self.db.TRADE_STATE_LIVE,
+                "reconciliation_mode": self.db.RECONCILIATION_ORDERS,
+            },
+        )
+
+        self.assertIsNotNone(stray_trade_id)
+        self.assertIsNotNone(live_trade_id)
+
+        with patch.object(self.db, "_get_live_wallet_snapshot", return_value={
+            "ok": True,
+            "verified": True,
+            "verification_status": "verified",
+            "wallet_connected": True,
+            "wallet_address": "0x1234567890abcdef1234567890abcdef12345678",
+            "available_balance_usd": 20.0,
+            "balance_source": "polygon_wallet",
+            "wallet_error": None,
+            "verification_error": None,
+            "block_number": 123,
+            "block_hash": "0xabc",
+            "block_timestamp": 1710000000,
+            "block_age_seconds": 12,
+            "max_block_age_seconds": 180,
+            "chain_id": 137,
+            "expected_chain_id": 137,
+            "chain_parity_ok": True,
+            "verified_at": 1710000012,
+        }):
+            penny_trades = self.client.get("/api/trades?status=open&runtime_scope=penny").json()
+            penny_stats = self.client.get("/api/stats?runtime_scope=penny").json()
+            penny_account = self.client.get("/api/runtime/account?runtime_scope=penny").json()
+            penny_runtime = self.client.get("/api/autonomy/runtime?runtime_scope=penny").json()
+
+        self.assertEqual([row["id"] for row in penny_trades], [live_trade_id])
+        self.assertEqual(penny_stats["open_trades"], 1)
+        self.assertEqual(penny_stats["total_trades"], 1)
+        self.assertEqual(penny_stats["trade_reconciliation"]["excluded_non_ledger_trades"], 1)
+        self.assertEqual(penny_account["open_positions"], 1)
+        self.assertEqual(penny_account["deployed_capital_usd"], 3.0)
+        self.assertEqual(penny_account["trade_reconciliation"]["excluded_non_ledger_trades"], 1)
+        self.assertEqual(penny_runtime["open_positions"], 1)
+        self.assertEqual(penny_runtime["max_open_usage"], "1/3")
+
     def test_closed_trade_history_api_is_runtime_scoped(self):
         signal_id = self.db.save_signal(_signal())
         paper_trade_id = self.db.open_trade(
