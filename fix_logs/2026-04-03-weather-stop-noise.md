@@ -13,6 +13,7 @@
 - Added noise-guard constants in `weather_scanner.py` so a signal must now clear three tradeable gates: at least 48 hours to its threshold, >=$10k liquidity, and <=12pp spread between NOAA/Open-Meteo probabilities; the existing `sources_agree` gate still applies and the guard feeds both baseline and corrected tradeable flags.
 - Surface the guard status via the opportunity metadata (`stable_liquidity`, `horizon_ok`, `disagreement_ok`, `stable_noise_guard`) and log noise-gate pass/fail with every scanned market to make the new filter traceable.
 - Raised the weather stop-loss floor to 18% in `tracker.py` so the paper engine tolerates the now-filtered-but-still-noisy swings, thereby keeping the trade open a bit longer while still closing before the noise fully resolves.
+- Superseded on `2026-04-05`: the supported stop policy moved back to `15%` after the April 4-5 investigation confirmed that the wider `18%` stop was amplifying gap-through losses without fixing the underlying entry-horizon noise. See `fix_logs/2026-04-05-weather-stop-loss-investigation.md`.
 - Updated and renamed the lifecycle test to assert the new configured floor and to keep the expectation derived from `tracker.WEATHER_STOP_LOSS_PCT` instead of a hard-coded 15%.
 
 ## Tests

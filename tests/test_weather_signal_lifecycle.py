@@ -1,7 +1,9 @@
+import json
 import importlib
 import os
 import tempfile
 import unittest
+from pathlib import Path
 from unittest import mock
 
 
@@ -41,6 +43,7 @@ def _weather_opp(
         "action": "BUY_YES",
         "tradeable": True,
         "liquidity": 1000,
+        "strategy_name": "weather_threshold",
     }
 
 
@@ -48,6 +51,7 @@ class WeatherSignalLifecycleTests(unittest.TestCase):
     def setUp(self):
         self.tmpdir = tempfile.TemporaryDirectory()
         self.old_db_path = os.environ.get("SCANNER_DB_PATH")
+        self.old_diag_dir = os.environ.get("SCANNER_DIAGNOSTICS_DIR")
         os.environ["SCANNER_DB_PATH"] = os.path.join(self.tmpdir.name, "scanner-test.db")
 
         import db
@@ -61,6 +65,10 @@ class WeatherSignalLifecycleTests(unittest.TestCase):
             os.environ.pop("SCANNER_DB_PATH", None)
         else:
             os.environ["SCANNER_DB_PATH"] = self.old_db_path
+        if self.old_diag_dir is None:
+            os.environ.pop("SCANNER_DIAGNOSTICS_DIR", None)
+        else:
+            os.environ["SCANNER_DIAGNOSTICS_DIR"] = self.old_diag_dir
 
         import db
 
@@ -224,7 +232,11 @@ class WeatherSignalLifecycleTests(unittest.TestCase):
         self.assertEqual(result, [])
         self.assertEqual(self.db.get_trade(trade_id)["status"], "open")
 
-        with mock.patch.object(tracker, "_resolve_single_leg_price", return_value={"price": stop_floor - 0.002, "source": "midpoint", "resolved": False}):
+        with mock.patch.object(
+            tracker,
+            "_resolve_single_leg_price",
+            return_value={"price": stop_floor - 0.002, "source": "midpoint", "resolved": False},
+        ), mock.patch.object(tracker.weather_guard_state, "register_failure"):
             result = tracker.auto_close_trades()
 
         self.assertEqual(len(result), 1)
@@ -232,7 +244,51 @@ class WeatherSignalLifecycleTests(unittest.TestCase):
         self.assertEqual(close["trade_id"], trade_id)
         self.assertIn("stop-loss hit", close["reason"])
         self.assertEqual(self.db.get_trade(trade_id)["status"], "closed")
+        self.assertAlmostEqual(tracker.WEATHER_STOP_LOSS_PCT, 0.15, places=4)
         self.assertAlmostEqual(stop_floor, trade["entry_price_a"] * (1 - tracker.WEATHER_STOP_LOSS_PCT), places=4)
+
+    def test_weather_stop_loss_persists_diagnostics_in_test_scoped_path(self):
+        signal_id = self.db.save_weather_signal(
+            _weather_opp(city="Denver", market="Will Denver hit 62F?", yes_token="yes-den", no_token="no-den")
+        )
+        trade_id = self.db.open_weather_trade(signal_id, size_usd=20)
+
+        import tracker
+
+        tracker = importlib.reload(tracker)
+        diagnostics_path = tracker._stop_contexts_file().resolve()
+        expected_path = (Path(self.tmpdir.name) / "reports" / "diagnostics" / "weather-stop-contexts.jsonl").resolve()
+        self.assertEqual(diagnostics_path, expected_path)
+
+        stop_floor = self.db.get_trade(trade_id)["entry_price_a"] * (1 - tracker.WEATHER_STOP_LOSS_PCT)
+        with mock.patch.object(
+            tracker,
+            "_resolve_single_leg_price",
+            return_value={"price": stop_floor - 0.01, "source": "midpoint", "resolved": False},
+        ), mock.patch.object(tracker.journal_writer, "append_entry") as append_entry, mock.patch.object(
+            tracker.weather_guard_state,
+            "register_failure",
+        ):
+            result = tracker.auto_close_trades()
+
+        self.assertEqual(len(result), 1)
+        self.assertTrue(diagnostics_path.exists())
+        rows = [json.loads(line) for line in diagnostics_path.read_text().splitlines() if line.strip()]
+        self.assertEqual(len(rows), 1)
+        payload = rows[0]
+        context = payload["context"]
+
+        self.assertEqual(payload["trade_id"], trade_id)
+        self.assertEqual(payload["signal_id"], signal_id)
+        self.assertEqual(context["city"], "denver")
+        self.assertEqual(context["target_date"], "2026-04-03")
+        self.assertEqual(context["strategy_name"], "weather_threshold")
+        self.assertTrue(context["sources_agree"])
+        self.assertTrue(context["gap_through_stop"])
+        self.assertEqual(context["trigger_type"], "gap_through")
+        self.assertIsNotNone(context["entry_age_hours"])
+        self.assertIsNotNone(context["hold_hours"])
+        append_entry.assert_called_once()
 
 
 if __name__ == "__main__":

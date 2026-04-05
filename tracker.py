@@ -1,6 +1,7 @@
 """Paper trading engine — monitors open trades, updates prices, manages P&L."""
 import json
 import logging
+import os
 import time
 from datetime import date, datetime
 from pathlib import Path
@@ -13,7 +14,7 @@ import journal_writer
 import weather_guard_state
 
 log = logging.getLogger("scanner.tracker")
-WEATHER_STOP_LOSS_PCT = 0.18
+WEATHER_STOP_LOSS_PCT = 0.15
 WEATHER_MAX_HOLD_HOURS = 72
 _WARN_TTL_SECS = 6 * 60 * 60
 _LAST_WARNINGS = {}
@@ -22,7 +23,17 @@ WHALE_MAX_HOLD_SECS = 48 * 3600
 WHALE_VOLATILITY_DROP_PCT = 0.15
 WHALE_AGGREGATE_ALERT_DRAWDOWN_USD = 50.0
 WHALE_AGGREGATE_ALERT_DRAWDOWN_USD = 50.0
-_STOP_CONTEXTS_FILE = Path(__file__).resolve().parent / "reports" / "diagnostics" / "weather-stop-contexts.jsonl"
+
+
+def _diagnostics_dir():
+    configured = os.environ.get("SCANNER_DIAGNOSTICS_DIR")
+    if configured:
+        return Path(configured)
+    return db.DB_PATH.resolve().parent / "reports" / "diagnostics"
+
+
+def _stop_contexts_file():
+    return _diagnostics_dir() / "weather-stop-contexts.jsonl"
 
 
 def refresh_open_trades():
@@ -78,15 +89,45 @@ def _build_weather_stop_context(trade, signal, entry_price, current_price, stop_
         if observed_hour is not None and previous_hour is not None
         else None
     )
+    trade_opened_at = _safe_float(trade.get("opened_at"))
+    signal_timestamp = _safe_float(signal.get("timestamp")) if signal else None
+    now = time.time()
+    hold_hours = (
+        round(max(0.0, now - trade_opened_at) / 3600, 2)
+        if trade_opened_at is not None
+        else None
+    )
+    entry_age_hours = (
+        round(max(0.0, trade_opened_at - signal_timestamp) / 3600, 2)
+        if trade_opened_at is not None and signal_timestamp is not None
+        else None
+    )
+    gap_below_stop = (
+        round(max(0.0, stop_floor - current_price), 4)
+        if stop_floor is not None and current_price is not None
+        else None
+    )
+    gap_through_stop = bool(
+        stop_floor is not None and current_price is not None and current_price < stop_floor
+    )
 
     context = {
         "signal_id": trade.get("weather_signal_id"),
         "entry_price": entry_price,
         "stop_floor": stop_floor,
         "current_price": current_price,
+        "city": signal.get("city") if signal else None,
+        "target_date": signal.get("target_date") if signal else None,
+        "strategy_name": signal.get("strategy_name") if signal else None,
         "hours_ahead": signal.get("hours_ahead") if signal else None,
         "edge_pct": signal.get("combined_edge_pct") if signal else None,
         "liquidity": signal.get("liquidity") if signal else None,
+        "sources_agree": signal.get("sources_agree") if signal else None,
+        "entry_age_hours": entry_age_hours,
+        "hold_hours": hold_hours,
+        "gap_through_stop": gap_through_stop,
+        "gap_below_stop": gap_below_stop,
+        "trigger_type": "gap_through" if gap_through_stop else "floor_touch",
         "observation": {
             "source": observation.get("source"),
             "observed_at": observation.get("observed_at"),
@@ -114,8 +155,9 @@ def _record_weather_stop_context(trade, context, reason):
         "logged_at": datetime.now().isoformat(),
     }
     try:
-        _STOP_CONTEXTS_FILE.parent.mkdir(parents=True, exist_ok=True)
-        with open(_STOP_CONTEXTS_FILE, "a") as f:
+        stop_contexts_file = _stop_contexts_file()
+        stop_contexts_file.parent.mkdir(parents=True, exist_ok=True)
+        with open(stop_contexts_file, "a") as f:
             f.write(json.dumps(payload) + "\n")
     except Exception as exc:
         log.warning("Failed to persist weather stop context for %s: %s", token_id, exc)
@@ -553,7 +595,9 @@ def _auto_close_weather(trade):
                 trade_id, reason, pnl_usd, event_label, context,
             )
             _record_weather_stop_context(trade, context, reason)
-            weather_guard_state.register_failure(reason)
+            weather_guard_state.register_failure(
+                f"{reason}; trigger={context.get('trigger_type')}; hold_hours={context.get('hold_hours')}"
+            )
             return {
                 "trade_id": trade_id,
                 "trade_type": "weather",
