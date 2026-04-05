@@ -1,0 +1,6 @@
+tunnel: 2f741e0f-2df9-4673-847d-26785964c43c
+credentials-file: /Users/will/.cloudflared/2f741e0f-2df9-4673-847d-26785964c43c.json
+ingress:
+    - hostname: scanner.battleshipreset.com
+      service: http://localhost:8899
+    - service: http_status:404

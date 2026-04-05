@@ -400,7 +400,6 @@
     <div class="header-actions">
       <span class="status-dot" id="statusDot"></span>
       <span id="lastScan" style="color: var(--text2); font-size: 12px;">No scans yet</span>
-      <button class="btn sky" id="weatherScanBtn" onclick="runWeatherScan()">Weather Scan</button>
       <button class="btn" id="autoTradeBtn" onclick="runAutoTrade()" style="background:var(--green);color:#000;font-weight:600;">Auto Trade</button>
     </div>
   </header>
@@ -600,12 +599,11 @@
   <!-- ── Weather Edge ── -->
   <div id="panel-weather" style="display:none">
     <div class="panel-toolbar">
-      <span class="info" id="weatherInfo">Run a Weather scan to compare NOAA + Open-Meteo vs market prices.</span>
+      <span class="info" id="weatherInfo">Weather scan results mirror the autonomy pipeline’s saved opportunities.</span>
       <div style="display:flex;gap:8px;">
         <label style="color:var(--text2);font-size:12px;display:flex;align-items:center;gap:4px;">
           <input type="checkbox" id="weatherTradeableOnly" onchange="persistUiPrefs(); loadWeather()"> Tradeable only
         </label>
-        <button class="btn sm sky" onclick="runWeatherScan()">Scan Now</button>
       </div>
     </div>
     <div class="table-wrap">
@@ -1707,16 +1705,6 @@ function runLockedScan() {
     toast(`Locked arb: ${data.opportunities} opps (${data.tradeable} tradeable) in ${data.duration_secs}s`);
     loadLocked();
     document.getElementById('statLocked').textContent = data.opportunities;
-  });
-}
-
-function runWeatherScan() {
-  _scan('weatherScanBtn', 'Weather', '/api/scan/weather', data => {
-    const mkt = data.markets_checked ? ` · scanned ${data.markets_checked.toLocaleString()} markets` : '';
-    const found = data.weather_found != null ? `, ${data.weather_found} matched parser` : '';
-    toast(`Weather: ${data.opportunities} signals (${data.tradeable} tradeable) in ${data.duration_secs}s${mkt}${found}`);
-    loadWeather();
-    document.getElementById('statWeather').textContent = data.opportunities;
   });
 }
 
