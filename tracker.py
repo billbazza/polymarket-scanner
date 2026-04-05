@@ -36,7 +36,7 @@ def _stop_contexts_file():
     return _diagnostics_dir() / "weather-stop-contexts.jsonl"
 
 
-def refresh_open_trades():
+def refresh_open_trades(runtime_scope: str | None = None):
     """Update current prices for all open trades and save snapshots.
 
     Handles both pairs trades (two-leg spread) and weather trades (single-leg).
@@ -44,7 +44,7 @@ def refresh_open_trades():
     Returns:
         list of dicts with trade_id, current prices, and unrealized P&L.
     """
-    trades = db.get_trades(status="open", limit=None)
+    trades = db.get_trades(status="open", limit=None, runtime_scope=runtime_scope)
     if not trades:
         log.debug("No open trades to refresh")
         return []
@@ -524,7 +524,7 @@ def _refresh_pairs_trade(trade):
     }]
 
 
-def auto_close_trades(z_threshold=0.5):
+def auto_close_trades(z_threshold=0.5, runtime_scope: str | None = None):
     """Close trades where the exit condition is met.
 
     Pairs: close when |z-score| < z_threshold (spread reverted) or price resolved.
@@ -533,7 +533,7 @@ def auto_close_trades(z_threshold=0.5):
     Returns:
         list of dicts with closed trade info and realized P&L.
     """
-    trades = db.get_trades(status="open", limit=None)
+    trades = db.get_trades(status="open", limit=None, runtime_scope=runtime_scope)
     if not trades:
         log.debug("No open trades to check for auto-close")
         return []

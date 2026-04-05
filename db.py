@@ -19,6 +19,9 @@ TRADE_STATE_PAPER = "paper_research"
 TRADE_STATE_WALLET = "wallet_attached"
 TRADE_STATE_LIVE = "live_exchange"
 
+RUNTIME_SCOPE_PAPER = "paper"
+RUNTIME_SCOPE_PENNY = "penny"
+
 RECONCILIATION_INTERNAL = "internal_simulation"
 RECONCILIATION_WALLET = "wallet_position"
 RECONCILIATION_ORDERS = "exchange_orders"
@@ -46,6 +49,14 @@ _WATCHED_WALLET_MONITOR_COLUMNS = [
 ]
 
 DEFAULT_WEATHER_REOPEN_PROBATION_LIMIT = 1
+
+
+def normalize_runtime_scope(value: str | None, *, default: str = RUNTIME_SCOPE_PAPER) -> str:
+    if value == RUNTIME_SCOPE_PENNY:
+        return RUNTIME_SCOPE_PENNY
+    if value == RUNTIME_SCOPE_PAPER:
+        return RUNTIME_SCOPE_PAPER
+    return default
 
 
 def _connect():
@@ -654,6 +665,46 @@ def _migration_010_wallet_monitor_events(conn):
     """)
 
 
+def _migration_021_runtime_scope_split(conn):
+    _ensure_columns_if_table_exists(
+        conn,
+        "trades",
+        [("runtime_scope", "TEXT NOT NULL DEFAULT 'paper'")],
+    )
+    _ensure_columns_if_table_exists(
+        conn,
+        "paper_trade_attempts",
+        [("runtime_scope", "TEXT NOT NULL DEFAULT 'paper'")],
+    )
+    conn.execute(
+        """
+        UPDATE trades
+        SET runtime_scope = CASE
+            WHEN trade_state_mode IN (?, ?) THEN ?
+            ELSE ?
+        END
+        WHERE runtime_scope IS NULL OR runtime_scope = ''
+        """,
+        (
+            TRADE_STATE_WALLET,
+            TRADE_STATE_LIVE,
+            RUNTIME_SCOPE_PENNY,
+            RUNTIME_SCOPE_PAPER,
+        ),
+    )
+    conn.execute(
+        """
+        UPDATE paper_trade_attempts
+        SET runtime_scope = CASE
+            WHEN LOWER(COALESCE(autonomy_level, '')) IN ('penny', 'book') THEN ?
+            ELSE ?
+        END
+        WHERE runtime_scope IS NULL OR runtime_scope = ''
+        """,
+        (RUNTIME_SCOPE_PENNY, RUNTIME_SCOPE_PAPER),
+    )
+
+
 def _migration_011_trade_monitor_events(conn):
     conn.executescript("""
         CREATE TABLE IF NOT EXISTS trade_monitor_events (
@@ -920,6 +971,7 @@ _MIGRATIONS = [
     ("017_perplexity_metadata", _migration_017_perplexity_metadata),
     ("018_weather_token_probation", _migration_018_weather_token_probation),
     ("019_signal_grade_field", _migration_019_signal_grade_field),
+    ("021_runtime_scope_split", _migration_021_runtime_scope_split),
 ]
 
 
@@ -1346,6 +1398,7 @@ def find_open_copy_trade(
     external_position_id: str | None = None,
     condition_id: str | None = None,
     outcome: str | None = None,
+    runtime_scope: str | None = None,
     conn=None,
 ) -> dict | None:
     """Return the current open copy trade matching a watched-wallet position."""
@@ -1358,7 +1411,7 @@ def find_open_copy_trade(
     conn = conn or get_conn()
     try:
         matchers = []
-        params = [wallet_norm]
+        params = [wallet_norm, normalize_runtime_scope(runtime_scope)]
         if canonical_ref:
             matchers.append("canonical_ref = ?")
             params.append(canonical_ref)
@@ -1377,6 +1430,7 @@ def find_open_copy_trade(
             WHERE trade_type='copy'
               AND status='open'
               AND copy_wallet=?
+              AND runtime_scope=?
               AND ({' OR '.join(matchers)})
             ORDER BY opened_at DESC, id DESC
             LIMIT 1
@@ -1698,11 +1752,19 @@ def _empty_strategy_bucket(strategy: str) -> dict:
     }
 
 
-def get_strategy_performance(refresh_unrealized: bool = False) -> dict:
+def _runtime_scope_clause(runtime_scope: str | None, column: str = "runtime_scope") -> tuple[str, list]:
+    scope = normalize_runtime_scope(runtime_scope, default="")
+    if scope not in {RUNTIME_SCOPE_PAPER, RUNTIME_SCOPE_PENNY}:
+        return "", []
+    return f" WHERE {column} = ?", [scope]
+
+
+def get_strategy_performance(refresh_unrealized: bool = False, runtime_scope: str | None = None) -> dict:
+    scope = normalize_runtime_scope(runtime_scope, default="")
     if refresh_unrealized:
         try:
             import tracker
-            tracker.refresh_open_trades()
+            tracker.refresh_open_trades(runtime_scope=runtime_scope)
         except Exception as e:
             log.warning("Failed to refresh open paper trades for strategy summary: %s", e)
 
@@ -1710,13 +1772,13 @@ def get_strategy_performance(refresh_unrealized: bool = False) -> dict:
     try:
         account = _paper_account_row(conn)
         starting_bankroll = float(account["starting_bankroll"] or 0.0)
+        where_clause, params = _runtime_scope_clause(runtime_scope)
         rows = conn.execute("""
             SELECT id, trade_type, strategy_name, status, pnl, size_usd, notes,
-                   trade_state_mode, reconciliation_mode,
+                   trade_state_mode, reconciliation_mode, runtime_scope,
                    external_order_id_a, external_order_id_b
             FROM trades
-            ORDER BY opened_at ASC, id ASC
-        """).fetchall()
+        """ + where_clause + " ORDER BY opened_at ASC, id ASC", params).fetchall()
         valuation_map = _open_trade_valuation_map_from_snapshots(conn)
     finally:
         conn.close()
@@ -1730,6 +1792,8 @@ def get_strategy_performance(refresh_unrealized: bool = False) -> dict:
     total_external_open_trades = 0
     total_open_trades_missing_marks = 0
     total_inferred_trade_states = 0
+
+    treat_all_scoped_trades_as_primary = scope == RUNTIME_SCOPE_PENNY
 
     for row in rows:
         trade = dict(row)
@@ -1755,7 +1819,7 @@ def get_strategy_performance(refresh_unrealized: bool = False) -> dict:
             else:
                 bucket["open_trades_missing_marks"] += 1
                 total_open_trades_missing_marks += 1
-            if state["is_paper"]:
+            if state["is_paper"] or treat_all_scoped_trades_as_primary:
                 bucket["paper_open_trades"] += 1
                 bucket["committed_capital"] += size_usd
                 if valuation["ok"]:
@@ -1771,7 +1835,7 @@ def get_strategy_performance(refresh_unrealized: bool = False) -> dict:
         elif trade.get("status") == "closed":
             bucket["closed_trades"] += 1
             bucket["realized_pnl"] += pnl
-            if state["is_paper"]:
+            if state["is_paper"] or treat_all_scoped_trades_as_primary:
                 bucket["paper_closed_trades"] += 1
                 bucket["paper_realized_pnl"] += pnl
             if pnl > 0:
@@ -1810,6 +1874,7 @@ def get_strategy_performance(refresh_unrealized: bool = False) -> dict:
         if bucket["trade_count"] or strategy in {"cointegration", "weather", "whale", "copy"}:
             strategies.append(bucket)
 
+    scope = normalize_runtime_scope(runtime_scope, default="")
     return {
         "starting_bankroll": round(starting_bankroll, 2),
         "total_committed_capital": round(total_committed_capital, 2),
@@ -1817,7 +1882,12 @@ def get_strategy_performance(refresh_unrealized: bool = False) -> dict:
         "total_unrealized_pnl": round(total_unrealized_pnl, 2),
         "total_paper_realized_pnl": round(total_paper_realized_pnl, 2),
         "total_paper_unrealized_pnl": round(total_paper_unrealized_pnl, 2),
-        "reporting_scope": "strategy_pnl_all_states__utilization_paper_only",
+        "runtime_scope": scope or None,
+        "reporting_scope": (
+            f"strategy_pnl_scope_{scope}__utilization_scope_only"
+            if scope
+            else "strategy_pnl_all_states__utilization_paper_only"
+        ),
         "data_quality": {
             "trade_state_inferred_trades": total_inferred_trade_states,
             "open_trades_missing_marks": total_open_trades_missing_marks,
@@ -1832,11 +1902,15 @@ def get_strategy_performance(refresh_unrealized: bool = False) -> dict:
     }
 
 
-def get_paper_account_state(refresh_unrealized: bool = False) -> dict:
+def get_paper_account_state(
+    refresh_unrealized: bool = False,
+    runtime_scope: str = RUNTIME_SCOPE_PAPER,
+) -> dict:
+    runtime_scope = normalize_runtime_scope(runtime_scope)
     if refresh_unrealized:
         try:
             import tracker
-            tracker.refresh_open_trades()
+            tracker.refresh_open_trades(runtime_scope=runtime_scope)
         except Exception as e:
             log.warning("Failed to refresh open paper trades for account summary: %s", e)
 
@@ -1844,12 +1918,13 @@ def get_paper_account_state(refresh_unrealized: bool = False) -> dict:
     try:
         account = _paper_account_row(conn)
         starting_bankroll = float(account["starting_bankroll"] or 0.0)
+        where_clause, params = _runtime_scope_clause(runtime_scope)
         rows = conn.execute("""
             SELECT id, trade_type, strategy_name, status, pnl, size_usd,
-                   trade_state_mode, reconciliation_mode,
+                   trade_state_mode, reconciliation_mode, runtime_scope,
                    external_order_id_a, external_order_id_b
             FROM trades
-        """).fetchall()
+        """ + where_clause, params).fetchall()
         valuation_map = _open_trade_valuation_map_from_snapshots(conn)
     finally:
         conn.close()
@@ -1865,6 +1940,7 @@ def get_paper_account_state(refresh_unrealized: bool = False) -> dict:
     excluded_realized_pnl = 0.0
     inferred_trade_states = 0
     open_paper_trades_missing_marks = 0
+    include_all_scoped_trades = runtime_scope == RUNTIME_SCOPE_PENNY
 
     for row in rows:
         trade = dict(row)
@@ -1875,7 +1951,7 @@ def get_paper_account_state(refresh_unrealized: bool = False) -> dict:
         pnl = float(trade.get("pnl") or 0.0)
         if trade.get("status") == "open":
             valuation = valuation_map.get(int(trade["id"]), {"ok": False, "pnl_usd": 0.0})
-            if state["is_paper"]:
+            if state["is_paper"] or include_all_scoped_trades:
                 open_trades += 1
                 committed_capital += size_usd
                 if valuation["ok"]:
@@ -1887,7 +1963,7 @@ def get_paper_account_state(refresh_unrealized: bool = False) -> dict:
                 if valuation["ok"]:
                     excluded_unrealized_pnl += float(valuation["pnl_usd"])
         elif trade.get("status") == "closed":
-            if state["is_paper"]:
+            if state["is_paper"] or include_all_scoped_trades:
                 realized_pnl += pnl
                 if pnl < 0:
                     cumulative_losses += abs(pnl)
@@ -1901,6 +1977,7 @@ def get_paper_account_state(refresh_unrealized: bool = False) -> dict:
     total_equity = available_cash + open_position_value
     bankroll_used_pct = (committed_capital / starting_bankroll * 100) if starting_bankroll > 0 else 0.0
     return {
+        "runtime_scope": runtime_scope,
         "starting_bankroll": round(starting_bankroll, 2),
         "available_cash": round(available_cash, 2),
         "committed_capital": round(committed_capital, 2),
@@ -1915,7 +1992,11 @@ def get_paper_account_state(refresh_unrealized: bool = False) -> dict:
         "excluded_open_trades": excluded_open_trades,
         "excluded_realized_pnl": round(excluded_realized_pnl, 2),
         "excluded_unrealized_pnl": round(excluded_unrealized_pnl, 2),
-        "reporting_scope": "paper_research_only",
+        "reporting_scope": (
+            "paper_research_only"
+            if runtime_scope == RUNTIME_SCOPE_PAPER
+            else f"runtime_scope_only::{runtime_scope}"
+        ),
         "data_quality": {
             "trade_state_inferred_trades": inferred_trade_states,
             "open_paper_trades_missing_marks": open_paper_trades_missing_marks,
@@ -1926,17 +2007,22 @@ def get_paper_account_state(refresh_unrealized: bool = False) -> dict:
                 or excluded_open_trades
             ),
         },
-        "cash_after_open_explanation": "Opening a paper trade deducts its full size from available cash immediately and moves that amount into committed capital until the trade closes.",
+        "cash_after_open_explanation": (
+            "Opening a paper trade deducts its full size from available cash immediately and moves that amount into committed capital until the trade closes."
+            if runtime_scope == RUNTIME_SCOPE_PAPER
+            else "Penny runtime accounting only includes penny-scoped trades, so open paper experiments do not consume penny cash or max-open capacity."
+        ),
         **_paper_position_policy_dict(),
     }
 
 
-def can_open_paper_trade(size_usd: float) -> dict:
+def can_open_paper_trade(size_usd: float, runtime_scope: str = RUNTIME_SCOPE_PAPER) -> dict:
     requested = max(0.0, float(size_usd))
-    account = get_paper_account_state(refresh_unrealized=False)
+    account = get_paper_account_state(refresh_unrealized=False, runtime_scope=runtime_scope)
     ok = account["available_cash"] >= requested
     return {
         "ok": ok,
+        "runtime_scope": runtime_scope,
         "requested_size_usd": round(requested, 2),
         "available_cash": account["available_cash"],
         "shortfall_usd": round(max(0.0, requested - account["available_cash"]), 2),
@@ -1944,13 +2030,16 @@ def can_open_paper_trade(size_usd: float) -> dict:
     }
 
 
-def get_paper_account_overview(refresh_unrealized: bool = False) -> dict:
+def get_paper_account_overview(
+    refresh_unrealized: bool = False,
+    runtime_scope: str = RUNTIME_SCOPE_PAPER,
+) -> dict:
     if refresh_unrealized:
-        strategy_breakdown = get_strategy_performance(refresh_unrealized=True)
-        account = get_paper_account_state(refresh_unrealized=False)
+        strategy_breakdown = get_strategy_performance(refresh_unrealized=True, runtime_scope=runtime_scope)
+        account = get_paper_account_state(refresh_unrealized=False, runtime_scope=runtime_scope)
     else:
-        account = get_paper_account_state(refresh_unrealized=False)
-        strategy_breakdown = get_strategy_performance(refresh_unrealized=False)
+        account = get_paper_account_state(refresh_unrealized=False, runtime_scope=runtime_scope)
+        strategy_breakdown = get_strategy_performance(refresh_unrealized=False, runtime_scope=runtime_scope)
 
     overview = dict(account)
     overview["strategy_breakdown"] = strategy_breakdown
@@ -1968,9 +2057,15 @@ def _sanitize_operator_reason(reason, fallback: str = "Decision recorded.") -> s
 
 def _resolve_trade_state_fields(metadata: dict | None = None) -> dict:
     metadata = metadata or {}
+    default_scope = (
+        RUNTIME_SCOPE_PENNY
+        if _normalize_trade_state_mode(metadata.get("trade_state_mode")) in {TRADE_STATE_WALLET, TRADE_STATE_LIVE}
+        else RUNTIME_SCOPE_PAPER
+    )
     return {
         "trade_state_mode": _normalize_trade_state_mode(metadata.get("trade_state_mode")),
         "reconciliation_mode": _normalize_reconciliation_mode(metadata.get("reconciliation_mode")),
+        "runtime_scope": normalize_runtime_scope(metadata.get("runtime_scope"), default=default_scope),
         "canonical_ref": metadata.get("canonical_ref"),
         "external_position_id": metadata.get("external_position_id"),
         "external_order_id_a": metadata.get("external_order_id_a"),
@@ -1994,6 +2089,7 @@ def record_paper_trade_attempt(
     wallet: str | None = None,
     condition_id: str | None = None,
     autonomy_level: str | None = None,
+    runtime_scope: str | None = None,
     phase: str | None = None,
     size_usd: float | None = None,
     details: dict | None = None,
@@ -2009,8 +2105,8 @@ def record_paper_trade_attempt(
             INSERT INTO paper_trade_attempts (
                 timestamp, source, strategy, outcome, reason_code, reason, event,
                 signal_id, weather_signal_id, trade_id, token_id, wallet, condition_id,
-                autonomy_level, phase, size_usd, details_json
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                autonomy_level, runtime_scope, phase, size_usd, details_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 time.time(),
@@ -2027,6 +2123,14 @@ def record_paper_trade_attempt(
                 wallet.lower() if wallet else None,
                 condition_id,
                 autonomy_level,
+                normalize_runtime_scope(
+                    runtime_scope,
+                    default=(
+                        RUNTIME_SCOPE_PENNY
+                        if (autonomy_level or "").lower() in {"penny", "book"}
+                        else RUNTIME_SCOPE_PAPER
+                    ),
+                ),
                 phase,
                 round(float(size_usd), 2) if size_usd is not None else None,
                 json.dumps(details) if details else None,
@@ -2202,7 +2306,7 @@ def get_wallet_monitor_event_summary(limit: int = 50, wallet: str | None = None)
     }
 
 
-def get_paper_trade_attempts(limit: int = 50) -> list[dict]:
+def get_paper_trade_attempts(limit: int = 50, runtime_scope: str | None = None) -> list[dict]:
     limit = _normalize_query_limit(limit, "get_paper_trade_attempts")
     conn = get_conn()
     try:
@@ -2212,12 +2316,16 @@ def get_paper_trade_attempts(limit: int = 50) -> list[dict]:
         query = """
             SELECT *
             FROM paper_trade_attempts
-            ORDER BY timestamp DESC, id DESC
         """
+        params: list = []
+        where_clause, where_params = _runtime_scope_clause(runtime_scope)
+        query += where_clause
+        params.extend(where_params)
+        query += " ORDER BY timestamp DESC, id DESC"
         if limit is None:
-            rows = conn.execute(query).fetchall()
+            rows = conn.execute(query, params).fetchall()
         else:
-            rows = conn.execute(query + " LIMIT ?", (limit,)).fetchall()
+            rows = conn.execute(query + " LIMIT ?", [*params, limit]).fetchall()
     except sqlite3.Error as exc:
         log.warning("Failed to query paper trade attempts: %s", exc)
         return []
@@ -2389,8 +2497,8 @@ def get_trade_monitor_summary(open_only: bool = True) -> dict:
         "by_status": by_status,
     }
 
-def get_paper_trade_attempt_summary(limit: int = 50) -> dict:
-    attempts = get_paper_trade_attempts(limit=limit)
+def get_paper_trade_attempt_summary(limit: int = 50, runtime_scope: str | None = None) -> dict:
+    attempts = get_paper_trade_attempts(limit=limit, runtime_scope=runtime_scope)
     blocked = sum(1 for item in attempts if item.get("outcome") == "blocked")
     allowed = sum(1 for item in attempts if item.get("outcome") == "allowed")
     errors = sum(1 for item in attempts if item.get("outcome") == "error")
@@ -2406,6 +2514,7 @@ def get_paper_trade_attempt_summary(limit: int = 50) -> dict:
     ][:5]
     return {
         "available": True,
+        "runtime_scope": normalize_runtime_scope(runtime_scope, default="") or None,
         "recent_count": len(attempts),
         "allowed": allowed,
         "blocked": blocked,
@@ -2603,10 +2712,11 @@ def _paper_position_policy_dict() -> dict:
     }
 
 
-def inspect_pairs_trade_open(signal_id, size_usd=100, conn=None):
+def inspect_pairs_trade_open(signal_id, size_usd=100, conn=None, runtime_scope: str = RUNTIME_SCOPE_PAPER):
     """Return a structured pairs-trade open decision."""
     owns_conn = conn is None
     conn = conn or get_conn()
+    runtime_scope = normalize_runtime_scope(runtime_scope)
     try:
         sig = conn.execute("SELECT * FROM signals WHERE id=?", (signal_id,)).fetchone()
         if not sig:
@@ -2618,8 +2728,8 @@ def inspect_pairs_trade_open(signal_id, size_usd=100, conn=None):
             }
 
         existing = conn.execute(
-            "SELECT id FROM trades WHERE signal_id=? AND status='open'",
-            (signal_id,),
+            "SELECT id FROM trades WHERE signal_id=? AND status='open' AND runtime_scope=?",
+            (signal_id, runtime_scope),
         ).fetchone()
         if existing:
             trade_id = int(existing["id"])
@@ -2631,7 +2741,7 @@ def inspect_pairs_trade_open(signal_id, size_usd=100, conn=None):
                 **_paper_position_policy_dict(),
             }
 
-        account_check = can_open_paper_trade(size_usd)
+        account_check = can_open_paper_trade(size_usd, runtime_scope=runtime_scope)
         if not account_check["ok"]:
             return {
                 "ok": False,
@@ -2652,6 +2762,7 @@ def inspect_pairs_trade_open(signal_id, size_usd=100, conn=None):
             "reason_code": "ready",
             "reason": "Ready to open paper pairs trade.",
             "signal": dict(sig),
+            "runtime_scope": runtime_scope,
             "requested_size_usd": round(float(size_usd), 2),
             "admission_path": sig["admission_path"],
             "experiment_name": sig["experiment_name"],
@@ -2663,10 +2774,17 @@ def inspect_pairs_trade_open(signal_id, size_usd=100, conn=None):
             conn.close()
 
 
-def inspect_whale_trade_open(whale_alert_id, size_usd=20, mode="paper", conn=None):
+def inspect_whale_trade_open(
+    whale_alert_id,
+    size_usd=20,
+    mode="paper",
+    conn=None,
+    runtime_scope: str = RUNTIME_SCOPE_PAPER,
+):
     """Return a structured decision for opening a whale trade."""
     owns_conn = conn is None
     conn = conn or get_conn()
+    runtime_scope = normalize_runtime_scope(runtime_scope)
     try:
         requested = max(0.0, float(size_usd or 0.0))
         if requested <= 0:
@@ -2704,8 +2822,8 @@ def inspect_whale_trade_open(whale_alert_id, size_usd=20, mode="paper", conn=Non
             }
 
         existing = conn.execute(
-            "SELECT id FROM trades WHERE whale_alert_id=? AND status='open'",
-            (whale_alert_id,),
+            "SELECT id FROM trades WHERE whale_alert_id=? AND status='open' AND runtime_scope=?",
+            (whale_alert_id, runtime_scope),
         ).fetchone()
         if existing:
             return {
@@ -2720,7 +2838,7 @@ def inspect_whale_trade_open(whale_alert_id, size_usd=20, mode="paper", conn=Non
             }
 
         if mode == "paper":
-            account_check = can_open_paper_trade(requested)
+            account_check = can_open_paper_trade(requested, runtime_scope=runtime_scope)
             if not account_check["ok"]:
                 return {
                     "ok": False,
@@ -2742,6 +2860,7 @@ def inspect_whale_trade_open(whale_alert_id, size_usd=20, mode="paper", conn=Non
             "reason": "Ready to open whale trade.",
             "alert": alert_dict,
             "token_id": alert_dict.get("token_id"),
+            "runtime_scope": runtime_scope,
             "requested_size_usd": requested,
             **_paper_position_policy_dict(),
         }
@@ -2804,9 +2923,11 @@ def inspect_copy_trade_open(
     *,
     max_wallet_open: int | None = None,
     max_total_open: int | None = None,
+    runtime_scope: str = RUNTIME_SCOPE_PAPER,
 ) -> dict:
     """Return a structured copy-trade open decision."""
     wallet = (wallet or "").lower()
+    runtime_scope = normalize_runtime_scope(runtime_scope)
     identifiers = get_position_identity(position, wallet=wallet)
     condition_id = identifiers["condition_id"] or ""
     external_position_id = identifiers["external_position_id"]
@@ -2830,6 +2951,7 @@ def inspect_copy_trade_open(
         external_position_id=external_position_id,
         condition_id=condition_id,
         outcome=outcome,
+        runtime_scope=runtime_scope,
     )
     if existing_trade:
         return {
@@ -2844,7 +2966,7 @@ def inspect_copy_trade_open(
             **_paper_position_policy_dict(),
         }
 
-    wallet_open = count_open_copy_trades(wallet) if max_wallet_open is not None else None
+    wallet_open = count_open_copy_trades(wallet, runtime_scope=runtime_scope) if max_wallet_open is not None else None
     if max_wallet_open is not None and wallet_open >= max_wallet_open:
         return {
             "ok": False,
@@ -2857,7 +2979,7 @@ def inspect_copy_trade_open(
             **_paper_position_policy_dict(),
         }
 
-    total_open = count_open_trades() if max_total_open is not None else None
+    total_open = count_open_trades(runtime_scope=runtime_scope) if max_total_open is not None else None
     if max_total_open is not None and total_open >= max_total_open:
         return {
             "ok": False,
@@ -2870,7 +2992,7 @@ def inspect_copy_trade_open(
             **_paper_position_policy_dict(),
         }
 
-    account_check = can_open_paper_trade(size_usd)
+    account_check = can_open_paper_trade(size_usd, runtime_scope=runtime_scope)
     if not account_check["ok"]:
         return {
             "ok": False,
@@ -2941,6 +3063,7 @@ def inspect_copy_trade_open(
         "external_position_id": external_position_id,
         "canonical_ref": canonical_ref,
         "entry_price": entry_price,
+        "runtime_scope": runtime_scope,
         "requested_size_usd": round(float(size_usd), 2),
         "max_wallet_open": max_wallet_open,
         "max_total_open": max_total_open,
@@ -2957,7 +3080,14 @@ def open_trade(signal_id, size_usd=100, metadata=None):
     for this signal_id, preventing duplicates from concurrent autonomy runs.
     """
     conn = get_conn()
-    decision = inspect_pairs_trade_open(signal_id, size_usd=size_usd, conn=conn)
+    metadata = metadata or {}
+    state_fields = _resolve_trade_state_fields(metadata)
+    decision = inspect_pairs_trade_open(
+        signal_id,
+        size_usd=size_usd,
+        conn=conn,
+        runtime_scope=state_fields["runtime_scope"],
+    )
     if not decision["ok"]:
         log.info("Paper pairs trade blocked for signal %s: %s", signal_id, decision["reason"])
         conn.close()
@@ -2970,11 +3100,9 @@ def open_trade(signal_id, size_usd=100, metadata=None):
     else:
         side_a, side_b = "SELL", "BUY"
 
-    metadata = metadata or {}
     ev = metadata.get("ev") or {}
     slippage = metadata.get("slippage") or {}
     guardrails = metadata.get("guardrails") or {}
-    state_fields = _resolve_trade_state_fields(metadata)
 
     conn.execute("""
         INSERT INTO trades (signal_id, opened_at, side_a, side_b,
@@ -2985,9 +3113,9 @@ def open_trade(signal_id, size_usd=100, metadata=None):
             reversion_exit_z, stop_z_threshold, max_hold_hours,
             regime_break_threshold, regime_break_flag,
             token_id_a, token_id_b, event, market_a,
-            trade_state_mode, reconciliation_mode, canonical_ref,
+            trade_state_mode, reconciliation_mode, runtime_scope, canonical_ref,
             external_position_id, external_order_id_a, external_order_id_b, external_source)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (
         signal_id, time.time(), side_a, side_b,
         sig["price_a"], sig["price_b"], size_usd, "open",
@@ -3013,6 +3141,7 @@ def open_trade(signal_id, size_usd=100, metadata=None):
         sig.get("market_a"),
         state_fields["trade_state_mode"],
         state_fields["reconciliation_mode"],
+        state_fields["runtime_scope"],
         state_fields["canonical_ref"],
         state_fields["external_position_id"],
         state_fields["external_order_id_a"],
@@ -3026,44 +3155,66 @@ def open_trade(signal_id, size_usd=100, metadata=None):
     return trade_id
 
 
-def has_open_weather_trade(token_id):
+def has_open_weather_trade(token_id, runtime_scope: str | None = None):
     """Return True if there is already an open weather trade for this token."""
     conn = get_conn()
+    runtime_scope = normalize_runtime_scope(runtime_scope)
     row = conn.execute(
-        "SELECT id FROM trades WHERE token_id_a=? AND trade_type='weather' AND status='open'",
-        (token_id,)
+        "SELECT id FROM trades WHERE token_id_a=? AND trade_type='weather' AND status='open' AND runtime_scope=?",
+        (token_id, runtime_scope)
     ).fetchone()
     conn.close()
     return row is not None
 
 
-def has_open_copy_trade(wallet: str, condition_id: str, external_position_id: str | None = None) -> bool:
+def has_open_copy_trade(
+    wallet: str,
+    condition_id: str,
+    external_position_id: str | None = None,
+    runtime_scope: str | None = None,
+) -> bool:
     """Return True if we already have an open copy trade for this wallet+market."""
     return find_open_copy_trade(
         wallet,
         condition_id=condition_id,
         external_position_id=external_position_id,
+        runtime_scope=runtime_scope,
     ) is not None
 
 
-def count_open_copy_trades(wallet: str | None = None) -> int:
+def count_open_copy_trades(wallet: str | None = None, runtime_scope: str | None = None) -> int:
     conn = get_conn()
+    scope = normalize_runtime_scope(runtime_scope, default="")
+    params: list = []
+    extra_scope = ""
+    if scope in {RUNTIME_SCOPE_PAPER, RUNTIME_SCOPE_PENNY}:
+        extra_scope = " AND runtime_scope=?"
+        params.append(scope)
     if wallet:
         row = conn.execute(
-            "SELECT COUNT(*) FROM trades WHERE copy_wallet=? AND trade_type='copy' AND status='open'",
-            (wallet.lower(),)
+            "SELECT COUNT(*) FROM trades WHERE copy_wallet=? AND trade_type='copy' AND status='open'"
+            + extra_scope,
+            [wallet.lower(), *params],
         ).fetchone()
     else:
         row = conn.execute(
             "SELECT COUNT(*) FROM trades WHERE trade_type='copy' AND status='open'"
+            + extra_scope,
+            params,
         ).fetchone()
     conn.close()
     return int(row[0] if row else 0)
 
 
-def count_open_trades() -> int:
+def count_open_trades(runtime_scope: str | None = None) -> int:
     conn = get_conn()
-    row = conn.execute("SELECT COUNT(*) FROM trades WHERE status='open'").fetchone()
+    params: list = []
+    query = "SELECT COUNT(*) FROM trades WHERE status='open'"
+    scope = normalize_runtime_scope(runtime_scope, default="")
+    if scope in {RUNTIME_SCOPE_PAPER, RUNTIME_SCOPE_PENNY}:
+        query += " AND runtime_scope=?"
+        params.append(scope)
+    row = conn.execute(query, params).fetchone()
     conn.close()
     return int(row[0] if row else 0)
 
@@ -3170,7 +3321,14 @@ def _evaluate_weather_token_reopen(conn, token_id, review):
     }
 
 
-def inspect_weather_trade_open(weather_signal_id, size_usd=100, max_total_open=None, conn=None, mode=None):
+def inspect_weather_trade_open(
+    weather_signal_id,
+    size_usd=100,
+    max_total_open=None,
+    conn=None,
+    mode=None,
+    runtime_scope: str = RUNTIME_SCOPE_PAPER,
+):
     """Return a structured weather-trade open decision.
 
     This centralizes duplicate suppression, paper cash checks, and optional
@@ -3179,6 +3337,7 @@ def inspect_weather_trade_open(weather_signal_id, size_usd=100, max_total_open=N
     """
     owns_conn = conn is None
     conn = conn or get_conn()
+    runtime_scope = normalize_runtime_scope(runtime_scope)
     try:
         max_total_open = _normalize_optional_cap(max_total_open)
         sig = conn.execute(
@@ -3198,8 +3357,8 @@ def inspect_weather_trade_open(weather_signal_id, size_usd=100, max_total_open=N
         action = sig["action"]
         entry_token = sig["yes_token"] if action == "BUY_YES" else sig["no_token"]
         existing_signal_trade = conn.execute(
-            "SELECT id FROM trades WHERE weather_signal_id=? AND status='open'",
-            (weather_signal_id,),
+            "SELECT id FROM trades WHERE weather_signal_id=? AND status='open' AND runtime_scope=?",
+            (weather_signal_id, runtime_scope),
         ).fetchone()
         if existing_signal_trade:
             trade_id = int(existing_signal_trade["id"])
@@ -3217,10 +3376,11 @@ def inspect_weather_trade_open(weather_signal_id, size_usd=100, max_total_open=N
             SELECT id, status, closed_at, exit_reason
             FROM trades
             WHERE weather_signal_id=?
+              AND runtime_scope=?
             ORDER BY opened_at DESC, id DESC
             LIMIT 1
             """,
-            (weather_signal_id,),
+            (weather_signal_id, runtime_scope),
         ).fetchone()
         if latest_signal_trade and latest_signal_trade["status"] == "closed":
             trade_id = int(latest_signal_trade["id"])
@@ -3243,10 +3403,11 @@ def inspect_weather_trade_open(weather_signal_id, size_usd=100, max_total_open=N
                 SELECT id, weather_signal_id
                 FROM trades
                 WHERE trade_type='weather' AND token_id_a=? AND status='open'
+                  AND runtime_scope=?
                 ORDER BY opened_at DESC, id DESC
                 LIMIT 1
                 """,
-                (entry_token,),
+                (entry_token, runtime_scope),
             ).fetchone()
         if existing_token_trade:
             trade_id = int(existing_token_trade["id"])
@@ -3268,10 +3429,11 @@ def inspect_weather_trade_open(weather_signal_id, size_usd=100, max_total_open=N
                 SELECT id, weather_signal_id, closed_at, exit_reason
                 FROM trades
                 WHERE trade_type='weather' AND token_id_a=? AND status='closed'
+                  AND runtime_scope=?
                 ORDER BY closed_at DESC, id DESC
                 LIMIT 1
                 """,
-                (entry_token,),
+                (entry_token, runtime_scope),
             ).fetchone()
         reopen_context = None
         if closed_token_trade:
@@ -3317,16 +3479,17 @@ def inspect_weather_trade_open(weather_signal_id, size_usd=100, max_total_open=N
                 mode,
             )
 
-        if max_total_open is not None and count_open_trades() >= max_total_open:
+        current_open = count_open_trades(runtime_scope=runtime_scope)
+        if max_total_open is not None and current_open >= max_total_open:
             return {
                 "ok": False,
                 "reason_code": "max_open_reached",
-                "reason": f"At max open trades ({count_open_trades()}/{max_total_open}).",
+                "reason": f"At max open trades ({current_open}/{max_total_open}).",
                 "entry_token": entry_token,
                 **_paper_position_policy_dict(),
             }
 
-        account_check = can_open_paper_trade(size_usd)
+        account_check = can_open_paper_trade(size_usd, runtime_scope=runtime_scope)
         if not account_check["ok"]:
             return {
                 "ok": False,
@@ -3351,6 +3514,7 @@ def inspect_weather_trade_open(weather_signal_id, size_usd=100, max_total_open=N
             "entry_token": entry_token,
             "entry_price": entry_price,
             "action": action,
+            "runtime_scope": runtime_scope,
             "requested_size_usd": round(float(size_usd), 2),
             "reopen_context": reopen_context,
             **_paper_position_policy_dict(),
@@ -3368,6 +3532,7 @@ def open_copy_trade(
     *,
     max_wallet_open: int | None = None,
     max_total_open: int | None = None,
+    runtime_scope: str = RUNTIME_SCOPE_PAPER,
 ) -> int | None:
     """Open a paper copy trade mirroring a watched wallet's position.
 
@@ -3383,6 +3548,7 @@ def open_copy_trade(
         size_usd=size_usd,
         max_wallet_open=max_wallet_open,
         max_total_open=max_total_open,
+        runtime_scope=runtime_scope,
     )
     if not decision["ok"]:
         log.info("Paper copy trade blocked for wallet %s: %s", wallet, decision["reason"])
@@ -3400,14 +3566,15 @@ def open_copy_trade(
             entry_price_a, entry_price_b, token_id_a, size_usd, status, strategy_name,
             copy_wallet, copy_label, copy_condition_id, copy_outcome,
             event, market_a, trade_state_mode, reconciliation_mode,
-            canonical_ref, external_position_id, external_source
+            runtime_scope, canonical_ref, external_position_id, external_source
         )
-        SELECT 'copy', ?, ?, '', ?, 0, ?, ?, 'open', 'copy', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+        SELECT 'copy', ?, ?, '', ?, 0, ?, ?, 'open', 'copy', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
         WHERE NOT EXISTS (
             SELECT 1
             FROM trades
             WHERE trade_type='copy'
               AND status='open'
+              AND runtime_scope=?
               AND copy_wallet=?
               AND (
                     canonical_ref=?
@@ -3424,9 +3591,11 @@ def open_copy_trade(
             outcome,
             TRADE_STATE_WALLET,
             RECONCILIATION_WALLET,
+            normalize_runtime_scope(runtime_scope, default=RUNTIME_SCOPE_PENNY),
             decision.get("canonical_ref") or identifiers["canonical_ref"],
             decision.get("external_position_id") or identifiers["external_position_id"],
             "watched_wallet",
+            normalize_runtime_scope(runtime_scope, default=RUNTIME_SCOPE_PENNY),
             wallet,
             decision.get("canonical_ref") or identifiers["canonical_ref"],
             condition_id,
@@ -3443,7 +3612,12 @@ def open_copy_trade(
     return trade_id
 
 
-def open_weather_trade(weather_signal_id, size_usd=100, mode=None):
+def open_weather_trade(
+    weather_signal_id,
+    size_usd=100,
+    mode=None,
+    runtime_scope: str = RUNTIME_SCOPE_PAPER,
+):
     """Open a single-leg paper trade from a weather signal.
 
     DB-level guard: returns None if an open trade already exists for this signal.
@@ -3454,6 +3628,7 @@ def open_weather_trade(weather_signal_id, size_usd=100, mode=None):
         size_usd=size_usd,
         conn=conn,
         mode=mode,
+        runtime_scope=runtime_scope,
     )
     if not decision["ok"]:
         log.info(
@@ -3477,8 +3652,8 @@ def open_weather_trade(weather_signal_id, size_usd=100, mode=None):
         INSERT INTO trades (signal_id, weather_signal_id, trade_type, opened_at,
             side_a, side_b, entry_price_a, entry_price_b,
             token_id_a, size_usd, status, strategy_name, event, market_a,
-            trade_state_mode, reconciliation_mode)
-        VALUES (NULL, ?, 'weather', ?, ?, '', ?, 0, ?, ?, 'open', ?, ?, ?, ?, ?)
+            trade_state_mode, reconciliation_mode, runtime_scope)
+        VALUES (NULL, ?, 'weather', ?, ?, '', ?, 0, ?, ?, 'open', ?, ?, ?, ?, ?, ?)
     """, (
         weather_signal_id, time.time(), action, entry_price, token, size_usd,
         strategy_name,
@@ -3486,6 +3661,7 @@ def open_weather_trade(weather_signal_id, size_usd=100, mode=None):
         decision["signal"].get("market"),
         TRADE_STATE_PAPER,
         RECONCILIATION_INTERNAL,
+        decision["runtime_scope"],
     ))
     trade_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
     conn.execute("UPDATE weather_signals SET status='traded' WHERE id=?", (weather_signal_id,))
@@ -3584,7 +3760,7 @@ _TRADES_SELECT = """
         t.entry_slippage_pct_b, t.reversion_exit_z, t.stop_z_threshold, t.max_hold_hours,
         t.closed_z_score, t.exit_reason, t.max_unrealized_profit, t.max_unrealized_drawdown,
         t.regime_break_threshold, t.regime_break_flag, t.regime_break_notes,
-        t.trade_state_mode, t.reconciliation_mode, t.canonical_ref,
+        t.trade_state_mode, t.reconciliation_mode, t.runtime_scope, t.canonical_ref,
         t.external_position_id, t.external_order_id_a, t.external_order_id_b, t.external_source,
         ww.active AS copy_wallet_active,
         ww.auto_drop_reason AS copy_wallet_reason,
@@ -3601,26 +3777,25 @@ _TRADES_SELECT = """
 """
 
 
-def get_trades(status=None, limit=50):
+def get_trades(status=None, limit=50, runtime_scope: str | None = None):
     conn = get_conn()
-    if status and limit is None:
-        rows = conn.execute(
-            _TRADES_SELECT + " WHERE t.status=? ORDER BY t.opened_at DESC",
-            (status,),
-        ).fetchall()
-    elif status:
-        rows = conn.execute(
-            _TRADES_SELECT + " WHERE t.status=? ORDER BY t.opened_at DESC LIMIT ?",
-            (status, limit),
-        ).fetchall()
-    elif limit is None:
-        rows = conn.execute(
-            _TRADES_SELECT + " ORDER BY t.opened_at DESC"
-        ).fetchall()
-    else:
-        rows = conn.execute(
-            _TRADES_SELECT + " ORDER BY t.opened_at DESC LIMIT ?", (limit,)
-        ).fetchall()
+    clauses = []
+    params: list = []
+    scope = normalize_runtime_scope(runtime_scope, default="")
+    if status:
+        clauses.append("t.status=?")
+        params.append(status)
+    if scope in {RUNTIME_SCOPE_PAPER, RUNTIME_SCOPE_PENNY}:
+        clauses.append("t.runtime_scope=?")
+        params.append(scope)
+    query = _TRADES_SELECT
+    if clauses:
+        query += " WHERE " + " AND ".join(clauses)
+    query += " ORDER BY t.opened_at DESC"
+    if limit is not None:
+        query += " LIMIT ?"
+        params.append(limit)
+    rows = conn.execute(query, params).fetchall()
     conn.close()
     return [dict(r) for r in rows]
 
@@ -4406,16 +4581,34 @@ def get_scan_runs(limit=20):
 
 # --- Stats ---
 
-def get_stats():
+def get_stats(runtime_scope: str | None = None):
     """Dashboard summary stats."""
     conn = get_conn()
-    total_trades = conn.execute("SELECT COUNT(*) FROM trades").fetchone()[0]
-    open_trades = conn.execute("SELECT COUNT(*) FROM trades WHERE status='open'").fetchone()[0]
+    scope = normalize_runtime_scope(runtime_scope, default="")
+    scope_clause = ""
+    params: list = []
+    if scope in {RUNTIME_SCOPE_PAPER, RUNTIME_SCOPE_PENNY}:
+        scope_clause = " AND runtime_scope=?"
+        params.append(scope)
+    total_trades = conn.execute("SELECT COUNT(*) FROM trades" + (" WHERE runtime_scope=?" if scope_clause else ""), params).fetchone()[0]
+    open_trades = conn.execute("SELECT COUNT(*) FROM trades WHERE status='open'" + scope_clause, params).fetchone()[0]
     _excl = "AND (notes IS NULL OR notes != 'manual close - dedup cleanup')"
-    closed_trades = conn.execute(f"SELECT COUNT(*) FROM trades WHERE status='closed' {_excl}").fetchone()[0]
-    total_pnl = conn.execute(f"SELECT COALESCE(SUM(pnl), 0) FROM trades WHERE status='closed' {_excl}").fetchone()[0]
-    wins = conn.execute(f"SELECT COUNT(*) FROM trades WHERE status='closed' AND pnl > 0 {_excl}").fetchone()[0]
-    losses = conn.execute(f"SELECT COUNT(*) FROM trades WHERE status='closed' AND pnl <= 0 {_excl}").fetchone()[0]
+    closed_trades = conn.execute(
+        f"SELECT COUNT(*) FROM trades WHERE status='closed' {scope_clause} {_excl}",
+        params,
+    ).fetchone()[0]
+    total_pnl = conn.execute(
+        f"SELECT COALESCE(SUM(pnl), 0) FROM trades WHERE status='closed' {scope_clause} {_excl}",
+        params,
+    ).fetchone()[0]
+    wins = conn.execute(
+        f"SELECT COUNT(*) FROM trades WHERE status='closed' AND pnl > 0 {scope_clause} {_excl}",
+        params,
+    ).fetchone()[0]
+    losses = conn.execute(
+        f"SELECT COUNT(*) FROM trades WHERE status='closed' AND pnl <= 0 {scope_clause} {_excl}",
+        params,
+    ).fetchone()[0]
 
     total_signals = conn.execute("SELECT COUNT(*) FROM signals").fetchone()[0]
     total_scans = conn.execute("SELECT COUNT(*) FROM scan_runs").fetchone()[0]
@@ -4424,13 +4617,14 @@ def get_stats():
     pnl_rows = conn.execute("""
         SELECT closed_at, pnl FROM trades
         WHERE status='closed' AND pnl IS NOT NULL AND pnl != 0
+    """ + ("" if not scope_clause else " AND runtime_scope=?") + """
         ORDER BY closed_at ASC
-    """).fetchall()
+    """, params).fetchall()
 
     conn.close()
 
     win_rate = (wins / closed_trades * 100) if closed_trades > 0 else 0
-    paper_account = get_paper_account_overview(refresh_unrealized=True)
+    paper_account = get_paper_account_overview(refresh_unrealized=True, runtime_scope=scope or RUNTIME_SCOPE_PAPER)
     strategy_breakdown = paper_account["strategy_breakdown"]
     paper_sizing = get_paper_sizing_summary(limit=200)
 
@@ -4442,6 +4636,7 @@ def get_stats():
         pnl_series.append({"t": closed_at, "pnl": round(cumulative, 2)})
 
     return {
+        "runtime_scope": scope or RUNTIME_SCOPE_PAPER,
         "total_trades": total_trades,
         "open_trades": open_trades,
         "closed_trades": closed_trades,
@@ -4883,7 +5078,8 @@ def cancel_open_order(row_id: int, reason: str = "expired") -> None:
 
 def open_whale_trade(trade_data):
     """Open a paper trade from a whale alert."""
-    account_check = can_open_paper_trade(trade_data.get("size_usd", 0))
+    runtime_scope = normalize_runtime_scope(trade_data.get("runtime_scope"))
+    account_check = can_open_paper_trade(trade_data.get("size_usd", 0), runtime_scope=runtime_scope)
     if not account_check["ok"]:
         log.warning(
             "Paper whale trade blocked for alert %s: need $%.2f cash, have $%.2f",
@@ -4899,8 +5095,8 @@ def open_whale_trade(trade_data):
             INSERT INTO trades (trade_type, opened_at, side_a, side_b,
                 entry_price_a, entry_price_b, token_id_a, size_usd, status,
                 strategy_name, whale_alert_id, event, market_a, notes,
-                trade_state_mode, reconciliation_mode)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                trade_state_mode, reconciliation_mode, runtime_scope)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             trade_data['trade_type'],
             trade_data['opened_at'],
@@ -4918,6 +5114,7 @@ def open_whale_trade(trade_data):
             trade_data.get('notes') or f"Suspicion: {trade_data.get('suspicion_score', 0)}/100",
             trade_data.get('trade_state_mode', TRADE_STATE_PAPER),
             trade_data.get('reconciliation_mode', RECONCILIATION_INTERNAL),
+            runtime_scope,
         ))
         trade_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
         conn.commit()

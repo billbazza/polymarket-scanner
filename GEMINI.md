@@ -30,7 +30,7 @@ Execution:     execution.py (paper/live trading) → blockchain.py (web3/Polygon
                     |
 Persistence:   db.py (SQLite) → scanner.db
                Tables: signals, trades, snapshots, scan_runs, weather_signals, locked_arb
-               Runtime state: logs/autonomy_state.json (local only; legacy root file auto-migrates)
+               Runtime state: logs/autonomy_state.paper.json + logs/autonomy_state.penny.json (local only; legacy shared files auto-migrate by scope)
                     |
 Monitoring:    log_setup.py → logs/scanner.log + logs/journal.jsonl (trade audit trail)
 ```
@@ -40,7 +40,7 @@ Monitoring:    log_setup.py → logs/scanner.log + logs/journal.jsonl (trade aud
 - **weather** (single-leg): `entry_price_a` only, `token_id_a` stored on trade. Auto-closes when price ≥ 0.99 (WIN) or ≤ 0.01 (LOSS). `signal_id=NULL`, `weather_signal_id` foreign key instead.
 
 ### Autonomy Loop (every 30 min via launchd)
-`autonomy.py` levels: `scout` (scan only) → `paper` (auto paper-trade A+ signals) → `penny` (real $1-5) → `book` (Kelly-sized). Each cycle: scan pairs → scan weather → refresh open trades → auto-close reverted/resolved trades → open new trades up to `max_open`.
+`autonomy.py` levels: `scout` (scan only) → `paper` (auto paper-trade A+ signals) → `penny` (real $1-5) → `book` (Kelly-sized). Paper and penny now persist isolated runtime state and scoped trade/accounting views, so paper experiments can stay open without consuming penny `max_open` capacity. Each cycle: scan pairs → scan weather → refresh open trades → auto-close reverted/resolved trades → open new trades up to the scoped `max_open`.
 
 ## Key Conventions
 
@@ -56,7 +56,7 @@ Every module follows: docstring → imports → `log = logging.getLogger("scanne
 Every opportunity flows: scanner finds pair → `math_engine.score_opportunity()` grades A+ to F → optionally `brain.validate_signal()` for AI validation → `execution.execute_trade()` if tradeable.
 
 ### Trading Modes
-- **Paper** (default): simulates against current prices, tracks in SQLite. There are no limits on numbers of trades while in paper mode. Autonomy now derives `mode="paper"` explicitly from the normalized `level` string so paper-level cointegration trades never invoke `brain.validate_signal()`; the system logs a `brain_validation_skipped` journal entry for each admitted A+ cohort signal, making the math-only trade path auditable while still enforcing slippage and balance checks.
+- **Paper** (default): simulates against current prices, tracks in SQLite. There are no limits on numbers of trades while in paper mode. Paper-runtime trades, balances, and autonomy state are now isolated from the penny runtime, so open paper experiments do not block penny `max_open` limits or penny dashboard views. Autonomy now derives `mode="paper"` explicitly from the normalized `level` string so paper-level cointegration trades never invoke `brain.validate_signal()`; the system logs a `brain_validation_skipped` journal entry for each admitted A+ cohort signal, making the math-only trade path auditable while still enforcing slippage and balance checks.
 - **Live**: requires `POLYMARKET_PRIVATE_KEY` in the macOS Keychain (or an explicit per-process env override), uses py-clob-client
 
 ### Database

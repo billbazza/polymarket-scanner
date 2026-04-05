@@ -377,8 +377,8 @@ def classify_trade(trade: dict, wallet_positions_cache: dict[str, list[dict]] | 
     }
 
 
-def reconcile_open_trades(auto_remediate: bool = True) -> dict:
-    open_trades = db.get_trades(status="open", limit=None)
+def reconcile_open_trades(auto_remediate: bool = True, runtime_scope: str | None = None) -> dict:
+    open_trades = db.get_trades(status="open", limit=None, runtime_scope=runtime_scope)
     wallet_positions_cache: dict[str, list[dict]] = {}
     results = []
     counts = {
@@ -457,8 +457,11 @@ def reconcile_open_trades(auto_remediate: bool = True) -> dict:
     return summary
 
 
-def get_flagged_open_trades() -> dict:
-    trades = {trade["id"]: trade for trade in db.get_trades(status="open", limit=None)}
+def get_flagged_open_trades(runtime_scope: str | None = None) -> dict:
+    trades = {
+        trade["id"]: trade
+        for trade in db.get_trades(status="open", limit=None, runtime_scope=runtime_scope)
+    }
     latest = db.get_latest_trade_monitor_states(open_only=True)
     flagged = []
     for item in latest:

@@ -48,6 +48,12 @@ def _fetch_stage2_rollout():
         log.warning("Stage 2 polygon rollout failed: %s", exc)
         return {"ok": False, "error": str(exc)}
 
+
+def _runtime_scope_for_mode(mode: str | None) -> str:
+    if mode == "live":
+        return db.RUNTIME_SCOPE_PENNY
+    return db.RUNTIME_SCOPE_PAPER
+
 def _get_mode():
     """Determine trading mode from environment."""
     key = runtime_config.get("POLYMARKET_PRIVATE_KEY")
@@ -118,9 +124,10 @@ def check_balance(mode=None):
         dict with balance_usd, mode, and any error info.
     """
     mode = mode or _get_mode()
+    runtime_scope = _runtime_scope_for_mode(mode)
 
     if mode == "paper":
-        account = db.get_paper_account_state(refresh_unrealized=False)
+        account = db.get_paper_account_state(refresh_unrealized=False, runtime_scope=runtime_scope)
         log.debug(
             "Paper balance check: available=$%.2f committed=$%.2f equity=$%.2f",
             account["available_cash"],
@@ -131,6 +138,7 @@ def check_balance(mode=None):
             "ok": True,
             "balance_usd": account["available_cash"],
             "mode": "paper",
+            "runtime_scope": runtime_scope,
             "paper_account": account,
         }
 
@@ -143,10 +151,10 @@ def check_balance(mode=None):
                     "error": "No wallet address available"}
         balance = blockchain.get_usdc_balance(wallet)
         log.info("Live balance for %s: $%.2f", wallet[:10] + "...", balance)
-        return {"ok": True, "balance_usd": balance, "mode": "live"}
+        return {"ok": True, "balance_usd": balance, "mode": "live", "runtime_scope": runtime_scope}
     except Exception as e:
         log.error("Failed to check live balance: %s", e)
-        return {"ok": False, "balance_usd": 0, "mode": "live",
+        return {"ok": False, "balance_usd": 0, "mode": "live", "runtime_scope": runtime_scope,
                 "error": str(e)}
 
 
@@ -430,6 +438,7 @@ def _revalidate_weather_horizon(signal: dict | None):
 def execute_weather_trade(signal, size_usd, mode=None):
     """Execute a paper-first weather trade from a saved weather signal."""
     mode = mode or _get_mode()
+    runtime_scope = _runtime_scope_for_mode(mode)
     signal = dict(signal or {})
     weather_signal_id = signal.get("id") or signal.get("weather_signal_id")
     if not weather_signal_id:
@@ -521,7 +530,12 @@ def execute_weather_trade(signal, size_usd, mode=None):
             "weather_signal_id": weather_signal_id,
         }
 
-    decision = db.inspect_weather_trade_open(weather_signal_id, size_usd=size_usd, mode=mode)
+    decision = db.inspect_weather_trade_open(
+        weather_signal_id,
+        size_usd=size_usd,
+        mode=mode,
+        runtime_scope=runtime_scope,
+    )
     if not decision["ok"]:
         return {
             "ok": False,
@@ -533,7 +547,7 @@ def execute_weather_trade(signal, size_usd, mode=None):
             "strategy_name": strategy_name,
         }
 
-    trade_id = db.open_weather_trade(weather_signal_id, size_usd=size_usd, mode=mode)
+    trade_id = db.open_weather_trade(weather_signal_id, size_usd=size_usd, mode=mode, runtime_scope=runtime_scope)
     if not trade_id:
         return {
             "ok": False,
@@ -544,7 +558,7 @@ def execute_weather_trade(signal, size_usd, mode=None):
             "strategy_name": strategy_name,
         }
 
-    account = db.get_paper_account_state(refresh_unrealized=False)
+    account = db.get_paper_account_state(refresh_unrealized=False, runtime_scope=runtime_scope)
     return {
         "ok": True,
         "mode": "paper",
@@ -554,6 +568,7 @@ def execute_weather_trade(signal, size_usd, mode=None):
         "strategy_name": strategy_name,
         "entry_price": decision.get("entry_price"),
         "action": decision.get("action"),
+        "runtime_scope": runtime_scope,
         "trade_state_mode": db.TRADE_STATE_PAPER,
         "reconciliation_mode": db.RECONCILIATION_INTERNAL,
         "paper_account": account,
@@ -575,6 +590,7 @@ def execute_weather_trade(signal, size_usd, mode=None):
 def execute_whale_trade(alert, size_usd=20, mode=None):
     """Open a guarded whale trade (paper/live)."""
     mode = mode or _get_mode()
+    runtime_scope = _runtime_scope_for_mode(mode)
     alert = alert or {}
     alert_id = alert.get("id")
     size_usd = round(float(size_usd or 0.0), 2)
@@ -653,7 +669,12 @@ def execute_whale_trade(alert, size_usd=20, mode=None):
             "balance": balance_info,
         }
 
-    decision = db.inspect_whale_trade_open(alert_id, size_usd=size_usd, mode=mode)
+    decision = db.inspect_whale_trade_open(
+        alert_id,
+        size_usd=size_usd,
+        mode=mode,
+        runtime_scope=runtime_scope,
+    )
     if not decision.get("ok"):
         return {
             "ok": False,
@@ -721,6 +742,7 @@ def execute_whale_trade(alert, size_usd=20, mode=None):
         "strategy_name": alert.get("strategy_name") or "whale",
         "trade_state_mode": db.TRADE_STATE_PAPER,
         "reconciliation_mode": db.RECONCILIATION_INTERNAL,
+        "runtime_scope": runtime_scope,
     }
 
     trade_id = db.open_whale_trade(trade_data)
@@ -781,6 +803,7 @@ def _execute_paper(signal, size_usd, price_a, price_b,
             "strategy_name": "cointegration",
             "trade_state_mode": db.TRADE_STATE_PAPER,
             "reconciliation_mode": db.RECONCILIATION_INTERNAL,
+            "runtime_scope": db.RUNTIME_SCOPE_PAPER,
             "entry_grade_label": signal.get("grade_label"),
             "admission_path": signal.get("admission_path"),
             "experiment_name": signal.get("experiment_name"),
@@ -796,7 +819,7 @@ def _execute_paper(signal, size_usd, price_a, price_b,
     if not trade_id:
         log.error("Failed to open trade in DB for signal %s", signal_id)
         return {"ok": False, "error": "DB open_trade failed", "mode": "paper"}
-    account = db.get_paper_account_state(refresh_unrealized=False)
+    account = db.get_paper_account_state(refresh_unrealized=False, runtime_scope=db.RUNTIME_SCOPE_PAPER)
 
     log.info("PAPER %s FILL: trade=%d | A(%s)=%.4f B(%s)=%.4f | $%.2f | bal=$%.2f",
              exec_mode.upper(), trade_id, side_a, price_a, side_b, price_b,
@@ -812,6 +835,7 @@ def _execute_paper(signal, size_usd, price_a, price_b,
         "fill_price_b": price_b,
         "size_usd": size_usd,
         "remaining_balance": account["available_cash"],
+        "runtime_scope": db.RUNTIME_SCOPE_PAPER,
         "paper_account": account,
         "confidence_score": confidence_metadata.get("confidence_score") if confidence_metadata else None,
         "confidence_policy": confidence_metadata.get("confidence_policy") if confidence_metadata else None,
@@ -830,7 +854,9 @@ def _execute_paper(signal, size_usd, price_a, price_b,
 
 def settle_paper_trade(trade_id, pnl_usd):
     """Retained for compatibility. Paper accounting is now derived from SQLite."""
-    account = db.get_paper_account_state(refresh_unrealized=False)
+    trade = db.get_trade(trade_id) or {}
+    runtime_scope = trade.get("runtime_scope") or db.RUNTIME_SCOPE_PAPER
+    account = db.get_paper_account_state(refresh_unrealized=False, runtime_scope=runtime_scope)
     log.info(
         "PAPER CLOSE: trade=%d | pnl=$%.2f | available=$%.2f equity=$%.2f",
         trade_id,
@@ -905,6 +931,7 @@ def _execute_live(signal, size_usd, price_a, price_b,
                 "strategy_name": "cointegration_live",
                 "trade_state_mode": db.TRADE_STATE_LIVE,
                 "reconciliation_mode": db.RECONCILIATION_ORDERS,
+                "runtime_scope": db.RUNTIME_SCOPE_PENNY,
                 **live_identity,
             },
         ) if signal_id else None

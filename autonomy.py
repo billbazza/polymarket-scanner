@@ -54,9 +54,13 @@ import journal_writer
 
 # --- Configuration ---
 
-STATE_FILE = Path(__file__).parent / "logs" / "autonomy_state.json"
+STATE_DIR = Path(__file__).parent / "logs"
+STATE_FILE = STATE_DIR / "autonomy_state.json"
 LEGACY_STATE_FILE = Path(__file__).parent / "autonomy_state.json"
 JOURNAL_FILE = Path(__file__).parent / "logs" / "journal.jsonl"
+
+RUNTIME_SCOPE_PAPER = "paper"
+RUNTIME_SCOPE_PENNY = "penny"
 
 LEVELS = {
     "scout": {
@@ -106,10 +110,29 @@ LEVELS = {
 
 # --- State Management ---
 
-def default_state():
+def normalize_runtime_scope(runtime_scope: str | None) -> str:
+    if runtime_scope == RUNTIME_SCOPE_PENNY:
+        return RUNTIME_SCOPE_PENNY
+    return RUNTIME_SCOPE_PAPER
+
+
+def runtime_scope_for_level(level: str | None) -> str:
+    if level in {"penny", "book"}:
+        return RUNTIME_SCOPE_PENNY
+    return RUNTIME_SCOPE_PAPER
+
+
+def state_file_for_scope(runtime_scope: str | None) -> Path:
+    scope = normalize_runtime_scope(runtime_scope)
+    return STATE_DIR / f"autonomy_state.{scope}.json"
+
+
+def default_state(runtime_scope: str | None = None):
     """Return the default autonomy state."""
+    scope = normalize_runtime_scope(runtime_scope)
     return {
-        "level": "scout",
+        "runtime_scope": scope,
+        "level": "paper" if scope == RUNTIME_SCOPE_PAPER else "penny",
         "promoted_at": None,
         "trades_at_level": 0,
         "wins_at_level": 0,
@@ -131,34 +154,49 @@ def _read_state_file(path):
 
 def _normalize_state(state):
     """Merge persisted state onto defaults so older files remain valid."""
-    merged = default_state()
+    scope = runtime_scope_for_level((state or {}).get("level")) if isinstance(state, dict) else RUNTIME_SCOPE_PAPER
+    merged = default_state(scope)
     if isinstance(state, dict):
         merged.update(state)
+    merged["runtime_scope"] = normalize_runtime_scope(
+        merged.get("runtime_scope"),
+    )
+    if merged.get("level") in LEVELS:
+        merged["runtime_scope"] = runtime_scope_for_level(merged["level"])
     return merged
 
 
-def load_state():
+def load_state(runtime_scope: str | None = None):
     """Load autonomy state from disk, migrating the legacy repo-root file if needed."""
-    state = _read_state_file(STATE_FILE)
+    scope = normalize_runtime_scope(runtime_scope)
+    state_path = state_file_for_scope(scope)
+    state = _read_state_file(state_path)
     if state is not None:
         return _normalize_state(state)
 
-    legacy_state = _read_state_file(LEGACY_STATE_FILE)
-    if legacy_state is not None:
+    for legacy_path in (STATE_FILE, LEGACY_STATE_FILE):
+        legacy_state = _read_state_file(legacy_path)
+        if legacy_state is None:
+            continue
         state = _normalize_state(legacy_state)
-        save_state(state)
-        log.info("Migrated autonomy state from %s to %s", LEGACY_STATE_FILE, STATE_FILE)
+        if runtime_scope_for_level(state.get("level")) != scope:
+            continue
+        save_state(state, runtime_scope=scope)
+        log.info("Migrated autonomy state from %s to %s", legacy_path, state_path)
         return state
 
-    return default_state()
+    return default_state(scope)
 
 
-def save_state(state):
+def save_state(state, runtime_scope: str | None = None):
     """Persist state to disk."""
-    STATE_FILE.parent.mkdir(exist_ok=True)
-    tmp_path = STATE_FILE.with_suffix(f"{STATE_FILE.suffix}.tmp")
+    scope = normalize_runtime_scope(runtime_scope or (state or {}).get("runtime_scope"))
+    state = _normalize_state({**(state or {}), "runtime_scope": scope})
+    state_path = state_file_for_scope(scope)
+    state_path.parent.mkdir(exist_ok=True)
+    tmp_path = state_path.with_suffix(f"{state_path.suffix}.tmp")
     tmp_path.write_text(json.dumps(state, indent=2))
-    tmp_path.replace(STATE_FILE)
+    tmp_path.replace(state_path)
 
 
 def journal(entry):
@@ -193,6 +231,7 @@ def record_attempt(level, strategy, outcome, reason_code, reason, **kwargs):
         reason_code=reason_code,
         reason=reason,
         autonomy_level=level,
+        runtime_scope=runtime_scope_for_level(level),
         phase=kwargs.pop("phase", None),
         **kwargs,
     )
@@ -275,13 +314,16 @@ def run_cycle(state):
 
     This is called every 30 minutes by the LaunchAgent.
     """
+    state = _normalize_state(state)
     level = state["level"]
     level_key = str(level).strip().lower()
+    runtime_scope = normalize_runtime_scope(state.get("runtime_scope") or runtime_scope_for_level(level_key))
+    state["runtime_scope"] = runtime_scope
     config = LEVELS.get(level, LEVELS.get(level_key, LEVELS["scout"]))
     current_stage = "initializing"
 
     try:
-        log.info("=== Autonomy cycle: level=%s (%s) ===", level, config["name"])
+        log.info("=== Autonomy cycle: level=%s (%s) scope=%s ===", level, config["name"], runtime_scope)
 
         # Step 1: Scan for new signals (use fast async scanner, ~5x faster)
         current_stage = "step 1 scan"
@@ -329,7 +371,7 @@ def run_cycle(state):
         db.save_scan_run(pairs_tested=scan_result["pairs_tested"], cointegrated=scan_result["pairs_cointegrated"],
                          opportunities=len(opportunities), duration=scan_duration)
 
-        paper_mode = level_key == "paper"
+        paper_mode = runtime_scope == RUNTIME_SCOPE_PAPER
         trial_settings = cointegration_trial.get_trial_settings()
         admitted_signals = []
         a_trial_candidates = 0
@@ -496,7 +538,7 @@ def run_cycle(state):
         current_stage = "step 2 refresh open trades"
         log.info("Step 2: Monitoring open trades...")
         try:
-            updates = tracker.refresh_open_trades()
+            updates = tracker.refresh_open_trades(runtime_scope=runtime_scope)
             if updates:
                 for u in updates:
                     pnl_info = u.get("unrealized_pnl", {})
@@ -542,7 +584,7 @@ def run_cycle(state):
         # Step 2c: Reconcile stuck or contradictory open-trade states
         current_stage = "step 2c reconcile open trades"
         try:
-            reconciliation = trade_monitor.reconcile_open_trades(auto_remediate=True)
+            reconciliation = trade_monitor.reconcile_open_trades(auto_remediate=True, runtime_scope=runtime_scope)
             flagged = reconciliation["counts"].get("resolved", 0)
             flagged += reconciliation["counts"].get("unpriceable-but-identifiable", 0)
             flagged += reconciliation["counts"].get("detached-from-watched-wallet", 0)
@@ -574,7 +616,7 @@ def run_cycle(state):
         current_stage = "step 3 auto-close"
         log.info("Step 3: Checking for auto-closes...")
         try:
-            closed = tracker.auto_close_trades(z_threshold=0.5)
+            closed = tracker.auto_close_trades(z_threshold=0.5, runtime_scope=runtime_scope)
             for c in closed:
                 pnl = c["pnl_usd"]
                 state["trades_at_level"] += 1
@@ -622,7 +664,7 @@ def run_cycle(state):
             save_state(state)
             return state
 
-        open_trades = db.get_trades(status="open", limit=None)
+        open_trades = db.get_trades(status="open", limit=None, runtime_scope=runtime_scope)
         open_count = len(open_trades)
         max_open = config["max_open"]
 
@@ -783,7 +825,7 @@ def run_cycle(state):
                     "cointegration",
                     opp,
                     baseline_size_usd=trade_size,
-                    account_overview=db.get_paper_account_overview(refresh_unrealized=False),
+                    account_overview=db.get_paper_account_overview(refresh_unrealized=False, runtime_scope=runtime_scope),
                     mode=mode,
                     source="autonomy",
                     signal_id=signal_id,
@@ -893,7 +935,7 @@ def run_cycle(state):
 
         # Step 4b: Open weather trades (if slots remain)
         current_stage = "step 4b open weather preflight"
-        open_trades = db.get_trades(status="open", limit=None)
+        open_trades = db.get_trades(status="open", limit=None, runtime_scope=runtime_scope)
         open_count = len(open_trades)
         slots_remaining = (max_open - open_count) if max_open is not None else None
 
@@ -925,7 +967,7 @@ def run_cycle(state):
                             "weather",
                             w_opp,
                             baseline_size_usd=trade_size,
-                            account_overview=db.get_paper_account_overview(refresh_unrealized=False),
+                            account_overview=db.get_paper_account_overview(refresh_unrealized=False, runtime_scope=runtime_scope),
                             mode="paper",
                             source="autonomy",
                             weather_signal_id=w_id,
@@ -1113,7 +1155,7 @@ def run_cycle(state):
             # Build index of currently open copy trades: (wallet, condition_id) → trade
             open_copy = {
                 ((t.get("copy_wallet") or "").lower(), db.get_trade_reconciliation_key(t)): t
-                for t in db.get_trades(status="open", limit=None)
+                for t in db.get_trades(status="open", limit=None, runtime_scope=runtime_scope)
                 if t.get("trade_type") == "copy" and db.get_trade_reconciliation_key(t) and t.get("copy_wallet")
             }
             # Track which (wallet, condition_id) tuples are still held this cycle
@@ -1217,6 +1259,7 @@ def run_cycle(state):
                             size_usd=20,
                             max_wallet_open=max_copy_wallet_open,
                             max_total_open=max_copy_total_open,
+                            runtime_scope=runtime_scope,
                         )
                         if not decision["ok"]:
                             record_attempt(
@@ -1264,6 +1307,7 @@ def run_cycle(state):
                             size_usd=20,
                             max_wallet_open=max_copy_wallet_open,
                             max_total_open=max_copy_total_open,
+                            runtime_scope=runtime_scope,
                         )
                         if t_id:
                             record_attempt(
@@ -1587,6 +1631,7 @@ def print_status(state):
   AUTONOMOUS TRADER STATUS
 {'='*60}
 
+  Runtime:      {state.get('runtime_scope', runtime_scope_for_level(level))}
   Level:        {config['name']} ({level})
   Description:  {config['description']}
   Trade Size:   {'$' + str(config['size_usd']) if config.get('size_usd') else 'Kelly-sized'}
@@ -1744,6 +1789,8 @@ def print_journal(n=20):
 
 def main():
     parser = argparse.ArgumentParser(description="Autonomous Polymarket trader")
+    parser.add_argument("--runtime-scope", choices=[RUNTIME_SCOPE_PAPER, RUNTIME_SCOPE_PENNY],
+                        help="Select isolated runtime scope")
     parser.add_argument("--level", choices=list(LEVELS.keys()),
                         help="Override trading level")
     parser.add_argument("--status", action="store_true",
@@ -1758,12 +1805,13 @@ def main():
                         help="Reset level counters (keeps level)")
     args = parser.parse_args()
 
-    state = load_state()
+    state = load_state(runtime_scope=args.runtime_scope)
 
     # Override level if specified
     if args.level:
         state["level"] = args.level
-        save_state(state)
+        state["runtime_scope"] = runtime_scope_for_level(args.level)
+        save_state(state, runtime_scope=state["runtime_scope"])
         log.info("Level set to: %s", args.level)
 
     if args.status:
@@ -1784,7 +1832,7 @@ def main():
         state["losses_at_level"] = 0
         state["pnl_at_level"] = 0.0
         state["returns_at_level"] = []
-        save_state(state)
+        save_state(state, runtime_scope=state.get("runtime_scope"))
         print(f"Level counters reset for {state['level']}")
         return
 

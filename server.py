@@ -102,6 +102,10 @@ TESTING_IDEAS_PATH = Path(__file__).parent / "testing-ideas.md"
 FIX_LOGS_DIR = Path(__file__).parent / "fix_logs"
 
 
+def _runtime_scope_param(runtime_scope: str | None) -> str:
+    return db.normalize_runtime_scope(runtime_scope)
+
+
 def _safe_record_paper_trade_attempt(**kwargs) -> bool:
     recorder = getattr(db, "record_paper_trade_attempt", None)
     if not callable(recorder):
@@ -115,7 +119,7 @@ def _safe_record_paper_trade_attempt(**kwargs) -> bool:
         return False
 
 
-def _paper_trade_attempt_feed(limit: int) -> dict:
+def _paper_trade_attempt_feed(limit: int, runtime_scope: str | None = None) -> dict:
     attempts_getter = getattr(db, "get_paper_trade_attempts", None)
     summary_getter = getattr(db, "get_paper_trade_attempt_summary", None)
     if not callable(attempts_getter) or not callable(summary_getter):
@@ -134,8 +138,8 @@ def _paper_trade_attempt_feed(limit: int) -> dict:
         }
 
     try:
-        attempts = attempts_getter(limit=limit)
-        summary = summary_getter(limit=limit)
+        attempts = attempts_getter(limit=limit, runtime_scope=runtime_scope)
+        summary = summary_getter(limit=limit, runtime_scope=runtime_scope)
         if not isinstance(summary, dict):
             summary = {}
         summary.setdefault("available", True)
@@ -555,13 +559,16 @@ async def dashboard():
 # --- Stats ---
 
 @app.get("/api/stats")
-async def stats():
-    return db.get_stats()
+async def stats(runtime_scope: str | None = None):
+    return db.get_stats(runtime_scope=_runtime_scope_param(runtime_scope))
 
 
 @app.get("/api/paper-account")
-async def paper_account():
-    return db.get_paper_account_overview(refresh_unrealized=True)
+async def paper_account(runtime_scope: str | None = None):
+    return db.get_paper_account_overview(
+        refresh_unrealized=True,
+        runtime_scope=_runtime_scope_param(runtime_scope),
+    )
 
 
 @app.get("/api/paper-sizing")
@@ -629,13 +636,13 @@ async def update_paper_sizing_settings(
 
 
 @app.get("/api/paper-trade-attempts")
-async def paper_trade_attempts(limit: int = 50):
-    return _paper_trade_attempt_feed(limit=limit)
+async def paper_trade_attempts(limit: int = 50, runtime_scope: str | None = None):
+    return _paper_trade_attempt_feed(limit=limit, runtime_scope=_runtime_scope_param(runtime_scope))
 
 
 @app.get("/api/trades/monitor")
-async def trade_monitor_status():
-    return trade_monitor.get_flagged_open_trades()
+async def trade_monitor_status(runtime_scope: str | None = None):
+    return trade_monitor.get_flagged_open_trades(runtime_scope=_runtime_scope_param(runtime_scope))
 
 
 @app.post("/api/trades/reconcile")
@@ -1312,8 +1319,8 @@ async def copy_wallet_events(limit: int = 40, wallet: str | None = None):
 # --- Trades ---
 
 @app.get("/api/trades")
-async def list_trades(status: str = None, limit: int = 50):
-    return db.get_trades(status=status, limit=limit)
+async def list_trades(status: str = None, limit: int = 50, runtime_scope: str | None = None):
+    return db.get_trades(status=status, limit=limit, runtime_scope=_runtime_scope_param(runtime_scope))
 
 
 @app.get("/api/trades/{trade_id}")
@@ -1325,14 +1332,16 @@ async def get_trade(trade_id: int):
 
 
 @app.post("/api/trades")
-async def create_trade(signal_id: int, size_usd: float = 100):
+async def create_trade(signal_id: int, size_usd: float = 100, runtime_scope: str | None = None):
     """Open a paper trade from a signal."""
-    decision = db.inspect_pairs_trade_open(signal_id, size_usd=size_usd)
+    runtime_scope = _runtime_scope_param(runtime_scope)
+    decision = db.inspect_pairs_trade_open(signal_id, size_usd=size_usd, runtime_scope=runtime_scope)
     if not decision["ok"]:
         _safe_record_paper_trade_attempt(
             source="manual_api",
             strategy="pairs",
             outcome="blocked",
+            runtime_scope=runtime_scope,
             reason_code=decision["reason_code"],
             reason=decision["reason"],
             event=((decision.get("signal") or {}).get("event")),
@@ -1358,12 +1367,13 @@ async def create_trade(signal_id: int, size_usd: float = 100):
                 },
             },
         )
-    trade_id = db.open_trade(signal_id, size_usd=size_usd)
+    trade_id = db.open_trade(signal_id, size_usd=size_usd, metadata={"runtime_scope": runtime_scope})
     if not trade_id:
         _safe_record_paper_trade_attempt(
             source="manual_api",
             strategy="pairs",
             outcome="error",
+            runtime_scope=runtime_scope,
             reason_code="open_failed",
             reason="Pairs trade could not be opened after preflight passed.",
             event=((decision.get("signal") or {}).get("event")),
@@ -1379,6 +1389,7 @@ async def create_trade(signal_id: int, size_usd: float = 100):
         source="manual_api",
         strategy="pairs",
         outcome="allowed",
+        runtime_scope=runtime_scope,
         reason_code="opened",
         reason="Paper pairs trade opened.",
         event=((decision.get("signal") or {}).get("event")),
@@ -1391,29 +1402,34 @@ async def create_trade(signal_id: int, size_usd: float = 100):
         "ok": True,
         "trade_id": trade_id,
         "status": "open",
+        "runtime_scope": runtime_scope,
         "trade_state_mode": db.TRADE_STATE_PAPER,
         "reconciliation_mode": db.RECONCILIATION_INTERNAL,
-        "paper_account": db.get_paper_account_state(refresh_unrealized=True),
+        "paper_account": db.get_paper_account_state(refresh_unrealized=True, runtime_scope=runtime_scope),
     }
 
 
 @app.post("/api/trades/{trade_id}/close")
 async def close_trade(trade_id: int, exit_price_a: float, exit_price_b: float = None, notes: str = ""):
     """Close a paper trade. exit_price_b is optional for single-leg (weather) trades."""
+    existing_trade = db.get_trade(trade_id)
     pnl = db.close_trade(trade_id, exit_price_a, exit_price_b, notes)
     if pnl is None:
         raise HTTPException(404, "Trade not found")
+    runtime_scope = (existing_trade or {}).get("runtime_scope") or db.RUNTIME_SCOPE_PAPER
     return {
         "trade_id": trade_id,
         "pnl": round(pnl, 2),
         "status": "closed",
-        "paper_account": db.get_paper_account_state(refresh_unrealized=True),
+        "runtime_scope": runtime_scope,
+        "paper_account": db.get_paper_account_state(refresh_unrealized=True, runtime_scope=runtime_scope),
     }
 
 
 @app.post("/api/weather/{signal_id}/trade")
-async def open_weather_trade(signal_id: int, size_usd: float = 20):
+async def open_weather_trade(signal_id: int, size_usd: float = 20, runtime_scope: str | None = None):
     """Open a paper trade from a weather signal."""
+    runtime_scope = _runtime_scope_param(runtime_scope)
     signal = db.get_weather_signal_by_id(signal_id)
     result = execution.execute_weather_trade(signal or {"id": signal_id}, size_usd=size_usd, mode="paper")
     if not result["ok"]:
@@ -1421,11 +1437,13 @@ async def open_weather_trade(signal_id: int, size_usd: float = 20):
             signal_id,
             size_usd=size_usd,
             mode="paper",
+            runtime_scope=runtime_scope,
         )
         _safe_record_paper_trade_attempt(
             source="manual_api",
             strategy="weather",
             outcome="blocked",
+            runtime_scope=runtime_scope,
             reason_code=result.get("reason_code") or decision["reason_code"],
             reason=result.get("error") or decision["reason"],
             event=((decision.get("signal") or {}).get("event")),
@@ -1456,6 +1474,7 @@ async def open_weather_trade(signal_id: int, size_usd: float = 20):
         source="manual_api",
         strategy="weather",
         outcome="allowed",
+        runtime_scope=runtime_scope,
         reason_code="opened",
         reason="Paper weather trade opened.",
         event=((signal or {}).get("event")),
@@ -1470,15 +1489,17 @@ async def open_weather_trade(signal_id: int, size_usd: float = 20):
         "trade_id": result["trade_id"],
         "signal_id": signal_id,
         "status": "open",
+        "runtime_scope": runtime_scope,
         "trade_state_mode": result["trade_state_mode"],
         "reconciliation_mode": result["reconciliation_mode"],
-        "paper_account": db.get_paper_account_state(refresh_unrealized=True),
+        "paper_account": db.get_paper_account_state(refresh_unrealized=True, runtime_scope=runtime_scope),
     }
 
 
 @app.post("/api/whales/{alert_id}/trade")
-async def open_whale_trade_endpoint(alert_id: int, size_usd: float = 20):
+async def open_whale_trade_endpoint(alert_id: int, size_usd: float = 20, runtime_scope: str | None = None):
     """Open a paper trade from a whale alert."""
+    runtime_scope = _runtime_scope_param(runtime_scope)
     try:
         alert = db.get_whale_alert_by_id(alert_id)
         if not alert:
@@ -1491,6 +1512,7 @@ async def open_whale_trade_endpoint(alert_id: int, size_usd: float = 20):
                 alert_id,
                 size_usd=size_usd,
                 mode="paper",
+                runtime_scope=runtime_scope,
             )
             reason_code = result.get("reason_code") or decision.get("reason_code")
             reason = result.get("error") or decision.get("reason")
@@ -1498,6 +1520,7 @@ async def open_whale_trade_endpoint(alert_id: int, size_usd: float = 20):
                 source="manual_api",
                 strategy="whale",
                 outcome="blocked",
+                runtime_scope=runtime_scope,
                 reason_code=reason_code,
                 reason=reason,
                 event=alert.get("event"),
@@ -1527,6 +1550,7 @@ async def open_whale_trade_endpoint(alert_id: int, size_usd: float = 20):
             source="manual_api",
             strategy="whale",
             outcome="allowed",
+            runtime_scope=runtime_scope,
             reason_code="opened",
             reason="Paper whale trade opened.",
             event=alert.get("event"),
@@ -1540,7 +1564,8 @@ async def open_whale_trade_endpoint(alert_id: int, size_usd: float = 20):
             "ok": True,
             "trade_id": result.get("trade_id"),
             "status": "open",
-            "paper_account": db.get_paper_account_state(refresh_unrealized=True),
+            "runtime_scope": runtime_scope,
+            "paper_account": db.get_paper_account_state(refresh_unrealized=True, runtime_scope=runtime_scope),
         }
     except HTTPException:
         raise
@@ -1589,61 +1614,70 @@ async def get_logs(lines: int = 100):
 
 # --- Autonomy ---
 
-_autonomy_status = {"running": False, "last_result": None}
+_autonomy_status = {
+    db.RUNTIME_SCOPE_PAPER: {"running": False, "last_result": None},
+    db.RUNTIME_SCOPE_PENNY: {"running": False, "last_result": None},
+}
 
-def _run_autonomy_background():
+
+def _run_autonomy_background(runtime_scope: str):
     """Run autonomy cycle in background thread."""
     import autonomy
-    _autonomy_status["running"] = True
+    _autonomy_status[runtime_scope]["running"] = True
     t0 = time.time()
     try:
-        stats_before = db.get_stats()
-        state = autonomy.load_state()
+        stats_before = db.get_stats(runtime_scope=runtime_scope)
+        state = autonomy.load_state(runtime_scope=runtime_scope)
         autonomy.run_cycle(state)
-        stats_after = db.get_stats()
+        stats_after = db.get_stats(runtime_scope=runtime_scope)
         duration = round(time.time() - t0, 1)
-        _autonomy_status["last_result"] = {
+        _autonomy_status[runtime_scope]["last_result"] = {
             "ok": True,
+            "runtime_scope": runtime_scope,
             "duration_secs": duration,
             "signals_found": stats_after.get("total_signals", 0) - stats_before.get("total_signals", 0),
             "trades_opened": stats_after.get("open_trades", 0) - stats_before.get("open_trades", 0),
             "trades_closed": stats_after.get("closed_trades", 0) - stats_before.get("closed_trades", 0),
         }
-        log.info("Autonomy cycle complete in %.1fs", duration)
+        log.info("Autonomy cycle complete in %.1fs for scope=%s", duration, runtime_scope)
     except Exception as e:
         log.exception("Autonomy cycle failed in background thread: %s", e)
         _safe_record_paper_trade_attempt(
             source="autonomy_runner",
             strategy="system",
             outcome="error",
+            runtime_scope=runtime_scope,
             reason_code="autonomy_cycle_failed",
             reason=f"Autonomy cycle failed: {e}",
             event="Autonomy cycle",
             details={"path": "/api/autonomy"},
         )
-        _autonomy_status["last_result"] = {"ok": False, "error": str(e)}
+        _autonomy_status[runtime_scope]["last_result"] = {"ok": False, "error": str(e), "runtime_scope": runtime_scope}
     finally:
-        _autonomy_status["running"] = False
+        _autonomy_status[runtime_scope]["running"] = False
 
 
 @app.post("/api/autonomy")
-async def run_autonomy():
+async def run_autonomy(runtime_scope: str | None = None):
     """Kick off autonomy cycle in background — returns immediately."""
     import threading
-    if _autonomy_status["running"]:
+    runtime_scope = _runtime_scope_param(runtime_scope)
+    if _autonomy_status[runtime_scope]["running"]:
         return {"ok": False, "error": "Cycle already running — check Console tab for progress"}
-    thread = threading.Thread(target=_run_autonomy_background, daemon=True)
+    thread = threading.Thread(target=_run_autonomy_background, args=(runtime_scope,), daemon=True)
     thread.start()
-    log.info("Autonomy cycle triggered from dashboard (background)")
-    return {"ok": True, "message": "Autonomy cycle started — watch Console tab for progress"}
+    log.info("Autonomy cycle triggered from dashboard (background) scope=%s", runtime_scope)
+    return {"ok": True, "message": "Autonomy cycle started — watch Console tab for progress", "runtime_scope": runtime_scope}
 
 
 @app.get("/api/autonomy/status")
-async def autonomy_status():
+async def autonomy_status(runtime_scope: str | None = None):
     """Check if an autonomy cycle is running and get last result."""
+    runtime_scope = _runtime_scope_param(runtime_scope)
     return {
-        "running": _autonomy_status["running"],
-        "last_result": _autonomy_status["last_result"],
+        "runtime_scope": runtime_scope,
+        "running": _autonomy_status[runtime_scope]["running"],
+        "last_result": _autonomy_status[runtime_scope]["last_result"],
     }
 
 

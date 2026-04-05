@@ -485,6 +485,11 @@
     <div class="header-actions">
       <span class="status-dot" id="statusDot"></span>
       <span id="lastScan" style="color: var(--text2); font-size: 12px;">No scans yet</span>
+      <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">
+        <span id="runtimeScopeBadge" class="pill" style="background:rgba(14,165,233,0.18);color:var(--sky);border:1px solid rgba(14,165,233,0.35)">Paper View</span>
+        <button class="btn sm" id="runtimeScopePaperBtn" onclick="setRuntimeScope('paper')">Paper</button>
+        <button class="btn sm" id="runtimeScopePennyBtn" onclick="setRuntimeScope('penny')">Penny</button>
+      </div>
       <button class="btn" id="autoTradeBtn" onclick="runAutoTrade()" style="background:var(--green);color:#000;font-weight:600;">Auto Trade</button>
     </div>
   </header>
@@ -508,12 +513,12 @@
   <div class="hero-panel">
     <div class="hero-head">
       <div class="hero-title">
-        <div class="hero-kicker">Paper Account</div>
-        <h2>Fixed bankroll accounting with cash, commitments, and equity separated cleanly.</h2>
+        <div class="hero-kicker" id="accountKicker">Paper Account</div>
+        <h2 id="accountHeading">Fixed bankroll accounting with cash, commitments, and equity separated cleanly.</h2>
         <p id="accountSummaryText">Paper trading starts from a fixed bankroll and moves funds from cash into committed capital when a trade opens.</p>
       </div>
       <div class="hero-equity">
-        <div class="label">Total Equity</div>
+        <div class="label" id="equityLabel">Total Equity</div>
         <div class="value" id="statEquity">$0.00</div>
         <div class="subtext" id="statStartingBankroll">Starting bankroll $0.00</div>
       </div>
@@ -524,7 +529,7 @@
         <div class="label">Available Cash</div>
         <div class="value" id="statAvailableCash">$0.00</div>
         <div class="meta" id="statCashMeta">Ready for new paper trades.</div>
-        <div style="display:grid;grid-template-columns:1fr;gap:8px;margin-top:10px">
+        <div id="paperSizingControls" style="display:grid;grid-template-columns:1fr;gap:8px;margin-top:10px">
           <label style="display:grid;gap:4px">
             <span style="font-size:11px;color:var(--text2)">Adaptive Min Size</span>
             <select id="paperAdaptiveMinSizeSelect" onchange="savePaperSizingSettings()" style="background:var(--panel);color:var(--text);border:1px solid var(--border);border-radius:8px;padding:8px"></select>
@@ -951,6 +956,7 @@ const API = '';
 const ALL_PANELS = ['signals','locked','weather','whales','copy','paper-attempts','trades','history','scans','reports','console'];
 const UI_PREFS_KEY = 'polymarket-scanner-ui-prefs-v1';
 let latestDailyReportFilename = null;
+let ACTIVE_RUNTIME_SCOPE = 'paper';
 
 // ── Utilities ──────────────────────────────────────────────────────────────
 
@@ -972,6 +978,45 @@ function fmtClock(ts) {
 
 function getEl(id) { return document.getElementById(id); }
 
+function runtimeScopedUrl(path, params = {}) {
+  const url = new URL(path, window.location.origin);
+  url.searchParams.set('runtime_scope', ACTIVE_RUNTIME_SCOPE);
+  Object.entries(params || {}).forEach(([key, value]) => {
+    if (value == null) return;
+    url.searchParams.set(key, value);
+  });
+  return url.pathname + url.search;
+}
+
+function updateRuntimeScopeUi() {
+  const isPaper = ACTIVE_RUNTIME_SCOPE === 'paper';
+  if (getEl('runtimeScopeBadge')) getEl('runtimeScopeBadge').textContent = isPaper ? 'Paper View' : 'Penny View';
+  if (getEl('runtimeScopePaperBtn')) {
+    getEl('runtimeScopePaperBtn').style.background = isPaper ? 'var(--blue)' : '';
+    getEl('runtimeScopePaperBtn').style.color = isPaper ? '#fff' : '';
+  }
+  if (getEl('runtimeScopePennyBtn')) {
+    getEl('runtimeScopePennyBtn').style.background = !isPaper ? 'var(--amber)' : '';
+    getEl('runtimeScopePennyBtn').style.color = !isPaper ? '#111827' : '';
+  }
+  if (getEl('accountKicker')) getEl('accountKicker').textContent = isPaper ? 'Paper Account' : 'Penny Runtime';
+  if (getEl('accountHeading')) getEl('accountHeading').textContent = isPaper
+    ? 'Fixed bankroll accounting with cash, commitments, and equity separated cleanly.'
+    : 'Live penny trading is isolated from paper experiments, with its own runtime state and open-trade limits.';
+  if (getEl('equityLabel')) getEl('equityLabel').textContent = isPaper ? 'Total Equity' : 'Scoped Equity';
+  if (getEl('paperSizingControls')) getEl('paperSizingControls').style.display = isPaper ? 'grid' : 'none';
+  if (getEl('autoTradeBtn')) getEl('autoTradeBtn').textContent = isPaper ? 'Run Paper' : 'Run Penny';
+}
+
+function setRuntimeScope(scope) {
+  ACTIVE_RUNTIME_SCOPE = scope === 'penny' ? 'penny' : 'paper';
+  persistUiPrefs();
+  updateRuntimeScopeUi();
+  loadStats();
+  loadTrades();
+  loadPaperAttempts();
+}
+
 function isSportsEvent(text) {
   const t = String(text || '').toLowerCase();
   return [
@@ -986,6 +1031,7 @@ function isSportsEvent(text) {
 
 function persistUiPrefs() {
   const prefs = {
+    runtimeScope: ACTIVE_RUNTIME_SCOPE,
     signalHideSports: !!getEl('signalHideSports')?.checked,
     signalStage3Only: !!getEl('signalStage3Only')?.checked,
     lockedTradeableOnly: !!getEl('lockedTradeableOnly')?.checked,
@@ -1006,6 +1052,7 @@ function persistUiPrefs() {
 function loadUiPrefs() {
   try {
     const prefs = JSON.parse(localStorage.getItem(UI_PREFS_KEY) || '{}');
+    ACTIVE_RUNTIME_SCOPE = prefs.runtimeScope === 'penny' ? 'penny' : 'paper';
     if (getEl('signalHideSports')) getEl('signalHideSports').checked = !!prefs.signalHideSports;
     if (getEl('signalStage3Only')) getEl('signalStage3Only').checked = !!prefs.signalStage3Only;
     if (getEl('lockedTradeableOnly')) getEl('lockedTradeableOnly').checked = !!prefs.lockedTradeableOnly;
@@ -1022,6 +1069,7 @@ function loadUiPrefs() {
   } catch(e) {
     console.warn('Failed to load UI prefs', e);
   }
+  updateRuntimeScopeUi();
 }
 
 function toast(msg, duration=4000) {
@@ -1220,12 +1268,13 @@ function switchTab(name) {
 async function loadStats() {
   try {
     const [statsR, sizingR] = await Promise.all([
-      fetch(API + '/api/stats'),
+      fetch(API + runtimeScopedUrl('/api/stats')),
       fetch(API + '/api/paper-sizing?limit=20'),
     ]);
     const s = await statsR.json();
     const sizingData = await sizingR.json();
     const account = s.paper_account || {};
+    const isPaper = (s.runtime_scope || ACTIVE_RUNTIME_SCOPE) === 'paper';
     const strategyBreakdown = (s.strategy_breakdown || account.strategy_breakdown || {});
     const setSignedValue = (id, value) => {
       const el = document.getElementById(id);
@@ -1235,36 +1284,43 @@ async function loadStats() {
     const formatSignedCell = value => `<span style="color:${value >= 0 ? 'var(--green)' : 'var(--red)'}">${fmtUsd(value)}</span>`;
 
     document.getElementById('statEquity').textContent = fmtUsd(account.total_equity);
-    document.getElementById('statStartingBankroll').textContent = `Starting bankroll ${fmtUsd(account.starting_bankroll)}`;
+    document.getElementById('statStartingBankroll').textContent = isPaper
+      ? `Starting bankroll ${fmtUsd(account.starting_bankroll)}`
+      : `Scoped runtime ${String(s.runtime_scope || ACTIVE_RUNTIME_SCOPE).toUpperCase()}`;
     document.getElementById('statAvailableCash').textContent = fmtUsd(account.available_cash);
     const drawdownPct = account.starting_bankroll > 0
       ? Math.max(0, ((account.starting_bankroll - account.total_equity) / account.starting_bankroll) * 100)
       : 0;
     const maxDrawdownPct = sizingData?.settings?.constraints?.max_drawdown_pct ?? 15;
-    document.getElementById('statCashMeta').textContent = `${fmtUsd(account.available_cash)} free to deploy now. Drawdown ${drawdownPct.toFixed(1)}% / cap ${Number(maxDrawdownPct).toFixed(0)}%.`;
+    document.getElementById('statCashMeta').textContent = isPaper
+      ? `${fmtUsd(account.available_cash)} free to deploy now. Drawdown ${drawdownPct.toFixed(1)}% / cap ${Number(maxDrawdownPct).toFixed(0)}%.`
+      : `${fmtUsd(account.available_cash)} available in the penny runtime. Paper experiments no longer consume these slots or balances.`;
     document.getElementById('statCommitted').textContent = fmtUsd(account.committed_capital);
-    document.getElementById('statCommittedMeta').textContent = `${fmtUsd(account.committed_capital)} tied up across ${account.open_trades || 0} open trade${(account.open_trades || 0) === 1 ? '' : 's'}.`;
+    document.getElementById('statCommittedMeta').textContent = `${fmtUsd(account.committed_capital)} tied up across ${account.open_trades || 0} open ${isPaper ? 'paper' : 'penny'} trade${(account.open_trades || 0) === 1 ? '' : 's'}.`;
     setSignedValue('statRealized', account.realized_pnl || 0);
     document.getElementById('statRealizedMeta').textContent = `Closed-trade net: gains ${fmtUsd(account.realized_gains || 0)} vs losses ${fmtUsd(account.cumulative_losses || 0)}.`;
     setSignedValue('statUnrealized', account.unrealized_pnl || 0);
     document.getElementById('statUnrealizedMeta').textContent = `Current mark-to-market on open trades.`;
     document.getElementById('statLossesUsd').textContent = fmtUsd(account.cumulative_losses);
     document.getElementById('statUtilization').textContent = (account.bankroll_used_pct || 0).toFixed(1) + '%';
-    document.getElementById('statUtilizationMeta').textContent =
-      `${fmtUsd(account.committed_capital || 0)} of ${fmtUsd(account.starting_bankroll || 0)} paper bankroll currently committed.` +
-      ((account.excluded_open_trades || 0)
-        ? ` ${account.excluded_open_trades} wallet/live trade${(account.excluded_open_trades || 0) === 1 ? '' : 's'} excluded from utilization.`
-        : '');
-    document.getElementById('accountSummaryText').textContent =
-      `Equity ${fmtUsd(account.total_equity)} = cash ${fmtUsd(account.available_cash)} + marked open positions ${fmtUsd(account.open_position_value)}.`;
-    document.getElementById('accountExplainer').innerHTML =
-      `<strong>Accounting rule:</strong> ${esc(account.cash_after_open_explanation || 'Opening a paper trade deducts its size from available cash immediately.')} ` +
-      `${esc(account.position_policy_detail || 'Paper trading is uncapped by position count and limited by available cash.')} ` +
-      `Available cash is computed as starting bankroll ${fmtUsd(account.starting_bankroll)} + realized P&amp;L ${fmtUsd(account.realized_pnl)} - committed capital ${fmtUsd(account.committed_capital)}. ` +
-      `Marked open-position value is committed capital ${fmtUsd(account.committed_capital)} + unrealized P&amp;L ${fmtUsd(account.unrealized_pnl)}. ` +
-      ((account.excluded_open_trades || 0)
-        ? `Wallet-attached/live trades are tracked separately and do not consume this paper bankroll view.`
-        : '');
+    document.getElementById('statUtilizationMeta').textContent = isPaper
+      ? `${fmtUsd(account.committed_capital || 0)} of ${fmtUsd(account.starting_bankroll || 0)} paper bankroll currently committed.` +
+        ((account.excluded_open_trades || 0)
+          ? ` ${account.excluded_open_trades} wallet/live trade${(account.excluded_open_trades || 0) === 1 ? '' : 's'} excluded from utilization.`
+          : '')
+      : `${account.open_trades || 0} penny trade${(account.open_trades || 0) === 1 ? '' : 's'} currently consume the live runtime's scoped capital.`;
+    document.getElementById('accountSummaryText').textContent = isPaper
+      ? `Equity ${fmtUsd(account.total_equity)} = cash ${fmtUsd(account.available_cash)} + marked open positions ${fmtUsd(account.open_position_value)}.`
+      : `Penny scope tracks only its own open and closed trades, so paper research no longer blocks penny max-open checks.`;
+    document.getElementById('accountExplainer').innerHTML = isPaper
+      ? `<strong>Accounting rule:</strong> ${esc(account.cash_after_open_explanation || 'Opening a paper trade deducts its size from available cash immediately.')} ` +
+        `${esc(account.position_policy_detail || 'Paper trading is uncapped by position count and limited by available cash.')} ` +
+        `Available cash is computed as starting bankroll ${fmtUsd(account.starting_bankroll)} + realized P&amp;L ${fmtUsd(account.realized_pnl)} - committed capital ${fmtUsd(account.committed_capital)}. ` +
+        `Marked open-position value is committed capital ${fmtUsd(account.committed_capital)} + unrealized P&amp;L ${fmtUsd(account.unrealized_pnl)}. ` +
+        ((account.excluded_open_trades || 0)
+          ? `Wallet-attached/live trades are tracked separately and do not consume this paper bankroll view.`
+          : '')
+      : `<strong>Runtime rule:</strong> Penny mode reads only penny-scoped trades and status. Open paper experiments remain visible in the paper view and do not consume penny max-open slots.`;
     renderPaperSizingControls(sizingData?.settings || {});
 
     document.getElementById('statWinRate').textContent = s.win_rate + '%';
@@ -1385,7 +1441,7 @@ function formatAttemptRef(row) {
 
 async function loadPaperAttempts() {
   try {
-    const r = await fetch(API + '/api/paper-trade-attempts?limit=60');
+    const r = await fetch(API + runtimeScopedUrl('/api/paper-trade-attempts', { limit: 60 }));
     const data = await r.json();
     const rows = data.attempts || [];
     const summary = data.summary || {};
@@ -1711,8 +1767,8 @@ async function loadWeather() {
 async function loadTrades() {
   try {
     const [r, monResp] = await Promise.all([
-      fetch(API + '/api/trades?status=open&limit=500'),
-      fetch(API + '/api/trades/monitor'),
+      fetch(API + runtimeScopedUrl('/api/trades', { status: 'open', limit: 500 })),
+      fetch(API + runtimeScopedUrl('/api/trades/monitor')),
     ]);
     const trades = await r.json();
     const monitor = monResp.ok ? await monResp.json() : {summary:{available:false}, trades:[]};
@@ -1969,10 +2025,14 @@ function runLockedScan() {
 }
 
 async function openWeatherTrade(signalId, btn) {
+  if (ACTIVE_RUNTIME_SCOPE !== 'paper') {
+    toast('Weather experimentation is available in the paper view only.', true);
+    return;
+  }
   btn.disabled = true;
   btn.textContent = '…';
   try {
-    const r = await fetch(API + `/api/weather/${signalId}/trade`, {method: 'POST'});
+    const r = await fetch(API + runtimeScopedUrl(`/api/weather/${signalId}/trade`), {method: 'POST'});
     const data = await r.json();
     if (r.ok && data.ok !== false) {
       toast(`Weather trade #${data.trade_id} opened`);
@@ -1998,30 +2058,30 @@ async function runAutoTrade() {
   btn.disabled = true;
   btn.innerHTML = '<span class="spinner"></span>Running...';
   try {
-    const r = await fetch(API + '/api/autonomy', { method: 'POST' });
+    const r = await fetch(API + runtimeScopedUrl('/api/autonomy'), { method: 'POST' });
     const data = await r.json();
     if (!data.ok) {
       toast('Auto trade: ' + data.error);
-      btn.disabled = false; btn.innerHTML = 'Auto Trade'; return;
+      btn.disabled = false; updateRuntimeScopeUi(); return;
     }
-    toast('Cycle started — watch Console tab...');
+    toast(`${ACTIVE_RUNTIME_SCOPE === 'paper' ? 'Paper' : 'Penny'} cycle started — watch Console tab...`);
     const poll = setInterval(async () => {
       try {
-        const sr = await fetch(API + '/api/autonomy/status');
+        const sr = await fetch(API + runtimeScopedUrl('/api/autonomy/status'));
         const status = await sr.json();
         if (!status.running) {
           clearInterval(poll);
-          btn.disabled = false; btn.innerHTML = 'Auto Trade';
+          btn.disabled = false; updateRuntimeScopeUi();
           const res = status.last_result;
           if (res && res.ok)
             toast(`Done: ${res.signals_found} signals, ${res.trades_opened} opened, ${res.trades_closed} closed (${res.duration_secs}s)`);
           loadStats(); loadSignals(); loadTrades(); loadWeather(); loadPaperAttempts();
         }
-      } catch(e) { clearInterval(poll); btn.disabled = false; btn.innerHTML = 'Auto Trade'; }
+      } catch(e) { clearInterval(poll); btn.disabled = false; updateRuntimeScopeUi(); }
     }, 5000);
   } catch(e) {
     toast('Auto trade error: ' + e.message);
-    btn.disabled = false; btn.innerHTML = 'Auto Trade';
+    btn.disabled = false; updateRuntimeScopeUi();
   }
 }
 
@@ -2052,10 +2112,14 @@ async function brainValidateWhale(alertId) {
 }
 
 async function paperTrade(signalId) {
+  if (ACTIVE_RUNTIME_SCOPE !== 'paper') {
+    toast('Manual paper entries are available in the paper view only.', true);
+    return;
+  }
   const size = prompt('Paper trade size (USD):', '100');
   if (!size) return;
   try {
-    const r = await fetch(API + `/api/trades?signal_id=${signalId}&size_usd=${size}`, { method: 'POST' });
+    const r = await fetch(API + runtimeScopedUrl('/api/trades', { signal_id: signalId, size_usd: size }), { method: 'POST' });
     const data = await r.json();
     if (!r.ok || data.ok === false) {
       toast(`Failed: ${data.reason || data.detail || data.error || 'Request failed'}`, true);
@@ -2206,11 +2270,15 @@ async function runWhaleScan() {
 }
 
 async function tradeWhaleAlert(alertId, btn) {
+  if (ACTIVE_RUNTIME_SCOPE !== 'paper') {
+    toast('Whale paper entries are available in the paper view only.', true);
+    return;
+  }
   const sizeUsd = Number(getEl('whaleOrderValue')?.value || 20);
   btn.disabled = true;
   btn.textContent = '…';
   try {
-    const r = await fetch(API + `/api/whales/${alertId}/trade?size_usd=${encodeURIComponent(sizeUsd)}`, { method: 'POST' });
+    const r = await fetch(API + runtimeScopedUrl(`/api/whales/${alertId}/trade`, { size_usd: sizeUsd }), { method: 'POST' });
     const data = await r.json();
     if (r.ok && data.ok) {
       toast(`Whale trade #${data.trade_id} opened`);
