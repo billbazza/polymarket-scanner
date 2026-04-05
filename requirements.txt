@@ -9,3 +9,4 @@ uvicorn
 anthropic
 openai
 xai_sdk
+web3
