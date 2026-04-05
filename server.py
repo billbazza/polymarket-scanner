@@ -226,10 +226,10 @@ def _daily_report_context() -> dict:
 
 
 def _render_daily_report_markdown(report_date: str, context: dict, report: dict) -> str:
-    working = "\n".join(f"- {item}" for item in report.get("working", []))
     def checkbox_list(items, checked=False):
         mark = "x" if checked else " "
         return "\n".join(f"- [{mark}] {item}" for item in items)
+    working = checkbox_list(report.get("working", []), checked=True)
     not_working = checkbox_list(report.get("not_working", []))
     improvements = checkbox_list(report.get("improvements", []))
     return f"""# Daily Report - {report_date}
@@ -242,13 +242,13 @@ Confidence: {report.get('confidence', 'unknown')}
 {report.get('summary', '')}
 
 ## Working
-{working or '- None recorded'}
+{working or '- [x] None recorded'}
 
 ## Not Working
-{not_working or '- None recorded'}
+{not_working or '- [ ] None recorded'}
 
 ## Top 5 Improvements
-{improvements or '1. None recorded'}
+{improvements or '- [ ] None promoted'}
 """
 
 
