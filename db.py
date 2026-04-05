@@ -1761,6 +1761,13 @@ def _runtime_scope_clause(runtime_scope: str | None, column: str = "runtime_scop
     return f" WHERE {column} = ?", [scope]
 
 
+def _should_skip_reporting_trade(trade) -> bool:
+    return (
+        (trade.get("status") or "").strip().lower() == "closed"
+        and (trade.get("notes") or "").strip() == "manual close - dedup cleanup"
+    )
+
+
 def get_strategy_performance(refresh_unrealized: bool = False, runtime_scope: str | None = None) -> dict:
     scope = normalize_runtime_scope(runtime_scope, default="")
     if refresh_unrealized:
@@ -1799,7 +1806,7 @@ def get_strategy_performance(refresh_unrealized: bool = False, runtime_scope: st
 
     for row in rows:
         trade = dict(row)
-        if trade.get("status") == "closed" and trade.get("notes") == "manual close - dedup cleanup":
+        if _should_skip_reporting_trade(trade):
             continue
         strategy = _trade_strategy_key(trade)
         bucket = buckets.setdefault(strategy, _empty_strategy_bucket(strategy))
@@ -1816,6 +1823,10 @@ def get_strategy_performance(refresh_unrealized: bool = False, runtime_scope: st
 
         if trade.get("status") == "open":
             bucket["open_trades"] += 1
+            if state["mode"] == TRADE_STATE_WALLET:
+                bucket["wallet_open_trades"] += 1
+            elif state["mode"] == TRADE_STATE_LIVE:
+                bucket["live_open_trades"] += 1
             if valuation["ok"]:
                 bucket["unrealized_pnl"] += float(valuation["pnl_usd"])
             else:
@@ -1830,10 +1841,6 @@ def get_strategy_performance(refresh_unrealized: bool = False, runtime_scope: st
                 bucket["external_open_trades"] += 1
                 bucket["external_capital"] += size_usd
                 total_external_open_trades += 1
-                if state["mode"] == TRADE_STATE_WALLET:
-                    bucket["wallet_open_trades"] += 1
-                elif state["mode"] == TRADE_STATE_LIVE:
-                    bucket["live_open_trades"] += 1
         elif trade.get("status") == "closed":
             bucket["closed_trades"] += 1
             bucket["realized_pnl"] += pnl
@@ -1922,7 +1929,7 @@ def get_paper_account_state(
         starting_bankroll = float(account["starting_bankroll"] or 0.0)
         where_clause, params = _runtime_scope_clause(runtime_scope)
         rows = conn.execute("""
-            SELECT id, trade_type, strategy_name, status, pnl, size_usd,
+            SELECT id, trade_type, strategy_name, status, pnl, size_usd, notes,
                    trade_state_mode, reconciliation_mode, runtime_scope,
                    external_order_id_a, external_order_id_b
             FROM trades
@@ -1946,6 +1953,8 @@ def get_paper_account_state(
 
     for row in rows:
         trade = dict(row)
+        if _should_skip_reporting_trade(trade):
+            continue
         state = _resolve_reporting_trade_state(trade)
         if state["inferred"]:
             inferred_trade_states += 1
@@ -2045,6 +2054,7 @@ def get_paper_account_overview(
 
     overview = dict(account)
     overview["strategy_breakdown"] = strategy_breakdown
+    overview["trade_reconciliation"] = get_runtime_scope_trade_reconciliation(runtime_scope=runtime_scope)
     return overview
 
 
@@ -2194,6 +2204,7 @@ def get_live_account_overview(
     total_equity = wallet_balance + open_position_value
     deployed_capital = float(scoped_account.get("committed_capital") or 0.0)
     wallet_exposure_pct = (open_position_value / total_equity * 100) if total_equity > 0 else 0.0
+    trade_reconciliation = get_runtime_scope_trade_reconciliation(runtime_scope=runtime_scope)
 
     return {
         "runtime_scope": runtime_scope,
@@ -2228,6 +2239,7 @@ def get_live_account_overview(
         "expected_chain_id": wallet_snapshot.get("expected_chain_id"),
         "chain_parity_ok": wallet_snapshot.get("chain_parity_ok"),
         "verified_at": wallet_snapshot.get("verified_at"),
+        "trade_reconciliation": trade_reconciliation,
         "runtime_scope_detail": (
             "Penny mode reports the verified Polygon wallet cash balance plus only penny-scoped open and closed trades."
         ),
@@ -4010,6 +4022,93 @@ def get_trade(trade_id):
     return dict(row) if row else None
 
 
+def get_runtime_scope_trade_reconciliation(runtime_scope: str | None = None) -> dict:
+    """Build an exact summary from the scoped trade set for acceptance checks."""
+    scope = normalize_runtime_scope(runtime_scope, default="")
+    conn = get_conn()
+    try:
+        where_clause, params = _runtime_scope_clause(scope)
+        rows = conn.execute(
+            """
+            SELECT id, status, pnl, size_usd, notes, trade_state_mode, reconciliation_mode, runtime_scope
+            FROM trades
+            """
+            + where_clause
+            + " ORDER BY opened_at ASC, id ASC",
+            params,
+        ).fetchall()
+        valuation_map = _open_trade_valuation_map_from_snapshots(conn)
+    finally:
+        conn.close()
+
+    open_trades = 0
+    closed_trades = 0
+    committed_capital = 0.0
+    realized_pnl = 0.0
+    unrealized_pnl = 0.0
+    wins = 0
+    losses = 0
+    missing_marks = 0
+    inferred_trade_states = 0
+    wallet_open_trades = 0
+    live_open_trades = 0
+    paper_open_trades = 0
+
+    for row in rows:
+        trade = dict(row)
+        if _should_skip_reporting_trade(trade):
+            continue
+        state = _resolve_reporting_trade_state(trade)
+        if state["inferred"]:
+            inferred_trade_states += 1
+        status = (trade.get("status") or "").strip().lower()
+        if status == "open":
+            open_trades += 1
+            committed_capital += float(trade.get("size_usd") or 0.0)
+            if state["mode"] == TRADE_STATE_PAPER:
+                paper_open_trades += 1
+            elif state["mode"] == TRADE_STATE_WALLET:
+                wallet_open_trades += 1
+            elif state["mode"] == TRADE_STATE_LIVE:
+                live_open_trades += 1
+            valuation = valuation_map.get(int(trade["id"]), {"ok": False, "pnl_usd": 0.0})
+            if valuation["ok"]:
+                unrealized_pnl += float(valuation["pnl_usd"])
+            else:
+                missing_marks += 1
+        elif status == "closed":
+            closed_trades += 1
+            pnl = float(trade.get("pnl") or 0.0)
+            realized_pnl += pnl
+            if pnl > 0:
+                wins += 1
+            else:
+                losses += 1
+
+    total_pnl = realized_pnl
+    open_position_value = committed_capital + unrealized_pnl
+    win_rate = (wins / closed_trades * 100) if closed_trades else 0.0
+    return {
+        "runtime_scope": scope or None,
+        "open_trades": open_trades,
+        "closed_trades": closed_trades,
+        "total_trades": open_trades + closed_trades,
+        "committed_capital": round(committed_capital, 2),
+        "open_position_value": round(open_position_value, 2),
+        "realized_pnl": round(realized_pnl, 2),
+        "unrealized_pnl": round(unrealized_pnl, 2),
+        "total_pnl": round(total_pnl, 2),
+        "wins": wins,
+        "losses": losses,
+        "win_rate": round(win_rate, 1),
+        "paper_open_trades": paper_open_trades,
+        "wallet_open_trades": wallet_open_trades,
+        "live_open_trades": live_open_trades,
+        "open_trades_missing_marks": missing_marks,
+        "trade_state_inferred_trades": inferred_trade_states,
+    }
+
+
 # --- Snapshots ---
 
 def save_snapshot(trade_id, price_a, price_b, spread, z_score):
@@ -4782,6 +4881,55 @@ def get_scan_runs(limit=20):
 
 # --- Stats ---
 
+def _build_runtime_scope_acceptance_checks(
+    runtime_scope: str,
+    stats_payload: dict,
+    runtime_account: dict,
+    trade_reconciliation: dict,
+) -> dict:
+    is_paper = runtime_scope == RUNTIME_SCOPE_PAPER
+    checks = []
+
+    def add_check(name: str, expected, actual):
+        checks.append(
+            {
+                "name": name,
+                "expected": expected,
+                "actual": actual,
+                "ok": expected == actual,
+            }
+        )
+
+    add_check("stats.open_trades", trade_reconciliation["open_trades"], int(stats_payload.get("open_trades") or 0))
+    add_check("stats.closed_trades", trade_reconciliation["closed_trades"], int(stats_payload.get("closed_trades") or 0))
+    add_check("stats.total_trades", trade_reconciliation["total_trades"], int(stats_payload.get("total_trades") or 0))
+    add_check("stats.total_pnl", trade_reconciliation["total_pnl"], round(float(stats_payload.get("total_pnl") or 0.0), 2))
+    add_check("stats.realized_pnl", trade_reconciliation["realized_pnl"], round(float(stats_payload.get("realized_pnl") or 0.0), 2))
+    add_check("stats.unrealized_pnl", trade_reconciliation["unrealized_pnl"], round(float(stats_payload.get("unrealized_pnl") or 0.0), 2))
+    add_check("stats.wins", trade_reconciliation["wins"], int(stats_payload.get("wins") or 0))
+    add_check("stats.losses", trade_reconciliation["losses"], int(stats_payload.get("losses") or 0))
+    add_check("stats.win_rate", trade_reconciliation["win_rate"], round(float(stats_payload.get("win_rate") or 0.0), 1))
+
+    if is_paper:
+        add_check("runtime_account.open_trades", trade_reconciliation["open_trades"], int(runtime_account.get("open_trades") or 0))
+        add_check("runtime_account.committed_capital", trade_reconciliation["committed_capital"], round(float(runtime_account.get("committed_capital") or 0.0), 2))
+        add_check("runtime_account.open_position_value", trade_reconciliation["open_position_value"], round(float(runtime_account.get("open_position_value") or 0.0), 2))
+        add_check("runtime_account.realized_pnl", trade_reconciliation["realized_pnl"], round(float(runtime_account.get("realized_pnl") or 0.0), 2))
+        add_check("runtime_account.unrealized_pnl", trade_reconciliation["unrealized_pnl"], round(float(runtime_account.get("unrealized_pnl") or 0.0), 2))
+    else:
+        add_check("runtime_account.open_positions", trade_reconciliation["open_trades"], int(runtime_account.get("open_positions") or 0))
+        add_check("runtime_account.deployed_capital_usd", trade_reconciliation["committed_capital"], round(float(runtime_account.get("deployed_capital_usd") or 0.0), 2))
+        add_check("runtime_account.open_position_value_usd", trade_reconciliation["open_position_value"], round(float(runtime_account.get("open_position_value_usd") or 0.0), 2))
+        add_check("runtime_account.realized_pnl_usd", trade_reconciliation["realized_pnl"], round(float(runtime_account.get("realized_pnl_usd") or 0.0), 2))
+        add_check("runtime_account.unrealized_pnl_usd", trade_reconciliation["unrealized_pnl"], round(float(runtime_account.get("unrealized_pnl_usd") or 0.0), 2))
+
+    return {
+        "runtime_scope": runtime_scope,
+        "all_passed": all(check["ok"] for check in checks),
+        "checks": checks,
+    }
+
+
 def get_stats(runtime_scope: str | None = None):
     """Dashboard summary stats."""
     conn = get_conn()
@@ -4828,6 +4976,7 @@ def get_stats(runtime_scope: str | None = None):
     runtime_scope_value = scope or RUNTIME_SCOPE_PAPER
     runtime_account = get_runtime_account_overview(refresh_unrealized=True, runtime_scope=runtime_scope_value)
     strategy_breakdown = runtime_account["strategy_breakdown"]
+    trade_reconciliation = get_runtime_scope_trade_reconciliation(runtime_scope=runtime_scope_value)
     paper_sizing = get_paper_sizing_summary(limit=200) if runtime_scope_value == RUNTIME_SCOPE_PAPER else None
 
     # Build cumulative series: each point is the running total after that trade closes
@@ -4837,7 +4986,7 @@ def get_stats(runtime_scope: str | None = None):
         cumulative += pnl
         pnl_series.append({"t": closed_at, "pnl": round(cumulative, 2)})
 
-    return {
+    stats_payload = {
         "runtime_scope": scope or RUNTIME_SCOPE_PAPER,
         "total_trades": total_trades,
         "open_trades": open_trades,
@@ -4855,7 +5004,15 @@ def get_stats(runtime_scope: str | None = None):
         "strategy_breakdown": strategy_breakdown,
         "paper_sizing": paper_sizing,
         "cointegration_trial": get_cointegration_trial_summary(),
+        "trade_reconciliation": trade_reconciliation,
     }
+    stats_payload["acceptance_checks"] = _build_runtime_scope_acceptance_checks(
+        runtime_scope=runtime_scope_value,
+        stats_payload=stats_payload,
+        runtime_account=runtime_account,
+        trade_reconciliation=trade_reconciliation,
+    )
+    return stats_payload
 
 
 def _latest_pairs_snapshot_rows(conn):

@@ -165,9 +165,18 @@ class RuntimeScopeSplitTests(unittest.TestCase):
         self.assertTrue(penny_stats["runtime_account"]["verified_live_ledger"])
         self.assertEqual(penny_stats["runtime_account"]["deployed_capital_usd"], 3.0)
         self.assertEqual(penny_stats["runtime_account"]["available_balance_usd"], 17.25)
+        self.assertTrue(penny_stats["acceptance_checks"]["all_passed"])
+        self.assertEqual(penny_stats["trade_reconciliation"]["runtime_scope"], "penny")
+        self.assertEqual(penny_stats["trade_reconciliation"]["total_trades"], 1)
+        self.assertEqual(penny_stats["trade_reconciliation"]["committed_capital"], 3.0)
+        self.assertEqual(
+            penny_stats["runtime_account"]["trade_reconciliation"]["committed_capital"],
+            3.0,
+        )
         self.assertEqual(penny_account["account_mode"], "live_wallet")
         self.assertTrue(penny_account["verified_live_ledger"])
         self.assertEqual(penny_account["available_balance_usd"], 17.25)
+        self.assertEqual(penny_account["trade_reconciliation"]["total_trades"], 1)
         self.assertNotIn("paper_account", penny_account)
 
     def test_penny_runtime_account_fails_closed_without_verified_live_wallet(self):
@@ -202,6 +211,48 @@ class RuntimeScopeSplitTests(unittest.TestCase):
         self.assertEqual(payload["verification_status"], "stale")
         self.assertIn("blocked", payload["message"].lower())
         self.assertIsNone(payload["available_balance_usd"])
+
+    def test_penny_closed_trade_stats_reconcile_only_to_penny_history(self):
+        signal_id = self.db.save_signal(_signal())
+        paper_trade_id = self.db.open_trade(
+            signal_id,
+            size_usd=25,
+            metadata={"runtime_scope": self.db.RUNTIME_SCOPE_PAPER},
+        )
+        penny_trade_id = self.db.open_trade(
+            signal_id,
+            size_usd=3,
+            metadata={
+                "runtime_scope": self.db.RUNTIME_SCOPE_PENNY,
+                "trade_state_mode": self.db.TRADE_STATE_LIVE,
+                "reconciliation_mode": self.db.RECONCILIATION_ORDERS,
+            },
+        )
+        self.db.close_trade(paper_trade_id, 0.55, 0.45, "paper close")
+        self.db.close_trade(penny_trade_id, 0.60, 0.40, "penny close")
+
+        with patch.object(self.db, "_get_live_wallet_snapshot", return_value={
+            "wallet_connected": True,
+            "wallet_address": "0x1234567890abcdef1234567890abcdef12345678",
+            "available_balance_usd": 12.0,
+            "balance_source": "polygon_wallet",
+            "wallet_error": None,
+        }):
+            penny_stats = self.client.get("/api/stats?runtime_scope=penny").json()
+            penny_account = self.client.get("/api/runtime/account?runtime_scope=penny").json()
+
+        self.assertEqual(penny_stats["closed_trades"], 1)
+        self.assertEqual(penny_stats["trade_reconciliation"]["closed_trades"], 1)
+        self.assertEqual(penny_stats["trade_reconciliation"]["total_trades"], 1)
+        self.assertEqual(
+            penny_stats["total_pnl"],
+            penny_stats["trade_reconciliation"]["total_pnl"],
+        )
+        self.assertEqual(
+            penny_account["realized_pnl_usd"],
+            penny_stats["trade_reconciliation"]["realized_pnl"],
+        )
+        self.assertTrue(penny_stats["acceptance_checks"]["all_passed"])
 
     def test_closed_trade_history_api_is_runtime_scoped(self):
         signal_id = self.db.save_signal(_signal())
@@ -292,6 +343,9 @@ class RuntimeScopeSplitTests(unittest.TestCase):
         self.assertEqual(penny_runtime["level_config"]["max_open"], 3)
         self.assertEqual(penny_runtime["max_open"], 3)
         self.assertEqual(penny_runtime["max_open_label"], "3")
+        self.assertEqual(penny_runtime["open_positions"], 0)
+        self.assertEqual(penny_runtime["max_open_usage"], "0/3")
+        self.assertEqual(penny_runtime["slots_remaining"], 3)
         self.assertTrue(penny_runtime["running"])
         self.assertTrue(penny_runtime["state_file"].endswith("autonomy_state.penny.json"))
 
@@ -305,6 +359,8 @@ class RuntimeScopeSplitTests(unittest.TestCase):
         self.assertIn("LIVE / POLYGON WALLET VERIFIED", html)
         self.assertIn("LIVE / POLYGON WALLET BLOCKED", html)
         self.assertIn("Penny mode fails closed", html)
+        self.assertIn("runtimeData?.max_open_usage || runtimeData?.max_open_label", html)
+        self.assertIn("acceptance && acceptance.all_passed === false", html)
 
 
 if __name__ == "__main__":

@@ -1603,6 +1603,8 @@ function renderRuntimeScopePanel(runtimeData, statsData, account) {
   const levelName = levelConfig?.name || String(state.level || 'unknown');
   const running = !!runtimeData?.running;
   const lastResult = runtimeData?.last_result || null;
+  const acceptance = statsData?.acceptance_checks || {};
+  const scopedOpenPositions = Number(runtimeData?.open_positions ?? (account?.open_positions ?? account?.open_trades ?? 0));
   const cycleSummary = running
     ? 'Running'
     : (lastResult?.ok === true
@@ -1611,19 +1613,23 @@ function renderRuntimeScopePanel(runtimeData, statsData, account) {
   const cycleMeta = running
     ? `A ${scope} autonomy cycle is currently running.`
     : lastResult?.ok === true
-      ? `Last ${scope} cycle: ${lastResult.trades_opened || 0} opened, ${lastResult.trades_closed || 0} closed in ${lastResult.duration_secs || 0}s.`
-      : lastResult?.error
-        ? `Last ${scope} cycle failed: ${lastResult.error}`
-        : `No ${scope} autonomy cycle result recorded in this server process yet.`;
+        ? `Last ${scope} cycle: ${lastResult.trades_opened || 0} opened, ${lastResult.trades_closed || 0} closed in ${lastResult.duration_secs || 0}s.`
+        : lastResult?.error
+          ? `Last ${scope} cycle failed: ${lastResult.error}`
+          : `No ${scope} autonomy cycle result recorded in this server process yet.`;
   const maxOpenMeta = isPaper
     ? 'Research mode stays cash-limited and intentionally has no hard max-open cap.'
-    : `${account?.open_positions || 0} open penny position${(account?.open_positions || 0) === 1 ? '' : 's'} currently count against this scoped limit.`;
+    : `${scopedOpenPositions} open penny position${scopedOpenPositions === 1 ? '' : 's'} currently count against this scoped limit.` +
+      (runtimeData?.max_open_usage ? ` Usage ${runtimeData.max_open_usage}.` : '');
   getEl('runtimeScopeMeta').textContent = isPaper
     ? 'Research and penny read different state files, trade totals, and autonomy lanes.'
     : 'Penny view is driven only by live wallet balances, penny-scoped trades, and open-position limits.';
+  if (acceptance && acceptance.all_passed === false) {
+    getEl('runtimeScopeMeta').textContent += ' Reconciliation warning: scoped dashboard totals do not match the scoped trade ledger.';
+  }
   getEl('runtimeLevelValue').textContent = levelName;
   getEl('runtimeLevelMeta').textContent = `Level key ${String(state.level || scope).toUpperCase()} · scope ${String(scope).toUpperCase()}`;
-  getEl('runtimeMaxOpenValue').textContent = runtimeData?.max_open_label || '—';
+  getEl('runtimeMaxOpenValue').textContent = runtimeData?.max_open_usage || runtimeData?.max_open_label || '—';
   getEl('runtimeMaxOpenMeta').textContent = maxOpenMeta;
   getEl('runtimeCycleValue').textContent = cycleSummary;
   getEl('runtimeCycleMeta').textContent = cycleMeta;
