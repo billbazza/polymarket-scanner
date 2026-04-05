@@ -419,6 +419,7 @@ def run_cycle(state):
         "runtime_label": runtime_tag,
         "level": level,
         "execution_mode": "synchronous",
+        "slot_usage": None,
         "weather_phase": {
             "status": "not_run",
             "strategy": "weather",
@@ -809,9 +810,20 @@ def run_cycle(state):
             save_state(state)
             return _finish_cycle()
 
-        open_trades = db.get_trades(status="open", limit=None, runtime_scope=runtime_scope)
-        open_count = len(open_trades)
         max_open = config["max_open"]
+        slot_usage = db.get_runtime_slot_usage(runtime_scope=runtime_scope, max_open=max_open)
+        cycle_summary["slot_usage"] = slot_usage
+        open_count = slot_usage["open_positions"]
+        open_trades = db.get_trades(status="open", limit=None, runtime_scope=runtime_scope)
+
+        if runtime_scope == RUNTIME_SCOPE_PENNY:
+            log.info(
+                "Step 4: Penny slot usage scope=%s usage=%s available=%s consumers=%s",
+                runtime_scope,
+                slot_usage.get("max_open_usage") or "uncapped",
+                slot_usage.get("slots_remaining"),
+                json.dumps(slot_usage.get("consuming_trade_ids") or []),
+            )
 
         if max_open is not None and open_count >= max_open:
             log.info("Step 4: At max positions (%d/%d), skipping new trades",
@@ -826,7 +838,11 @@ def run_cycle(state):
                 f"At max positions ({open_count}/{max_open}).",
                 event="Pairs autonomy preflight",
                 phase=current_stage,
-                details={"open_count": open_count, "max_open": max_open},
+                details={
+                    "open_count": open_count,
+                    "max_open": max_open,
+                    "slot_usage": slot_usage,
+                },
             )
             save_state(state)
             return _finish_cycle()
@@ -1087,9 +1103,9 @@ def run_cycle(state):
 
         # Step 4b: Open weather trades (if slots remain)
         current_stage = "step 4b open weather preflight"
-        open_trades = db.get_trades(status="open", limit=None, runtime_scope=runtime_scope)
-        open_count = len(open_trades)
-        slots_remaining = (max_open - open_count) if max_open is not None else None
+        weather_slot_usage = db.get_runtime_slot_usage(runtime_scope=runtime_scope, max_open=max_open)
+        open_count = weather_slot_usage["open_positions"]
+        slots_remaining = weather_slot_usage["slots_remaining"]
 
         weather_phase_started = time.time()
         weather_phase = {
@@ -1106,15 +1122,19 @@ def run_cycle(state):
                 "exact_temp_opportunities": 0,
             },
         }
+        weather_phase["slot_usage_at_start"] = weather_slot_usage
         cycle_summary["phases"].append(weather_phase)
         cycle_summary["weather_phase"] = weather_phase
         weather_policy = weather_phase_policy(runtime_scope, config.get("runtime_controls"))
         weather_phase["execution_mode"] = weather_policy["execution_mode"]
         weather_phase["auto_trade_enabled"] = bool(weather_policy["auto_trade_enabled"])
         log.info(
-            "Step 4b: Weather phase start scope=%s mode=%s",
+            "Step 4b: Weather phase start scope=%s mode=%s usage=%s available=%s consumers=%s",
             runtime_scope,
             weather_phase["execution_mode"],
+            weather_slot_usage.get("max_open_usage") or "uncapped",
+            slots_remaining,
+            json.dumps(weather_slot_usage.get("consuming_trade_ids") or []),
         )
         try:
             import weather_exact_temp_scanner
@@ -1158,9 +1178,15 @@ def run_cycle(state):
                     weather_phase["trade_execution_status"] = "slots_full"
                     weather_phase["reason_code"] = "max_open_reached_before_weather"
                     weather_phase["reason"] = f"No weather slots remain for scope={runtime_scope}."
+                    weather_phase["blocking_trades"] = weather_slot_usage.get("consuming_trades") or []
                 elif slots_remaining is not None:
                     candidates = executable_weather[:slots_remaining]
-                    weather_phase["trade_execution_status"] = "limited_by_slots"
+                    weather_phase["trade_execution_status"] = (
+                        "limited_by_slots"
+                        if len(executable_weather) > max(slots_remaining, 0)
+                        else "enabled"
+                    )
+                    weather_phase["blocking_trades"] = weather_slot_usage.get("consuming_trades") or []
                 else:
                     weather_phase["trade_execution_status"] = "enabled"
             else:
@@ -1318,6 +1344,10 @@ def run_cycle(state):
                     )
             weather_phase["status"] = "completed"
             weather_phase["duration_secs"] = round(time.time() - weather_phase_started, 1)
+            weather_phase["slot_usage_at_end"] = db.get_runtime_slot_usage(
+                runtime_scope=runtime_scope,
+                max_open=max_open,
+            )
             if weather_traded:
                 log.info("Step 4b: Opened %d weather trades", weather_traded)
             log.info(

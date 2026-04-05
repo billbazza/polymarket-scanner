@@ -1866,17 +1866,17 @@ async def autonomy_runtime(runtime_scope: str | None = None):
     level_key = str((state or {}).get("level") or "").strip().lower()
     level_config = autonomy.get_level_config(level_key, runtime_scope)
     max_open = level_config.get("max_open")
-    open_positions = db.count_open_trades(runtime_scope=runtime_scope)
-    slots_remaining = None if max_open is None else max(0, int(max_open) - int(open_positions))
+    slot_usage = db.get_runtime_slot_usage(runtime_scope=runtime_scope, max_open=max_open)
     return {
         "runtime_scope": runtime_scope,
         "state": state,
         "level_config": level_config,
         "max_open": max_open,
         "max_open_label": "No hard cap (cash-limited)" if max_open is None else str(max_open),
-        "open_positions": open_positions,
-        "max_open_usage": None if max_open is None else f"{open_positions}/{max_open}",
-        "slots_remaining": slots_remaining,
+        "open_positions": slot_usage["open_positions"],
+        "max_open_usage": slot_usage["max_open_usage"],
+        "slots_remaining": slot_usage["slots_remaining"],
+        "slot_usage": slot_usage,
         "state_file": str(autonomy.state_file_for_scope(runtime_scope)),
         "running": _autonomy_status[runtime_scope]["running"],
         "last_result": _autonomy_status[runtime_scope]["last_result"],

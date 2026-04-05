@@ -3759,6 +3759,61 @@ def count_open_trades(runtime_scope: str | None = None) -> int:
     )
 
 
+def get_runtime_slot_usage(
+    runtime_scope: str | None = None,
+    *,
+    max_open: int | None = None,
+) -> dict:
+    """Return the canonical scoped slot usage and the open trades consuming it."""
+    scope = normalize_runtime_scope(runtime_scope, default="")
+    open_trades = get_trades(status="open", limit=None, runtime_scope=scope)
+    open_trades = sorted(
+        open_trades,
+        key=lambda trade: (
+            float(trade.get("opened_at") or 0.0),
+            int(trade.get("id") or 0),
+        ),
+    )
+    consumers = []
+    for trade in open_trades:
+        consumers.append(
+            {
+                "trade_id": trade.get("id"),
+                "trade_type": trade.get("trade_type") or "pairs",
+                "strategy_name": trade.get("strategy_name") or "cointegration",
+                "event": trade.get("event"),
+                "market_a": trade.get("market_a"),
+                "signal_id": trade.get("signal_id"),
+                "weather_signal_id": trade.get("weather_signal_id"),
+                "size_usd": round(float(trade.get("size_usd") or 0.0), 2),
+                "status": trade.get("status"),
+                "opened_at": trade.get("opened_at"),
+                "runtime_scope": trade.get("runtime_scope"),
+                "trade_state_mode": trade.get("trade_state_mode"),
+                "reconciliation_mode": trade.get("reconciliation_mode"),
+            }
+        )
+    open_positions = len(consumers)
+    slots_remaining = None if max_open is None else max(0, int(max_open) - open_positions)
+    return {
+        "runtime_scope": scope or None,
+        "open_positions": open_positions,
+        "max_open": None if max_open is None else int(max_open),
+        "slots_remaining": slots_remaining,
+        "max_open_usage": None if max_open is None else f"{open_positions}/{int(max_open)}",
+        "consuming_trades": consumers,
+        "consuming_trade_ids": [item["trade_id"] for item in consumers if item.get("trade_id") is not None],
+        "strategies": sorted(
+            {item["strategy_name"] for item in consumers if item.get("strategy_name")}
+        ),
+        "slot_budget_scope": (
+            "shared_live_scope"
+            if scope == RUNTIME_SCOPE_PENNY
+            else "paper_scope"
+        ),
+    }
+
+
 def _fetch_weather_token_probation(conn, token_id, runtime_scope: str | None = None):
     if not token_id:
         return None

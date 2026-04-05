@@ -661,8 +661,60 @@ class RuntimeScopeSplitTests(unittest.TestCase):
         self.assertEqual(penny_runtime["open_positions"], 0)
         self.assertEqual(penny_runtime["max_open_usage"], "0/3")
         self.assertEqual(penny_runtime["slots_remaining"], 3)
+        self.assertEqual(penny_runtime["slot_usage"]["open_positions"], 0)
+        self.assertEqual(penny_runtime["slot_usage"]["consuming_trades"], [])
         self.assertTrue(penny_runtime["running"])
         self.assertTrue(penny_runtime["state_file"].endswith("autonomy_state.penny.json"))
+
+    def test_penny_runtime_slot_usage_excludes_non_live_rows_and_lists_consumers(self):
+        signal_id = self.db.save_signal(_signal())
+        stray_trade_id = self.db.open_trade(
+            signal_id,
+            size_usd=8,
+            metadata={"runtime_scope": self.db.RUNTIME_SCOPE_PENNY},
+        )
+        live_pairs_id = self.db.open_trade(
+            signal_id,
+            size_usd=3,
+            metadata={
+                "runtime_scope": self.db.RUNTIME_SCOPE_PENNY,
+                "trade_state_mode": self.db.TRADE_STATE_LIVE,
+                "reconciliation_mode": self.db.RECONCILIATION_ORDERS,
+                "strategy_name": "cointegration",
+            },
+        )
+        weather_signal_id = self.db.save_weather_signal(self._weather_signal("wx-yes", "wx-no", "Will NYC hit 80F?"))
+        live_weather_id = self.db.open_weather_trade(
+            weather_signal_id,
+            size_usd=4,
+            mode="live",
+            runtime_scope=self.db.RUNTIME_SCOPE_PENNY,
+            metadata={
+                "trade_state_mode": self.db.TRADE_STATE_LIVE,
+                "reconciliation_mode": self.db.RECONCILIATION_ORDERS,
+            },
+        )
+
+        self.assertIsNotNone(stray_trade_id)
+        self.assertIsNotNone(live_pairs_id)
+        self.assertIsNotNone(live_weather_id)
+
+        response = self.client.get("/api/autonomy/runtime?runtime_scope=penny")
+        payload = response.json()
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(payload["open_positions"], 2)
+        self.assertEqual(payload["max_open_usage"], "2/3")
+        self.assertEqual(payload["slots_remaining"], 1)
+        self.assertEqual(payload["slot_usage"]["consuming_trade_ids"], [live_pairs_id, live_weather_id])
+        self.assertEqual(
+            [row["trade_id"] for row in payload["slot_usage"]["consuming_trades"]],
+            [live_pairs_id, live_weather_id],
+        )
+        self.assertEqual(
+            {row["trade_type"] for row in payload["slot_usage"]["consuming_trades"]},
+            {"pairs", "weather"},
+        )
 
     def test_penny_runtime_settings_update_is_scoped_and_audit_logged(self):
         import autonomy
