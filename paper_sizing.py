@@ -14,7 +14,7 @@ DEFAULT_SETTINGS = {
     "enabled": True,
     "paper_only": True,
     "rollout_state": "shadow",
-    "active_policy": "fixed",
+    "active_policy": "adaptive_kelly",
     "review_note_path": DEFAULT_REVIEW_NOTE,
     "activation_requirements": {
         "require_review_note": True,
@@ -31,14 +31,35 @@ DEFAULT_SETTINGS = {
     "constraints": {
         "max_total_bankroll_utilization_pct": 35.0,
         "round_to_usd": 1.0,
+        "max_drawdown_pct": 15.0,
+        "max_drawdown_options_pct": [10, 15, 20, 25, 30, 35, 40, 45, 50],
+        "adaptive_trade_size_options_usd": [5, 10, 15, 20, 25, 30, 40, 50],
     },
+    "adaptive_tier_presets": {
+        "adaptive_4_6_8_10": {
+            "label": "4 / 6 / 8 / 10",
+            "tiers": [
+                {"min_edge_pct": 0.0, "kelly_cap_pct": 4.0, "label": "<18%"},
+                {"min_edge_pct": 18.0, "kelly_cap_pct": 6.0, "label": "18-24.99%"},
+                {"min_edge_pct": 25.0, "kelly_cap_pct": 8.0, "label": "25-34.99%"},
+                {"min_edge_pct": 35.0, "kelly_cap_pct": 10.0, "label": "35%+"},
+            ],
+        },
+    },
+    "selected_adaptive_tier_preset": "adaptive_4_6_8_10",
     "strategies": {
         "cointegration": {
             "fixed_size_usd": 20.0,
-            "min_size_usd": 10.0,
-            "max_size_usd": 30.0,
+            "min_size_usd": 5.0,
+            "max_size_usd": 10.0,
             "max_strategy_bankroll_utilization_pct": 20.0,
             "max_trade_bankroll_utilization_pct": 2.5,
+            "adaptive_kelly": {
+                "enabled": True,
+                "edge_metric": "ev_pct",
+                "min_size_usd": 5.0,
+                "max_size_usd": 10.0,
+            },
             "score_weights": {
                 "ev_pct": 0.35,
                 "kelly_fraction": 0.25,
@@ -53,10 +74,16 @@ DEFAULT_SETTINGS = {
         },
         "weather": {
             "fixed_size_usd": 20.0,
-            "min_size_usd": 10.0,
-            "max_size_usd": 35.0,
+            "min_size_usd": 5.0,
+            "max_size_usd": 10.0,
             "max_strategy_bankroll_utilization_pct": 15.0,
             "max_trade_bankroll_utilization_pct": 2.5,
+            "adaptive_kelly": {
+                "enabled": True,
+                "edge_metric": "combined_edge_pct",
+                "min_size_usd": 5.0,
+                "max_size_usd": 10.0,
+            },
             "score_weights": {
                 "combined_edge_pct": 0.45,
                 "kelly_fraction": 0.20,
@@ -105,7 +132,95 @@ def _normalize_strategy_settings(name: str, settings: dict) -> dict:
         0.1,
         float(strategy.get("max_trade_bankroll_utilization_pct", 2.0) or 2.0),
     )
+    adaptive = strategy.get("adaptive_kelly") or {}
+    adaptive["enabled"] = bool(adaptive.get("enabled", True))
+    adaptive["edge_metric"] = str(adaptive.get("edge_metric", "ev_pct") or "ev_pct")
+    adaptive["min_size_usd"] = max(
+        1.0,
+        float(adaptive.get("min_size_usd", strategy["min_size_usd"]) or strategy["min_size_usd"]),
+    )
+    adaptive["max_size_usd"] = max(
+        adaptive["min_size_usd"],
+        float(adaptive.get("max_size_usd", strategy["max_size_usd"]) or strategy["max_size_usd"]),
+    )
+    strategy["adaptive_kelly"] = adaptive
     return strategy
+
+
+def _normalize_adaptive_presets(settings: dict) -> None:
+    presets = settings.get("adaptive_tier_presets") or {}
+    normalized = {}
+    for preset_name, preset in presets.items():
+        tiers = []
+        for tier in (preset.get("tiers") or []):
+            tiers.append({
+                "min_edge_pct": round(max(0.0, float(tier.get("min_edge_pct", 0.0) or 0.0)), 4),
+                "kelly_cap_pct": round(min(25.0, max(0.0, float(tier.get("kelly_cap_pct", 0.0) or 0.0))), 4),
+                "label": str(tier.get("label") or ""),
+            })
+        tiers.sort(key=lambda item: item["min_edge_pct"])
+        if tiers:
+            normalized[preset_name] = {
+                "label": str(preset.get("label") or preset_name),
+                "tiers": tiers,
+            }
+    if not normalized:
+        normalized = copy.deepcopy(DEFAULT_SETTINGS["adaptive_tier_presets"])
+    settings["adaptive_tier_presets"] = normalized
+    selected = str(settings.get("selected_adaptive_tier_preset") or "")
+    if selected not in normalized:
+        selected = next(iter(normalized))
+    settings["selected_adaptive_tier_preset"] = selected
+
+
+def _drawdown_snapshot(account_overview: dict) -> dict:
+    starting_bankroll = float(account_overview.get("starting_bankroll") or 0.0)
+    total_equity = float(account_overview.get("total_equity") or 0.0)
+    if starting_bankroll <= 0:
+        return {
+            "starting_bankroll": round(starting_bankroll, 2),
+            "total_equity": round(total_equity, 2),
+            "drawdown_usd": 0.0,
+            "drawdown_pct": 0.0,
+        }
+    drawdown_usd = max(0.0, starting_bankroll - total_equity)
+    return {
+        "starting_bankroll": round(starting_bankroll, 2),
+        "total_equity": round(total_equity, 2),
+        "drawdown_usd": round(drawdown_usd, 2),
+        "drawdown_pct": round(drawdown_usd / starting_bankroll * 100.0, 2),
+    }
+
+
+def _strategy_edge_value(strategy: str, opportunity: dict, edge_metric: str) -> float:
+    if strategy == "cointegration" and edge_metric == "ev_pct":
+        return float((opportunity.get("ev") or {}).get("ev_pct") or 0.0)
+    return float(opportunity.get(edge_metric) or 0.0)
+
+
+def _select_adaptive_tier(settings: dict, strategy_settings: dict, opportunity: dict, strategy: str) -> dict:
+    preset_name = settings["selected_adaptive_tier_preset"]
+    preset = settings["adaptive_tier_presets"][preset_name]
+    adaptive = strategy_settings.get("adaptive_kelly") or {}
+    edge_metric = adaptive.get("edge_metric", "ev_pct")
+    edge_value = _strategy_edge_value(strategy, opportunity, edge_metric)
+    active_tier = preset["tiers"][0]
+    for tier in preset["tiers"]:
+        if edge_value >= float(tier["min_edge_pct"]):
+            active_tier = tier
+        else:
+            break
+    return {
+        "preset_name": preset_name,
+        "preset_label": preset.get("label") or preset_name,
+        "edge_metric": edge_metric,
+        "edge_value": round(edge_value, 4),
+        "tier_label": active_tier.get("label") or "",
+        "tier_min_edge_pct": round(float(active_tier["min_edge_pct"]), 4),
+        "tier_kelly_cap_pct": round(float(active_tier["kelly_cap_pct"]), 4),
+        "tier_kelly_cap_fraction": round(float(active_tier["kelly_cap_pct"]) / 100.0, 4),
+        "tiers": preset["tiers"],
+    }
 
 
 def get_sizing_settings(*, include_gate_status: bool = True) -> dict:
@@ -114,7 +229,7 @@ def get_sizing_settings(*, include_gate_status: bool = True) -> dict:
     settings["enabled"] = bool(settings.get("enabled", True))
     settings["paper_only"] = bool(settings.get("paper_only", True))
     settings["rollout_state"] = str(settings.get("rollout_state", "shadow") or "shadow")
-    settings["active_policy"] = str(settings.get("active_policy", "fixed") or "fixed")
+    settings["active_policy"] = str(settings.get("active_policy", "adaptive_kelly") or "adaptive_kelly")
     settings["review_note_path"] = str(settings.get("review_note_path", DEFAULT_REVIEW_NOTE) or DEFAULT_REVIEW_NOTE)
     activation = settings["activation_requirements"]
     activation["require_review_note"] = bool(activation.get("require_review_note", True))
@@ -132,6 +247,19 @@ def get_sizing_settings(*, include_gate_status: bool = True) -> dict:
         0.01,
         float(settings["constraints"].get("round_to_usd", 1.0) or 1.0),
     )
+    settings["constraints"]["max_drawdown_pct"] = max(
+        0.0,
+        float(settings["constraints"].get("max_drawdown_pct", 15.0) or 15.0),
+    )
+    options = settings["constraints"].get("max_drawdown_options_pct") or DEFAULT_SETTINGS["constraints"]["max_drawdown_options_pct"]
+    settings["constraints"]["max_drawdown_options_pct"] = sorted({
+        int(min(50, max(10, float(item)))) for item in options
+    })
+    size_options = settings["constraints"].get("adaptive_trade_size_options_usd") or DEFAULT_SETTINGS["constraints"]["adaptive_trade_size_options_usd"]
+    settings["constraints"]["adaptive_trade_size_options_usd"] = sorted({
+        int(min(500, max(1, float(item)))) for item in size_options
+    })
+    _normalize_adaptive_presets(settings)
     for name in list(settings.get("strategies", {})):
         _normalize_strategy_settings(name, settings)
     settings["review_note_exists"] = Path(settings["review_note_path"]).exists()
@@ -265,8 +393,8 @@ def get_activation_status(*, settings: dict | None = None, mode: str = "paper") 
             "reason": "Trade-state/accounting stability has not been explicitly acknowledged.",
         })
 
-    confidence_requested = requested_policy == "confidence_aware"
-    can_apply_confidence = confidence_requested and not blockers
+    adaptive_requested = requested_policy == "adaptive_kelly"
+    can_apply_confidence = adaptive_requested and not blockers
     selected_policy = requested_policy if can_apply_confidence else default_policy
     return {
         "mode": mode,
@@ -320,6 +448,7 @@ def build_paper_sizing_decision(
     current_total_util = float(account_overview.get("bankroll_used_pct") or 0.0)
     strategy_bucket = _extract_strategy_bucket(account_overview, strategy)
     current_strategy_util = float(strategy_bucket.get("bankroll_utilization_pct") or 0.0)
+    drawdown = _drawdown_snapshot(account_overview)
 
     max_trade_size = starting_bankroll * (strategy_settings["max_trade_bankroll_utilization_pct"] / 100.0) if starting_bankroll > 0 else confidence_size
     max_total_room = max(
@@ -339,6 +468,8 @@ def build_paper_sizing_decision(
         "max_total_room_usd": round(max_total_room, 2),
         "max_strategy_room_usd": round(max_strategy_room, 2),
         "available_cash_usd": round(available_cash, 2),
+        "drawdown_pct": drawdown["drawdown_pct"],
+        "drawdown_limit_pct": round(float(settings["constraints"]["max_drawdown_pct"]), 2),
         "binding_caps": [
             name for name, value in (
                 ("trade_cap", max_trade_size),
@@ -353,6 +484,42 @@ def build_paper_sizing_decision(
 
     activation_status = get_activation_status(settings=settings, mode=mode)
     selected_policy = activation_status["selected_policy"]
+    adaptive_meta = None
+    if strategy_settings.get("adaptive_kelly", {}).get("enabled"):
+        adaptive_meta = _select_adaptive_tier(settings, strategy_settings, opportunity, strategy)
+        if strategy == "cointegration":
+            raw_kelly_fraction = float((opportunity.get("sizing") or {}).get("kelly_fraction") or 0.0)
+        else:
+            raw_kelly_fraction = float(opportunity.get("kelly_fraction") or 0.0)
+        adaptive_cap_fraction = float(adaptive_meta["tier_kelly_cap_fraction"])
+        effective_kelly_fraction = min(0.25, max(0.0, raw_kelly_fraction), adaptive_cap_fraction)
+        adaptive_min = float(strategy_settings["adaptive_kelly"]["min_size_usd"])
+        adaptive_max = float(strategy_settings["adaptive_kelly"]["max_size_usd"])
+        adaptive_size = total_equity * effective_kelly_fraction if total_equity > 0 else 0.0
+        adaptive_size = _round_size(
+            max(adaptive_min, min(adaptive_size, adaptive_max)),
+            settings["constraints"]["round_to_usd"],
+        )
+        drawdown_limit_pct = float(settings["constraints"]["max_drawdown_pct"])
+        drawdown_blocked = drawdown["drawdown_pct"] >= drawdown_limit_pct > 0
+        if drawdown_blocked:
+            capped_confidence_size = _round_size(adaptive_min, settings["constraints"]["round_to_usd"])
+            constraints["binding_caps"].append("max_drawdown")
+        else:
+            capped_confidence_size = _round_size(
+                min(adaptive_size, max_trade_size, max_total_room, max_strategy_room, available_cash),
+                settings["constraints"]["round_to_usd"],
+            )
+        adaptive_meta.update({
+            "raw_kelly_fraction": round(raw_kelly_fraction, 4),
+            "effective_kelly_fraction": round(effective_kelly_fraction, 4),
+            "drawdown_limit_pct": round(drawdown_limit_pct, 2),
+            "drawdown_blocked": drawdown_blocked,
+            "min_size_usd": round(adaptive_min, 2),
+            "max_size_usd": round(adaptive_max, 2),
+            "pre_constraint_size_usd": round(adaptive_size, 2),
+            "selected_size_usd": round(capped_confidence_size, 2),
+        })
 
     selected_size = baseline_size if selected_policy == "fixed" else capped_confidence_size
     projected_total_util = (
@@ -373,7 +540,7 @@ def build_paper_sizing_decision(
         "rollout_state": settings["rollout_state"],
         "active_policy": settings["active_policy"],
         "selected_policy": selected_policy,
-        "applied": bool(selected_policy == "confidence_aware" and mode == "paper"),
+        "applied": bool(selected_policy == "adaptive_kelly" and mode == "paper"),
         "signal_id": signal_id,
         "weather_signal_id": weather_signal_id,
         "event": opportunity.get("event") or opportunity.get("market"),
@@ -383,11 +550,14 @@ def build_paper_sizing_decision(
         "confidence_score": round(score_value, 4),
         "confidence_inputs": score["inputs"],
         "confidence_components": score["normalized"],
+        "adaptive_sizing": adaptive_meta,
         "account_snapshot": {
             "starting_bankroll": round(starting_bankroll, 2),
             "available_cash": round(available_cash, 2),
             "committed_capital": round(committed_capital, 2),
             "total_equity": round(total_equity, 2),
+            "drawdown_pct": drawdown["drawdown_pct"],
+            "drawdown_usd": drawdown["drawdown_usd"],
         },
         "utilization": {
             "current_total_pct": round(current_total_util, 2),
@@ -435,6 +605,7 @@ def record_sizing_decision(decision: dict) -> int:
             details={
                 "confidence_inputs": decision.get("confidence_inputs"),
                 "confidence_components": decision.get("confidence_components"),
+                "adaptive_sizing": decision.get("adaptive_sizing"),
                 "review_note_path": decision.get("review_note_path"),
                 "compare_only": decision.get("compare_only"),
                 "rollback_policy": decision.get("rollback_policy"),

@@ -50,6 +50,20 @@ def _weather_signal():
     }
 
 
+def _cointegration_signal_with(ev_pct: float, kelly_fraction: float):
+    signal = _cointegration_signal()
+    signal["ev"] = {"ev_pct": ev_pct}
+    signal["sizing"] = {"recommended_size": 26.0, "kelly_fraction": kelly_fraction}
+    return signal
+
+
+def _weather_signal_with(edge_pct: float, kelly_fraction: float):
+    signal = _weather_signal()
+    signal["combined_edge_pct"] = edge_pct
+    signal["kelly_fraction"] = kelly_fraction
+    return signal
+
+
 class PaperSizingTests(unittest.TestCase):
     def setUp(self):
         self.tmpdir = tempfile.TemporaryDirectory()
@@ -102,7 +116,7 @@ class PaperSizingTests(unittest.TestCase):
         self.assertTrue(decision["compare_only"])
         self.assertEqual(decision["selected_policy"], "fixed")
         self.assertEqual(decision["selected_size_usd"], 20.0)
-        self.assertGreater(decision["confidence_size_usd"], 20.0)
+        self.assertEqual(decision["confidence_size_usd"], 10.0)
         self.assertEqual(decision["review_note_path"], "reviews/2026-04-02-paper-sizing-rollout-review.md")
         self.assertIn("shadow_rollout", decision["activation_status"]["blocker_codes"])
         self.assertIn("signal_admission_not_acknowledged", decision["activation_status"]["blocker_codes"])
@@ -122,7 +136,7 @@ class PaperSizingTests(unittest.TestCase):
         self.db.set_paper_starting_bankroll(500)
         self.paper_sizing.set_sizing_settings({
             "rollout_state": "active",
-            "active_policy": "confidence_aware",
+            "active_policy": "adaptive_kelly",
         })
 
         live_decision = self.paper_sizing.build_paper_sizing_decision(
@@ -166,7 +180,7 @@ class PaperSizingTests(unittest.TestCase):
             source="autonomy",
             weather_signal_id=21,
         )
-        self.assertEqual(paper_decision["selected_policy"], "confidence_aware")
+        self.assertEqual(paper_decision["selected_policy"], "adaptive_kelly")
         self.assertTrue(paper_decision["applied"])
         self.paper_sizing.record_sizing_decision(paper_decision)
 
@@ -174,7 +188,7 @@ class PaperSizingTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         body = response.json()
 
-        self.assertEqual(body["settings"]["active_policy"], "confidence_aware")
+        self.assertEqual(body["settings"]["active_policy"], "adaptive_kelly")
         self.assertTrue(body["settings"]["paper_gate"]["can_apply_confidence"])
         self.assertEqual(body["summary"]["recent_count"], 1)
         self.assertEqual(body["summary"]["applied_decisions"], 1)
@@ -184,7 +198,7 @@ class PaperSizingTests(unittest.TestCase):
         self.db.set_paper_starting_bankroll(1000)
         self.paper_sizing.set_sizing_settings({
             "rollout_state": "active",
-            "active_policy": "confidence_aware",
+            "active_policy": "adaptive_kelly",
             "review_note_path": "reviews/does-not-exist.md",
             "activation_requirements": {
                 "readiness": {
@@ -206,6 +220,140 @@ class PaperSizingTests(unittest.TestCase):
         self.assertEqual(decision["selected_policy"], "fixed")
         self.assertFalse(decision["applied"])
         self.assertIn("review_note_missing", decision["activation_status"]["blocker_codes"])
+
+    def test_active_policy_uses_adaptive_tier_and_cost_guardrails_for_cointegration(self):
+        self.db.set_paper_starting_bankroll(500)
+        self.paper_sizing.set_sizing_settings({
+            "rollout_state": "active",
+            "active_policy": "adaptive_kelly",
+            "activation_requirements": {
+                "readiness": {
+                    "signal_admission_stable": True,
+                    "trade_state_accounting_stable": True,
+                },
+            },
+        })
+
+        low = self.paper_sizing.build_paper_sizing_decision(
+            "cointegration",
+            _cointegration_signal_with(ev_pct=12.0, kelly_fraction=0.20),
+            baseline_size_usd=20,
+            mode="paper",
+            source="autonomy",
+            signal_id=11,
+        )
+        self.assertEqual(low["selected_policy"], "adaptive_kelly")
+        self.assertTrue(low["applied"])
+        self.assertEqual(low["adaptive_sizing"]["tier_kelly_cap_pct"], 4.0)
+        self.assertEqual(low["selected_size_usd"], 10.0)
+
+        high = self.paper_sizing.build_paper_sizing_decision(
+            "cointegration",
+            _cointegration_signal_with(ev_pct=36.0, kelly_fraction=0.20),
+            baseline_size_usd=20,
+            mode="paper",
+            source="autonomy",
+            signal_id=12,
+        )
+        self.assertEqual(high["adaptive_sizing"]["tier_kelly_cap_pct"], 10.0)
+        self.assertEqual(high["selected_size_usd"], 10.0)
+
+    def test_active_policy_uses_adaptive_tier_and_floor_for_weather(self):
+        self.db.set_paper_starting_bankroll(500)
+        self.paper_sizing.set_sizing_settings({
+            "rollout_state": "active",
+            "active_policy": "adaptive_kelly",
+            "activation_requirements": {
+                "readiness": {
+                    "signal_admission_stable": True,
+                    "trade_state_accounting_stable": True,
+                },
+            },
+        })
+
+        decision = self.paper_sizing.build_paper_sizing_decision(
+            "weather",
+            _weather_signal_with(edge_pct=27.0, kelly_fraction=0.01),
+            baseline_size_usd=20,
+            mode="paper",
+            source="autonomy",
+            weather_signal_id=21,
+        )
+        self.assertEqual(decision["selected_policy"], "adaptive_kelly")
+        self.assertEqual(decision["adaptive_sizing"]["tier_kelly_cap_pct"], 8.0)
+        self.assertEqual(decision["selected_size_usd"], 5.0)
+
+    def test_drawdown_gate_forces_floor_size_and_api_exposes_controls(self):
+        self.db.set_paper_starting_bankroll(500)
+        conn = self.db.get_conn()
+        try:
+            conn.execute(
+                """
+                INSERT INTO trades (trade_type, opened_at, side_a, side_b,
+                    entry_price_a, entry_price_b, size_usd, status, event, market_a, pnl)
+                VALUES ('weather', ?, 'BUY_YES', '', 0.50, 0, 10, 'closed', 'Loss 1', 'Loss 1', -50)
+                """,
+                (1.0,),
+            )
+            conn.execute(
+                """
+                INSERT INTO trades (trade_type, opened_at, side_a, side_b,
+                    entry_price_a, entry_price_b, size_usd, status, event, market_a, pnl)
+                VALUES ('weather', ?, 'BUY_YES', '', 0.50, 0, 10, 'closed', 'Loss 2', 'Loss 2', -50)
+                """,
+                (2.0,),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        self.paper_sizing.set_sizing_settings({
+            "rollout_state": "active",
+            "active_policy": "adaptive_kelly",
+            "constraints": {"max_drawdown_pct": 15},
+            "activation_requirements": {
+                "readiness": {
+                    "signal_admission_stable": True,
+                    "trade_state_accounting_stable": True,
+                },
+            },
+        })
+
+        decision = self.paper_sizing.build_paper_sizing_decision(
+            "weather",
+            _weather_signal_with(edge_pct=40.0, kelly_fraction=0.20),
+            baseline_size_usd=20,
+            mode="paper",
+            source="autonomy",
+            weather_signal_id=21,
+        )
+        self.assertTrue(decision["adaptive_sizing"]["drawdown_blocked"])
+        self.assertIn("max_drawdown", decision["constraints"]["binding_caps"])
+        self.assertEqual(decision["selected_size_usd"], 5.0)
+
+        response = self.client.post(
+            "/api/paper-sizing/settings?max_drawdown_pct=20&selected_adaptive_tier_preset=adaptive_4_6_8_10",
+            headers={"X-API-Key": "test-admin-key"},
+        )
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertTrue(body["ok"])
+        self.assertEqual(body["settings"]["constraints"]["max_drawdown_pct"], 20)
+        self.assertIn(50, body["settings"]["constraints"]["max_drawdown_options_pct"])
+        self.assertIn(40, body["settings"]["constraints"]["adaptive_trade_size_options_usd"])
+
+    def test_api_can_raise_adaptive_trade_size_range_on_the_fly(self):
+        response = self.client.post(
+            "/api/paper-sizing/settings?adaptive_min_size_usd=10&adaptive_max_size_usd=30",
+            headers={"X-API-Key": "test-admin-key"},
+        )
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertTrue(body["ok"])
+        strategies = body["settings"]["strategies"]
+        self.assertEqual(strategies["cointegration"]["adaptive_kelly"]["min_size_usd"], 10)
+        self.assertEqual(strategies["cointegration"]["adaptive_kelly"]["max_size_usd"], 30)
+        self.assertEqual(strategies["weather"]["adaptive_kelly"]["min_size_usd"], 10)
+        self.assertEqual(strategies["weather"]["adaptive_kelly"]["max_size_usd"], 30)
 
 
 if __name__ == "__main__":

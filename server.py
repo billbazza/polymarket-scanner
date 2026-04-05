@@ -69,6 +69,7 @@ async def authorize_mutating_routes(request: Request, call_next):
     if (
         path.startswith("/api/trades")
         or path.startswith("/api/weather/")
+        or path == "/api/paper-sizing/settings"
         or path == "/api/copy/mirror"
         or path == "/api/copy/settings"
         or path == "/api/copy/watch"
@@ -572,6 +573,59 @@ async def paper_sizing(limit: int = 50):
         "decisions": db.get_paper_sizing_decisions(limit=limit),
         "summary": db.get_paper_sizing_summary(limit=max(limit, 200)),
     }
+
+
+@app.post("/api/paper-sizing/settings")
+async def update_paper_sizing_settings(
+    max_drawdown_pct: float | None = None,
+    selected_adaptive_tier_preset: str | None = None,
+    adaptive_min_size_usd: float | None = None,
+    adaptive_max_size_usd: float | None = None,
+):
+    import paper_sizing as paper_sizing_module
+
+    current = paper_sizing_module.get_sizing_settings(include_gate_status=False)
+    options = set((current.get("constraints") or {}).get("max_drawdown_options_pct") or [])
+    size_options = set((current.get("constraints") or {}).get("adaptive_trade_size_options_usd") or [])
+    updates = {}
+    if max_drawdown_pct is not None:
+        normalized_drawdown = int(round(float(max_drawdown_pct)))
+        if normalized_drawdown not in options:
+            raise HTTPException(400, f"max_drawdown_pct must be one of {sorted(options)}")
+        updates.setdefault("constraints", {})["max_drawdown_pct"] = normalized_drawdown
+    if selected_adaptive_tier_preset is not None:
+        preset_name = str(selected_adaptive_tier_preset)
+        if preset_name not in (current.get("adaptive_tier_presets") or {}):
+            raise HTTPException(400, "Unknown adaptive tier preset")
+        updates["selected_adaptive_tier_preset"] = preset_name
+    if adaptive_min_size_usd is not None or adaptive_max_size_usd is not None:
+        normalized_min = int(round(float(
+            adaptive_min_size_usd
+            if adaptive_min_size_usd is not None
+            else (((current.get("strategies") or {}).get("cointegration") or {}).get("adaptive_kelly") or {}).get("min_size_usd", 5)
+        )))
+        normalized_max = int(round(float(
+            adaptive_max_size_usd
+            if adaptive_max_size_usd is not None
+            else (((current.get("strategies") or {}).get("cointegration") or {}).get("adaptive_kelly") or {}).get("max_size_usd", 10)
+        )))
+        if normalized_min not in size_options or normalized_max not in size_options:
+            raise HTTPException(400, f"adaptive sizes must be chosen from {sorted(size_options)}")
+        if normalized_max < normalized_min:
+            raise HTTPException(400, "adaptive_max_size_usd must be >= adaptive_min_size_usd")
+        updates.setdefault("strategies", {})
+        for strategy_name in ("cointegration", "weather"):
+            updates["strategies"].setdefault(strategy_name, {})
+            updates["strategies"][strategy_name]["min_size_usd"] = normalized_min
+            updates["strategies"][strategy_name]["max_size_usd"] = normalized_max
+            updates["strategies"][strategy_name]["adaptive_kelly"] = {
+                "min_size_usd": normalized_min,
+                "max_size_usd": normalized_max,
+            }
+    if not updates:
+        return {"ok": True, "settings": paper_sizing_module.get_sizing_settings()}
+    settings = paper_sizing_module.set_sizing_settings(updates)
+    return {"ok": True, "settings": settings}
 
 
 @app.get("/api/paper-trade-attempts")

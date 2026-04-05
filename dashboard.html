@@ -424,6 +424,24 @@
         <div class="label">Available Cash</div>
         <div class="value" id="statAvailableCash">$0.00</div>
         <div class="meta" id="statCashMeta">Ready for new paper trades.</div>
+        <div style="display:grid;grid-template-columns:1fr;gap:8px;margin-top:10px">
+          <label style="display:grid;gap:4px">
+            <span style="font-size:11px;color:var(--text2)">Adaptive Min Size</span>
+            <select id="paperAdaptiveMinSizeSelect" onchange="savePaperSizingSettings()" style="background:var(--panel);color:var(--text);border:1px solid var(--border);border-radius:8px;padding:8px"></select>
+          </label>
+          <label style="display:grid;gap:4px">
+            <span style="font-size:11px;color:var(--text2)">Adaptive Max Size</span>
+            <select id="paperAdaptiveMaxSizeSelect" onchange="savePaperSizingSettings()" style="background:var(--panel);color:var(--text);border:1px solid var(--border);border-radius:8px;padding:8px"></select>
+          </label>
+          <label style="display:grid;gap:4px">
+            <span style="font-size:11px;color:var(--text2)">MAX_DRAWDOWN</span>
+            <select id="paperMaxDrawdownSelect" onchange="savePaperSizingSettings()" style="background:var(--panel);color:var(--text);border:1px solid var(--border);border-radius:8px;padding:8px"></select>
+          </label>
+          <label style="display:grid;gap:4px">
+            <span style="font-size:11px;color:var(--text2)">Adaptive Tier Preset</span>
+            <select id="paperTierPresetSelect" onchange="savePaperSizingSettings()" style="background:var(--panel);color:var(--text);border:1px solid var(--border);border-radius:8px;padding:8px"></select>
+          </label>
+        </div>
       </div>
       <div class="account-card accent-commit">
         <div class="label">Committed Capital</div>
@@ -943,8 +961,12 @@ function switchTab(name) {
 
 async function loadStats() {
   try {
-    const r = await fetch(API + '/api/stats');
-    const s = await r.json();
+    const [statsR, sizingR] = await Promise.all([
+      fetch(API + '/api/stats'),
+      fetch(API + '/api/paper-sizing?limit=20'),
+    ]);
+    const s = await statsR.json();
+    const sizingData = await sizingR.json();
     const account = s.paper_account || {};
     const strategyBreakdown = (s.strategy_breakdown || account.strategy_breakdown || {});
     const setSignedValue = (id, value) => {
@@ -957,7 +979,11 @@ async function loadStats() {
     document.getElementById('statEquity').textContent = fmtUsd(account.total_equity);
     document.getElementById('statStartingBankroll').textContent = `Starting bankroll ${fmtUsd(account.starting_bankroll)}`;
     document.getElementById('statAvailableCash').textContent = fmtUsd(account.available_cash);
-    document.getElementById('statCashMeta').textContent = `${fmtUsd(account.available_cash)} free to deploy now. Paper entries are cash-limited, not count-capped.`;
+    const drawdownPct = account.starting_bankroll > 0
+      ? Math.max(0, ((account.starting_bankroll - account.total_equity) / account.starting_bankroll) * 100)
+      : 0;
+    const maxDrawdownPct = sizingData?.settings?.constraints?.max_drawdown_pct ?? 15;
+    document.getElementById('statCashMeta').textContent = `${fmtUsd(account.available_cash)} free to deploy now. Drawdown ${drawdownPct.toFixed(1)}% / cap ${Number(maxDrawdownPct).toFixed(0)}%.`;
     document.getElementById('statCommitted').textContent = fmtUsd(account.committed_capital);
     document.getElementById('statCommittedMeta').textContent = `${fmtUsd(account.committed_capital)} tied up across ${account.open_trades || 0} open trade${(account.open_trades || 0) === 1 ? '' : 's'}.`;
     setSignedValue('statRealized', account.realized_pnl || 0);
@@ -981,6 +1007,7 @@ async function loadStats() {
       ((account.excluded_open_trades || 0)
         ? `Wallet-attached/live trades are tracked separately and do not consume this paper bankroll view.`
         : '');
+    renderPaperSizingControls(sizingData?.settings || {});
 
     document.getElementById('statWinRate').textContent = s.win_rate + '%';
     document.getElementById('statOpen').textContent = s.open_trades;
@@ -1026,6 +1053,66 @@ async function loadStats() {
 
     drawPnlChart(s.pnl_series);
   } catch(e) {}
+}
+
+function renderPaperSizingControls(settings) {
+  const minSizeSelect = getEl('paperAdaptiveMinSizeSelect');
+  const maxSizeSelect = getEl('paperAdaptiveMaxSizeSelect');
+  const drawdownSelect = getEl('paperMaxDrawdownSelect');
+  const presetSelect = getEl('paperTierPresetSelect');
+  if (!drawdownSelect || !presetSelect || !minSizeSelect || !maxSizeSelect) return;
+  const constraints = settings.constraints || {};
+  const sizeOptions = constraints.adaptive_trade_size_options_usd || [];
+  const coinAdaptive = ((settings.strategies || {}).cointegration || {}).adaptive_kelly || {};
+  const currentMinSize = Number(coinAdaptive.min_size_usd ?? 5);
+  const currentMaxSize = Number(coinAdaptive.max_size_usd ?? 10);
+  minSizeSelect.innerHTML = sizeOptions.map(value =>
+    `<option value="${value}" ${Number(value) === currentMinSize ? 'selected' : ''}>$${value}</option>`
+  ).join('');
+  maxSizeSelect.innerHTML = sizeOptions.map(value =>
+    `<option value="${value}" ${Number(value) === currentMaxSize ? 'selected' : ''}>$${value}</option>`
+  ).join('');
+  const drawdownOptions = constraints.max_drawdown_options_pct || [];
+  const currentDrawdown = Number(constraints.max_drawdown_pct ?? 15);
+  drawdownSelect.innerHTML = drawdownOptions.map(value =>
+    `<option value="${value}" ${Number(value) === currentDrawdown ? 'selected' : ''}>${value}%</option>`
+  ).join('');
+  const presets = settings.adaptive_tier_presets || {};
+  const currentPreset = settings.selected_adaptive_tier_preset || '';
+  presetSelect.innerHTML = Object.entries(presets).map(([name, preset]) =>
+    `<option value="${esc(name)}" ${name === currentPreset ? 'selected' : ''}>${esc(preset.label || name)}</option>`
+  ).join('');
+}
+
+async function savePaperSizingSettings() {
+  const minSizeSelect = getEl('paperAdaptiveMinSizeSelect');
+  const maxSizeSelect = getEl('paperAdaptiveMaxSizeSelect');
+  const drawdownSelect = getEl('paperMaxDrawdownSelect');
+  const presetSelect = getEl('paperTierPresetSelect');
+  if (!drawdownSelect || !presetSelect || !minSizeSelect || !maxSizeSelect) return;
+  if (Number(maxSizeSelect.value) < Number(minSizeSelect.value)) {
+    toast('Adaptive max size must be at least the adaptive min size.', true);
+    loadStats();
+    return;
+  }
+  const params = new URLSearchParams({
+    adaptive_min_size_usd: minSizeSelect.value,
+    adaptive_max_size_usd: maxSizeSelect.value,
+    max_drawdown_pct: drawdownSelect.value,
+    selected_adaptive_tier_preset: presetSelect.value,
+  });
+  try {
+    const r = await fetch(API + '/api/paper-sizing/settings?' + params.toString(), { method: 'POST' });
+    const data = await r.json();
+    if (!r.ok || !data.ok) {
+      throw new Error(data.detail || data.error || 'Failed to save paper sizing settings');
+    }
+    renderPaperSizingControls(data.settings || {});
+    toast(`Paper sizing updated: $${minSizeSelect.value}-$${maxSizeSelect.value} · drawdown ${drawdownSelect.value}%`, 4000);
+    loadStats();
+  } catch (e) {
+    toast('Paper sizing settings error: ' + e.message, true);
+  }
 }
 
 function formatAttemptRef(row) {
