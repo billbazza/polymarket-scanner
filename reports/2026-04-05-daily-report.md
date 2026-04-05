@@ -19,6 +19,6 @@ System shows strong performance with 70.6% win rate and $396 realized PnL on $20
 - [ ] High rejection rate in cointegration signals (632 rejections vs 9 trades)
 
 ## Top 5 Improvements
-- [ ] Activate whale strategy implementation - missing opportunities from 10+ high-suspicion alerts
+- [ ] Activate whale strategy implementation - missing opportunities from 10+ high-suspicion alerts - low bet bids?
 - [ ] Tighten weather stop-losses - recent 18-24% drawdowns suggest stops too wide - i think this is done?
 - [ ] Reduce cointegration rejection threshold - 99.7% rejection rate limiting profitable setups
