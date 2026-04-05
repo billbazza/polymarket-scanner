@@ -271,6 +271,52 @@ class BrainProviderMigrationTests(unittest.TestCase):
         self.assertTrue(should_trade)
         self.assertIn("defaulting to statistical signal", reasoning)
 
+    def test_validate_signal_extracts_json_from_wrapped_response(self):
+        os.environ["OPENAI_API_KEY"] = "openai-test"
+        os.environ["BRAIN_PROVIDER"] = "openai"
+
+        brain = importlib.reload(self.brain)
+
+        with mock.patch.object(
+            brain,
+            "_brain_request",
+            return_value={
+                "provider": brain.PROVIDER_OPENAI,
+                "model": "gpt-5-mini",
+                "text": 'Here is the decision:\n{"trade": false, "reasoning": "wrapped json", "risk_flags": []}',
+            },
+        ):
+            should_trade, reasoning = brain.validate_signal({"event": "Wrapped response"})
+
+        self.assertFalse(should_trade)
+        self.assertEqual(reasoning, "wrapped json")
+
+    def test_validate_signal_handles_malformed_json_with_explicit_parity_fallback(self):
+        os.environ["OPENAI_API_KEY"] = "openai-test"
+        os.environ["BRAIN_PROVIDER"] = "openai"
+
+        brain = importlib.reload(self.brain)
+
+        with mock.patch.object(
+            brain,
+            "_brain_request",
+            return_value={
+                "provider": brain.PROVIDER_OPENAI,
+                "model": "gpt-5-mini",
+                "text": '{"trade": true, "reasoning": "unterminated}',
+            },
+        ), mock.patch.object(brain.log, "warning") as warning_log:
+            should_trade, reasoning = brain.validate_signal({"event": "Malformed response"})
+
+        self.assertTrue(should_trade)
+        self.assertIn("Brain advisory unavailable", reasoning)
+        self.assertIn("malformed JSON", reasoning)
+        self.assertIn("parity policy keeps the math-approved trade eligible", reasoning)
+        self.assertTrue(warning_log.called)
+        warning_message = warning_log.call_args[0][0] % warning_log.call_args[0][1:]
+        self.assertIn("Brain validation advisory malformed", warning_message)
+        self.assertIn("Unterminated string", warning_message)
+
     def test_blank_keychain_service_override_still_detects_default_service_provider_keys(self):
         for name in ("ANTHROPIC_API_KEY", "OPENAI_API_KEY", "XAI_API_KEY", "BRAIN_PROVIDER"):
             os.environ.pop(name, None)

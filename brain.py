@@ -757,6 +757,66 @@ def _brain_request(prompt: str, model: str, max_tokens: int) -> dict | None:
     return None
 
 
+def _extract_json_payload(text: str):
+    """Parse JSON from a model response, tolerating wrapper prose around one JSON object."""
+    normalized = _normalise_text_response(text)
+    if not normalized:
+        raise ValueError("empty_response")
+
+    decoder = json.JSONDecoder()
+    parse_errors = []
+
+    def _try_decode(candidate: str):
+        payload, end = decoder.raw_decode(candidate)
+        trailing = candidate[end:].strip()
+        if trailing:
+            raise ValueError("trailing_text")
+        return payload
+
+    try:
+        return _try_decode(normalized)
+    except (json.JSONDecodeError, ValueError) as exc:
+        parse_errors.append(exc)
+
+    for index, char in enumerate(normalized):
+        if char not in "{[":
+            continue
+        try:
+            return _try_decode(normalized[index:])
+        except (json.JSONDecodeError, ValueError) as exc:
+            parse_errors.append(exc)
+
+    raise parse_errors[-1]
+
+
+def _summarize_brain_payload_error(exc: Exception, text: str) -> str:
+    """Compress parser noise into a stable operator-facing diagnostic."""
+    if isinstance(exc, ValueError) and str(exc) == "empty_response":
+        return "empty response"
+
+    if isinstance(exc, ValueError) and str(exc) == "trailing_text":
+        return "response had non-JSON trailing text"
+
+    if isinstance(exc, json.JSONDecodeError):
+        detail = exc.msg
+        if exc.pos >= 0:
+            detail = f"{detail} at char {exc.pos}"
+        return detail
+
+    return str(exc) or "invalid JSON"
+
+
+def _brain_validation_fallback_reason(response: dict | None, error_summary: str) -> str:
+    """Explain the parity fallback when advisory output is unusable."""
+    provider = response.get("provider") if response else None
+    model = response.get("model") if response else None
+    source = "/".join(part for part in (provider, model) if part) or "brain"
+    return (
+        f"Brain advisory unavailable ({source} returned malformed JSON: {error_summary}) "
+        "— parity policy keeps the math-approved trade eligible."
+    )
+
+
 def estimate_probability(question, price, context="", model=DEFAULT_MODEL):
     """Ask the configured AI provider to estimate probability for a single market.
 
@@ -900,7 +960,7 @@ Respond with ONLY valid JSON:
         response = _brain_request(prompt, model=model, max_tokens=300)
         if not response:
             return True, "Brain unavailable — defaulting to statistical signal"
-        result = json.loads(response["text"])
+        result = _extract_json_payload(response["text"])
         result["provider"] = response["provider"]
         result["model"] = response["model"]
         should_trade = result.get("trade", False)
@@ -913,9 +973,15 @@ Respond with ONLY valid JSON:
 
         return should_trade, result.get("reasoning", "")
 
+    except (json.JSONDecodeError, ValueError) as e:
+        error_summary = _summarize_brain_payload_error(e, response["text"] if response else "")
+        reason = _brain_validation_fallback_reason(response, error_summary)
+        log.warning("Brain validation advisory malformed for %s: %s",
+                    signal.get("event", "?")[:40], error_summary)
+        return True, reason
     except Exception as e:
         log.error("Brain validation error: %s", e)
-        return True, f"Brain error — defaulting to trade: {e}"
+        return True, f"Brain advisory unavailable ({e}) — parity policy keeps the math-approved trade eligible."
 
 
 def recommend_wallet(address: str, label: str, score_result: dict, model=DEFAULT_MODEL) -> dict | None:
