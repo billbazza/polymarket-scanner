@@ -139,6 +139,84 @@
     gap: 12px;
     margin-bottom: 24px;
   }
+  .brain-runtime-banner {
+    margin-bottom: 18px;
+    padding: 12px 14px;
+    border-radius: 12px;
+    border: 1px solid rgba(14, 165, 233, 0.24);
+    background:
+      linear-gradient(135deg, rgba(15, 23, 42, 0.9), rgba(17, 24, 39, 0.82)),
+      radial-gradient(circle at top right, rgba(14, 165, 233, 0.1), transparent 35%);
+    box-shadow: 0 14px 30px rgba(2, 6, 23, 0.18);
+  }
+  .brain-runtime-head {
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-start;
+    gap: 12px;
+    flex-wrap: wrap;
+  }
+  .brain-runtime-kicker {
+    color: var(--sky);
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    font-size: 10px;
+    font-weight: 700;
+    margin-bottom: 3px;
+  }
+  .brain-runtime-summary {
+    font-size: 14px;
+    font-weight: 700;
+    line-height: 1.35;
+  }
+  .brain-runtime-meta {
+    color: var(--text2);
+    font-size: 12px;
+    line-height: 1.45;
+    max-width: 520px;
+  }
+  .brain-runtime-pills {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    margin-top: 10px;
+  }
+  .runtime-pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+    min-height: 32px;
+    padding: 7px 10px;
+    border-radius: 999px;
+    border: 1px solid rgba(71, 85, 105, 0.45);
+    background: rgba(15, 23, 42, 0.78);
+    font-size: 11px;
+    line-height: 1.35;
+  }
+  .runtime-pill-name { font-weight: 700; color: var(--text); }
+  .runtime-pill-status { color: var(--text2); }
+  .runtime-pill-detail { color: var(--text2); }
+  .runtime-pill-active {
+    border-color: rgba(16, 185, 129, 0.3);
+    background: rgba(16, 185, 129, 0.09);
+  }
+  .runtime-pill-ready {
+    border-color: rgba(59, 130, 246, 0.28);
+    background: rgba(59, 130, 246, 0.08);
+  }
+  .runtime-pill-disabled {
+    border-color: rgba(239, 68, 68, 0.28);
+    background: rgba(239, 68, 68, 0.08);
+  }
+  .runtime-pill-warning {
+    border-color: rgba(245, 158, 11, 0.28);
+    background: rgba(245, 158, 11, 0.08);
+  }
+  .runtime-pill-muted {
+    border-color: rgba(107, 114, 128, 0.35);
+    background: rgba(51, 65, 85, 0.5);
+  }
 
   header {
     display: flex;
@@ -390,6 +468,13 @@
     .container { padding: 12px; }
     .hero-title h2 { font-size: 20px; }
     .hero-equity .value { font-size: 25px; }
+    .brain-runtime-banner { padding: 12px; }
+    .brain-runtime-summary { font-size: 13px; }
+    .brain-runtime-meta { max-width: none; }
+    .runtime-pill {
+      width: 100%;
+      border-radius: 12px;
+    }
   }
 </style>
 </head>
@@ -403,6 +488,22 @@
       <button class="btn" id="autoTradeBtn" onclick="runAutoTrade()" style="background:var(--green);color:#000;font-weight:600;">Auto Trade</button>
     </div>
   </header>
+
+  <div class="brain-runtime-banner" id="brainRuntimeBanner" aria-live="polite">
+    <div class="brain-runtime-head">
+      <div>
+        <div class="brain-runtime-kicker">Brain Runtime</div>
+        <div class="brain-runtime-summary" id="brainRuntimeSummary">Loading provider runtime…</div>
+      </div>
+      <div class="brain-runtime-meta" id="brainRuntimeMeta">Checking `/api/brain/runtime` for provider state.</div>
+    </div>
+    <div class="brain-runtime-pills" id="brainRuntimeProviders">
+      <div class="runtime-pill runtime-pill-muted">
+        <span class="runtime-pill-name">Providers</span>
+        <span class="runtime-pill-status">Checking…</span>
+      </div>
+    </div>
+  </div>
 
   <div class="hero-panel">
     <div class="hero-head">
@@ -862,6 +963,12 @@ function fmtPct(v) { return v != null ? (v * 100).toFixed(1) + '%' : '-'; }
 function fmtUsd(v) { return '$' + Number(v || 0).toLocaleString('en-US', {minimumFractionDigits:2, maximumFractionDigits:2}); }
 function fmtNum(v, dp=3) { return v != null ? Number(v).toFixed(dp) : '-'; }
 function esc(s) { const d = document.createElement('div'); d.textContent = String(s||''); return d.innerHTML; }
+function fmtClock(ts) {
+  if (!ts) return null;
+  const d = new Date(ts);
+  if (Number.isNaN(d.getTime())) return null;
+  return d.toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' });
+}
 
 function getEl(id) { return document.getElementById(id); }
 
@@ -934,6 +1041,159 @@ function brainToast(prefix, shouldTrade, reasoning) {
   const msg = `${prefix}: ${shouldTrade ? 'TRADE' : 'SKIP'} — ${reasoning}`;
   const duration = Math.min(20000, Math.max(10000, 5000 + String(reasoning || '').length * 20));
   toast(msg, duration);
+}
+
+function brainProviderLabel(provider) {
+  return {
+    anthropic: 'Anthropic',
+    openai: 'OpenAI',
+    xai: 'xAI',
+  }[provider] || (provider ? String(provider) : 'None');
+}
+
+function brainAvailabilityLabel(state) {
+  return {
+    active: 'Active',
+    available: 'Ready',
+    credits_exhausted: 'Credits exhausted',
+    quota_exhausted: 'Quota exhausted',
+    missing_config: 'Missing config',
+    client_unavailable: 'Client unavailable',
+    auth_error: 'Auth error',
+    model_unavailable: 'Model unavailable',
+    runtime_error: 'Runtime issue',
+  }[state] || (state ? String(state).replace(/_/g, ' ') : 'Unknown');
+}
+
+function brainAvailabilityClass(state) {
+  if (state === 'active') return 'runtime-pill-active';
+  if (state === 'available') return 'runtime-pill-ready';
+  if (state === 'credits_exhausted' || state === 'quota_exhausted') return 'runtime-pill-disabled';
+  if (state === 'missing_config') return 'runtime-pill-muted';
+  return 'runtime-pill-warning';
+}
+
+function formatQuotaOrCreditDetail(providerStatus) {
+  const credit = providerStatus?.credit_observation;
+  if (credit && credit.remaining != null) {
+    const unitSuffix = credit.unit && credit.unit !== 'unknown'
+      ? ` ${credit.unit}`
+      : ' (unit unknown)';
+    return `credit ${credit.remaining}${unitSuffix}`;
+  }
+
+  const quota = providerStatus?.quota_observation;
+  if (!quota) return null;
+
+  const parts = [];
+  if (quota.requests_remaining != null) {
+    const limit = quota.requests_limit != null ? `/${quota.requests_limit}` : '';
+    parts.push(`req ${quota.requests_remaining}${limit}`);
+  }
+  if (quota.tokens_remaining != null) {
+    const limit = quota.tokens_limit != null ? `/${quota.tokens_limit}` : '';
+    parts.push(`tok ${quota.tokens_remaining}${limit}`);
+  }
+  if (!parts.length && quota.retry_after != null) {
+    parts.push(`retry ${quota.retry_after}`);
+  }
+  if (!parts.length && quota.requests_reset != null) {
+    parts.push(`req reset ${quota.requests_reset}`);
+  }
+  if (!parts.length && quota.tokens_reset != null) {
+    parts.push(`tok reset ${quota.tokens_reset}`);
+  }
+  if (!parts.length) {
+    parts.push('quota observed, remaining unknown');
+  }
+  return parts.join(' · ');
+}
+
+function renderBrainRuntime(status) {
+  const summaryEl = getEl('brainRuntimeSummary');
+  const metaEl = getEl('brainRuntimeMeta');
+  const providersEl = getEl('brainRuntimeProviders');
+  if (!summaryEl || !metaEl || !providersEl) return;
+
+  const providers = status?.providers || {};
+  const providerEntries = Object.entries(providers);
+  const order = status?.configured_order || [];
+  providerEntries.sort((a, b) => {
+    const ai = order.indexOf(a[0]);
+    const bi = order.indexOf(b[0]);
+    if (ai === -1 && bi === -1) return a[0].localeCompare(b[0]);
+    if (ai === -1) return 1;
+    if (bi === -1) return -1;
+    return ai - bi;
+  });
+
+  const activeProvider = status?.active_provider ? brainProviderLabel(status.active_provider) : 'No active provider';
+  const sourceCopy = status?.active_provider
+    ? (status.active_provider_source === 'last_success' ? 'from live runtime' : 'from configured preference')
+    : 'brain disabled';
+  const disabledProviders = providerEntries.filter(([, providerStatus]) =>
+    ['credits_exhausted', 'quota_exhausted', 'missing_config'].includes(providerStatus?.availability)
+  );
+
+  summaryEl.textContent = status?.active_provider
+    ? `${activeProvider} is current (${sourceCopy}).`
+    : 'Brain provider runtime unavailable.';
+
+  const disabledCopy = disabledProviders.length
+    ? `Disabled: ${disabledProviders.map(([name, providerStatus]) => `${brainProviderLabel(name)} ${brainAvailabilityLabel(providerStatus.availability).toLowerCase()}`).join(' · ')}.`
+    : (status?.brain_enabled ? 'No providers disabled by config, credit, or quota right now.' : 'No provider clients are ready.');
+  const fallback = status?.last_fallback
+    ? ` Last fallback ${brainProviderLabel(status.last_fallback.from_provider)} → ${brainProviderLabel(status.last_fallback.to_provider)} (${brainAvailabilityLabel(status.last_fallback.reason_kind).toLowerCase()})${fmtClock(status.last_fallback.at) ? ` at ${fmtClock(status.last_fallback.at)}` : ''}.`
+    : '';
+  metaEl.textContent = `Mode ${status?.mode || 'unknown'}${status?.active_provider_at && status?.active_provider_source === 'last_success' ? ` · active since ${fmtClock(status.active_provider_at) || status.active_provider_at}` : ''}. ${disabledCopy}${fallback}`;
+
+  if (!providerEntries.length) {
+    providersEl.innerHTML = `
+      <div class="runtime-pill runtime-pill-warning">
+        <span class="runtime-pill-name">Providers</span>
+        <span class="runtime-pill-status">No runtime data</span>
+      </div>
+    `;
+    return;
+  }
+
+  providersEl.innerHTML = providerEntries.map(([name, providerStatus]) => {
+    const availability = brainAvailabilityLabel(providerStatus?.availability);
+    const detail = formatQuotaOrCreditDetail(providerStatus);
+    return `
+      <div class="runtime-pill ${brainAvailabilityClass(providerStatus?.availability)}">
+        <span class="runtime-pill-name">${esc(brainProviderLabel(name))}</span>
+        <span class="runtime-pill-status">${esc(availability)}</span>
+        ${detail ? `<span class="runtime-pill-detail">${esc(detail)}</span>` : ''}
+      </div>
+    `;
+  }).join('');
+}
+
+async function loadBrainRuntime() {
+  try {
+    const r = await fetch(API + '/api/brain/runtime');
+    const data = await r.json();
+    if (!r.ok || data?.ok === false) {
+      throw new Error(data?.error || data?.detail || `HTTP ${r.status}`);
+    }
+    renderBrainRuntime(data);
+  } catch (e) {
+    const summaryEl = getEl('brainRuntimeSummary');
+    const metaEl = getEl('brainRuntimeMeta');
+    const providersEl = getEl('brainRuntimeProviders');
+    if (summaryEl) summaryEl.textContent = 'Brain runtime could not be loaded.';
+    if (metaEl) metaEl.textContent = 'Dashboard could not read `/api/brain/runtime`; provider state is unknown.';
+    if (providersEl) {
+      providersEl.innerHTML = `
+        <div class="runtime-pill runtime-pill-warning">
+          <span class="runtime-pill-name">Providers</span>
+          <span class="runtime-pill-status">Status unknown</span>
+        </div>
+      `;
+    }
+    console.error('loadBrainRuntime error:', e);
+  }
 }
 
 // ── Tabs ───────────────────────────────────────────────────────────────────
@@ -2624,10 +2884,12 @@ async function mirrorTrade(wallet, conditionId, btn) {
 // ── Init ───────────────────────────────────────────────────────────────────
 
 loadUiPrefs();
+loadBrainRuntime();
 loadStats();
 loadSignals();
 loadPaperAttempts();
 checkWhaleAlerts();
+setInterval(loadBrainRuntime, 60000);
 setInterval(loadStats, 60000);
 setInterval(loadTrades, 60000);
 setInterval(loadPaperAttempts, 60000);
