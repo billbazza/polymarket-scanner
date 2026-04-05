@@ -1479,6 +1479,16 @@ async def create_trade(signal_id: int, size_usd: float = 100, runtime_scope: str
     mode = "live" if runtime_scope == db.RUNTIME_SCOPE_PENNY else "paper"
     decision = db.inspect_pairs_trade_open(signal_id, size_usd=size_usd, runtime_scope=runtime_scope)
     if not decision["ok"]:
+        log.info(
+            "Manual pairs trade blocked signal=%s runtime_scope=%s decision_source=%s blocker_source=%s history_source=%s reason_code=%s reason=%s",
+            signal_id,
+            runtime_scope,
+            decision.get("decision_source"),
+            decision.get("blocker_source"),
+            decision.get("history_source"),
+            decision.get("reason_code"),
+            decision.get("reason"),
+        )
         _safe_record_paper_trade_attempt(
             source="manual_api",
             strategy="pairs",
@@ -1501,6 +1511,9 @@ async def create_trade(signal_id: int, size_usd: float = 100, runtime_scope: str
                 "error": decision["reason"],
                 "reason": decision["reason"],
                 "reason_code": decision["reason_code"],
+                "blocking_source": decision.get("blocker_source"),
+                "blocking_runtime_scope": decision.get("blocker_runtime_scope"),
+                "blocking_strategy": decision.get("blocker_strategy"),
                 "paper_account": decision.get("account"),
                 "policy": {
                     "position_policy": decision.get("position_policy"),
@@ -1510,7 +1523,12 @@ async def create_trade(signal_id: int, size_usd: float = 100, runtime_scope: str
             },
         )
     signal = db.get_signal_by_id(signal_id)
-    result = execution.execute_trade(signal or {"id": signal_id}, size_usd=size_usd, mode=mode)
+    result = execution.execute_trade(
+        signal or {"id": signal_id},
+        size_usd=size_usd,
+        mode=mode,
+        runtime_scope=runtime_scope,
+    )
     if not result.get("ok"):
         _safe_record_paper_trade_attempt(
             source="manual_api",
@@ -1545,6 +1563,8 @@ async def create_trade(signal_id: int, size_usd: float = 100, runtime_scope: str
                 "error": result.get("error") or "Pairs trade could not be opened.",
                 "reason": result.get("error") or "Pairs trade could not be opened.",
                 "reason_code": result.get("reason_code") or "open_failed",
+                "blocking_source": result.get("blocker_source"),
+                "blocking_runtime_scope": result.get("blocker_runtime_scope"),
             },
         )
     _safe_record_paper_trade_attempt(
@@ -1610,7 +1630,12 @@ async def open_weather_trade(signal_id: int, size_usd: float = 20, runtime_scope
     runtime_scope = _runtime_scope_param(runtime_scope)
     mode = "live" if runtime_scope == db.RUNTIME_SCOPE_PENNY else "paper"
     signal = db.get_weather_signal_by_id(signal_id)
-    result = execution.execute_weather_trade(signal or {"id": signal_id}, size_usd=size_usd, mode=mode)
+    result = execution.execute_weather_trade(
+        signal or {"id": signal_id},
+        size_usd=size_usd,
+        mode=mode,
+        runtime_scope=runtime_scope,
+    )
     if not result["ok"]:
         decision = result.get("decision") or db.inspect_weather_trade_open(
             signal_id,
@@ -1619,11 +1644,12 @@ async def open_weather_trade(signal_id: int, size_usd: float = 20, runtime_scope
             runtime_scope=runtime_scope,
         )
         log.info(
-            "Manual weather trade blocked signal=%s reason_code=%s runtime_scope=%s decision_source=%s history_source=%s reason=%s",
+            "Manual weather trade blocked signal=%s reason_code=%s runtime_scope=%s decision_source=%s blocker_source=%s history_source=%s reason=%s",
             signal_id,
             result.get("reason_code") or decision["reason_code"],
             runtime_scope,
             decision.get("decision_source"),
+            decision.get("blocker_source"),
             decision.get("history_source"),
             result.get("error") or decision["reason"],
         )
@@ -1656,6 +1682,9 @@ async def open_weather_trade(signal_id: int, size_usd: float = 20, runtime_scope
                 "error": result.get("error") or decision["reason"],
                 "reason": result.get("error") or decision["reason"],
                 "reason_code": result.get("reason_code") or decision["reason_code"],
+                "blocking_source": decision.get("blocker_source"),
+                "blocking_runtime_scope": decision.get("blocker_runtime_scope"),
+                "blocking_strategy": decision.get("blocker_strategy"),
                 "paper_account": decision.get("account"),
                 "policy": {
                     "position_policy": decision.get("position_policy"),

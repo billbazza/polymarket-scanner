@@ -51,7 +51,9 @@ def _fetch_stage2_rollout():
         return {"ok": False, "error": str(exc)}
 
 
-def _runtime_scope_for_mode(mode: str | None) -> str:
+def _runtime_scope_for_mode(mode: str | None, runtime_scope: str | None = None) -> str:
+    if runtime_scope is not None:
+        return db.normalize_runtime_scope(runtime_scope)
     if mode == "live":
         return db.RUNTIME_SCOPE_PENNY
     return db.RUNTIME_SCOPE_PAPER
@@ -116,7 +118,7 @@ def _cap_quarter_kelly(size_usd: float, balance_usd: float) -> tuple[float, bool
     return cap, True
 
 
-def check_balance(mode=None):
+def check_balance(mode=None, runtime_scope: str | None = None):
     """Check available USDC balance.
 
     Paper mode: returns simulated balance.
@@ -126,7 +128,7 @@ def check_balance(mode=None):
         dict with balance_usd, mode, and any error info.
     """
     mode = mode or _get_mode()
-    runtime_scope = _runtime_scope_for_mode(mode)
+    runtime_scope = _runtime_scope_for_mode(mode, runtime_scope)
 
     if mode == "paper":
         account = db.get_paper_account_state(refresh_unrealized=False, runtime_scope=runtime_scope)
@@ -269,17 +271,24 @@ def _estimate_leg_fee_usd(exec_mode: str, notional_usd: float) -> float:
 
 
 def _failure_result(mode: str, reason_code: str, error: str, **extra) -> dict:
+    runtime_scope = extra.pop("runtime_scope", None)
+    blocker_source = extra.pop("blocker_source", None)
     payload = {
         "ok": False,
         "mode": mode,
         "reason_code": reason_code,
         "error": error,
     }
+    if runtime_scope is not None:
+        payload["runtime_scope"] = runtime_scope
+        payload["blocker_runtime_scope"] = runtime_scope
+    if blocker_source is not None:
+        payload["blocker_source"] = blocker_source
     payload.update(extra)
     return payload
 
 
-def execute_trade(signal, size_usd, mode=None):
+def execute_trade(signal, size_usd, mode=None, runtime_scope: str | None = None):
     """Execute a pairs trade from a signal.
 
     Args:
@@ -292,6 +301,7 @@ def execute_trade(signal, size_usd, mode=None):
         dict with trade result, fill prices, trade_id, or error.
     """
     mode = mode or _get_mode()
+    runtime_scope = _runtime_scope_for_mode(mode, runtime_scope)
     signal = signal or {}
     signal = dict(signal)
     size_usd = round(float(size_usd or 0.0), 2)
@@ -305,8 +315,14 @@ def execute_trade(signal, size_usd, mode=None):
             confidence_meta["confidence_score"],
             confidence_meta["confidence_policy"],
         )
-    log.info("Executing trade: %s | size=$%.2f mode=%s z=%.2f",
-             signal.get("event", "?")[:50], size_usd, mode, signal.get("z_score", 0))
+    log.info(
+        "Executing trade: %s | size=$%.2f mode=%s runtime_scope=%s z=%.2f",
+        signal.get("event", "?")[:50],
+        size_usd,
+        mode,
+        runtime_scope,
+        signal.get("z_score", 0),
+    )
 
     stage2_context = None
     if _stage2_enabled() and mode == "paper":
@@ -327,13 +343,15 @@ def execute_trade(signal, size_usd, mode=None):
         return payload
 
     # 1. Balance pre-check
-    bal = check_balance(mode)
+    bal = check_balance(mode, runtime_scope=runtime_scope)
     if not bal["ok"]:
         log.warning("Balance check failed: %s", bal.get("error"))
         return _wrap_result(_failure_result(
             mode,
             "balance_check_failed",
             f"Balance check failed: {bal.get('error')}",
+            runtime_scope=runtime_scope,
+            blocker_source="shared-external" if mode == "live" else f"{runtime_scope}-execution",
             balance=bal,
         ))
 
@@ -353,6 +371,8 @@ def execute_trade(signal, size_usd, mode=None):
             mode,
             "insufficient_balance",
             f"Insufficient balance: ${bal['balance_usd']:.2f} < ${size_usd:.2f}",
+            runtime_scope=runtime_scope,
+            blocker_source=f"{runtime_scope}-execution",
             balance=bal,
             requested_size_usd=size_usd,
         ))
@@ -371,14 +391,26 @@ def execute_trade(signal, size_usd, mode=None):
             price_a, price_b = _get_maker_prices(token_a, token_b, side_a, side_b)
         except Exception as e:
             log.error("Failed to compute maker prices: %s", e)
-            return _wrap_result(_failure_result(mode, "maker_price_fetch_failed", f"Maker price fetch failed: {e}"))
+            return _wrap_result(_failure_result(
+                mode,
+                "maker_price_fetch_failed",
+                f"Maker price fetch failed: {e}",
+                runtime_scope=runtime_scope,
+                blocker_source="shared-external",
+            ))
     else:
         try:
             price_a = api.get_midpoint(token_a)
             price_b = api.get_midpoint(token_b)
         except Exception as e:
             log.error("Failed to fetch current prices: %s", e)
-            return _wrap_result(_failure_result(mode, "price_fetch_failed", f"Price fetch failed: {e}"))
+            return _wrap_result(_failure_result(
+                mode,
+                "price_fetch_failed",
+                f"Price fetch failed: {e}",
+                runtime_scope=runtime_scope,
+                blocker_source="shared-external",
+            ))
 
     if price_a <= 0 or price_b <= 0:
         log.warning("Invalid prices: a=%.4f b=%.4f", price_a, price_b)
@@ -386,6 +418,8 @@ def execute_trade(signal, size_usd, mode=None):
             mode,
             "invalid_prices",
             f"Invalid prices: a={price_a} b={price_b}",
+            runtime_scope=runtime_scope,
+            blocker_source="shared-external",
             price_a=price_a,
             price_b=price_b,
         ))
@@ -408,6 +442,8 @@ def execute_trade(signal, size_usd, mode=None):
                 mode,
                 "slippage_block",
                 f"Slippage too high: {slippage_leg_a.get('reason')}",
+                runtime_scope=runtime_scope,
+                blocker_source="shared-external",
                 slippage=slippage_leg_a,
                 slippage_leg="a",
             ))
@@ -418,6 +454,8 @@ def execute_trade(signal, size_usd, mode=None):
                 mode,
                 "slippage_block",
                 f"Slippage too high on leg B: {slippage_leg_b.get('reason')}",
+                runtime_scope=runtime_scope,
+                blocker_source="shared-external",
                 slippage=slippage_leg_b,
                 slippage_leg="b",
             ))
@@ -452,7 +490,7 @@ def execute_trade(signal, size_usd, mode=None):
             gbp_rate = hmrc.require_gbp_rate()
         except RuntimeError as e:
             log.error("LIVE TRADE BLOCKED — HMRC compliance failure: %s", e)
-            return _wrap_result(_failure_result(mode, "hmrc_gate_blocked", str(e)))
+            return _wrap_result(_failure_result(mode, "hmrc_gate_blocked", str(e), runtime_scope=runtime_scope, blocker_source=f"{runtime_scope}-execution"))
 
     # 5. Execute based on mode and execution style
     if mode == "paper":
@@ -466,6 +504,7 @@ def execute_trade(signal, size_usd, mode=None):
             exec_mode=exec_mode,
             confidence_metadata=confidence_meta,
             quarter_kelly_capped=quarter_kelly_capped,
+            runtime_scope=runtime_scope,
         )
     else:
         result = _execute_live(
@@ -478,6 +517,7 @@ def execute_trade(signal, size_usd, mode=None):
             exec_mode=exec_mode,
             confidence_metadata=confidence_meta,
             quarter_kelly_capped=quarter_kelly_capped,
+            runtime_scope=runtime_scope,
         )
 
     # 6. Stamp and audit-log real trades
@@ -536,10 +576,10 @@ def _revalidate_weather_horizon(signal: dict | None):
     return {"ok": True, "remaining_hours": remaining_hours}
 
 
-def execute_weather_trade(signal, size_usd, mode=None):
+def execute_weather_trade(signal, size_usd, mode=None, runtime_scope: str | None = None):
     """Execute a weather trade from a saved weather signal."""
     mode = mode or _get_mode()
-    runtime_scope = _runtime_scope_for_mode(mode)
+    runtime_scope = _runtime_scope_for_mode(mode, runtime_scope)
     signal = dict(signal or {})
     weather_signal_id = signal.get("id") or signal.get("weather_signal_id")
     if not weather_signal_id:
@@ -569,11 +609,12 @@ def execute_weather_trade(signal, size_usd, mode=None):
             confidence_meta["confidence_policy"],
         )
     log.info(
-        "Executing weather trade: signal=%s strategy=%s size=$%.2f mode=%s",
+        "Executing weather trade: signal=%s strategy=%s size=$%.2f mode=%s runtime_scope=%s",
         weather_signal_id,
         strategy_name,
         size_usd,
         mode,
+        runtime_scope,
     )
 
     if strategy_name.startswith("weather_exact_temp") and mode != "paper":
@@ -589,6 +630,8 @@ def execute_weather_trade(signal, size_usd, mode=None):
             "error": "Exact-temperature weather execution remains paper-only.",
             "strategy_name": strategy_name,
             "weather_signal_id": weather_signal_id,
+            "runtime_scope": runtime_scope,
+            "blocker_source": f"{runtime_scope}-weather",
         }
 
     horizon_check = _revalidate_weather_horizon(signal)
@@ -602,7 +645,7 @@ def execute_weather_trade(signal, size_usd, mode=None):
             "remaining_hours": horizon_check.get("remaining_hours"),
         }
 
-    bal = check_balance(mode)
+    bal = check_balance(mode, runtime_scope=runtime_scope)
     if not bal["ok"]:
         return {
             "ok": False,
@@ -610,6 +653,8 @@ def execute_weather_trade(signal, size_usd, mode=None):
             "reason_code": "balance_check_failed",
             "error": f"Balance check failed: {bal.get('error')}",
             "weather_signal_id": weather_signal_id,
+            "runtime_scope": runtime_scope,
+            "blocker_source": "shared-external" if mode == "live" else f"{runtime_scope}-weather",
         }
     quarter_kelly_capped = False
     size_before_cap = size_usd
@@ -629,6 +674,8 @@ def execute_weather_trade(signal, size_usd, mode=None):
             "error": f"Insufficient balance: ${bal['balance_usd']:.2f} < ${size_usd:.2f}",
             "paper_account": bal.get("paper_account"),
             "weather_signal_id": weather_signal_id,
+            "runtime_scope": runtime_scope,
+            "blocker_source": f"{runtime_scope}-weather",
         }
 
     decision = db.inspect_weather_trade_open(
@@ -646,6 +693,9 @@ def execute_weather_trade(signal, size_usd, mode=None):
             "decision": decision,
             "weather_signal_id": weather_signal_id,
             "strategy_name": strategy_name,
+            "runtime_scope": runtime_scope,
+            "blocker_source": decision.get("blocker_source"),
+            "blocker_runtime_scope": decision.get("blocker_runtime_scope"),
         }
 
     if mode == "paper":
@@ -697,6 +747,8 @@ def execute_weather_trade(signal, size_usd, mode=None):
             "error": "Weather signal lacks an entry token.",
             "weather_signal_id": weather_signal_id,
             "strategy_name": strategy_name,
+            "runtime_scope": runtime_scope,
+            "blocker_source": f"{runtime_scope}-weather",
         }
 
     slippage = math_engine.check_slippage(
@@ -713,6 +765,8 @@ def execute_weather_trade(signal, size_usd, mode=None):
             "weather_signal_id": weather_signal_id,
             "strategy_name": strategy_name,
             "slippage": slippage,
+            "runtime_scope": runtime_scope,
+            "blocker_source": "shared-external",
         }
 
     try:
@@ -1069,7 +1123,8 @@ def execute_whale_trade(alert, size_usd=20, mode=None):
 
 def _execute_paper(signal, size_usd, price_a, price_b,
                    side_a="BUY", side_b="SELL", exec_mode="maker",
-                   confidence_metadata=None, quarter_kelly_capped=False):
+                   confidence_metadata=None, quarter_kelly_capped=False,
+                   runtime_scope: str = db.RUNTIME_SCOPE_PAPER):
     """Simulate order fill.
 
     Maker mode: records limit prices (better than mid) with 0% fee — optimistic
@@ -1079,7 +1134,13 @@ def _execute_paper(signal, size_usd, price_a, price_b,
     signal_id = signal.get("id")
     if not signal_id:
         log.error("Signal missing 'id' field, cannot record trade")
-        return _failure_result("paper", "signal_id_missing", "Signal missing id")
+        return _failure_result(
+            "paper",
+            "signal_id_missing",
+            "Signal missing id",
+            runtime_scope=runtime_scope,
+            blocker_source=f"{runtime_scope}-execution",
+        )
 
     trade_id = db.open_trade(
         signal_id,
@@ -1088,7 +1149,7 @@ def _execute_paper(signal, size_usd, price_a, price_b,
             "strategy_name": "cointegration",
             "trade_state_mode": db.TRADE_STATE_PAPER,
             "reconciliation_mode": db.RECONCILIATION_INTERNAL,
-            "runtime_scope": db.RUNTIME_SCOPE_PAPER,
+            "runtime_scope": runtime_scope,
             "entry_grade_label": signal.get("grade_label"),
             "admission_path": signal.get("admission_path"),
             "experiment_name": signal.get("experiment_name"),
@@ -1103,8 +1164,14 @@ def _execute_paper(signal, size_usd, price_a, price_b,
     )
     if not trade_id:
         log.error("Failed to open trade in DB for signal %s", signal_id)
-        return _failure_result("paper", "db_open_trade_failed", "DB open_trade failed")
-    account = db.get_paper_account_state(refresh_unrealized=False, runtime_scope=db.RUNTIME_SCOPE_PAPER)
+        return _failure_result(
+            "paper",
+            "db_open_trade_failed",
+            "DB open_trade failed",
+            runtime_scope=runtime_scope,
+            blocker_source=f"{runtime_scope}-cointegration",
+        )
+    account = db.get_paper_account_state(refresh_unrealized=False, runtime_scope=runtime_scope)
 
     log.info("PAPER %s FILL: trade=%d | A(%s)=%.4f B(%s)=%.4f | $%.2f | bal=$%.2f",
              exec_mode.upper(), trade_id, side_a, price_a, side_b, price_b,
@@ -1120,7 +1187,7 @@ def _execute_paper(signal, size_usd, price_a, price_b,
         "fill_price_b": price_b,
         "size_usd": size_usd,
         "remaining_balance": account["available_cash"],
-        "runtime_scope": db.RUNTIME_SCOPE_PAPER,
+        "runtime_scope": runtime_scope,
         "paper_account": account,
         "confidence_score": confidence_metadata.get("confidence_score") if confidence_metadata else None,
         "confidence_policy": confidence_metadata.get("confidence_policy") if confidence_metadata else None,
@@ -1308,7 +1375,8 @@ def close_live_trade(trade: dict, notes: str = "") -> dict:
 
 def _execute_live(signal, size_usd, price_a, price_b,
                   side_a="BUY", side_b="SELL", exec_mode="maker",
-                  confidence_metadata=None, quarter_kelly_capped=False):
+                  confidence_metadata=None, quarter_kelly_capped=False,
+                  runtime_scope: str = db.RUNTIME_SCOPE_PENNY):
     """Execute real orders via py-clob-client.
 
     Maker mode: GTC limit orders posted inside spread — fills when someone
@@ -1319,12 +1387,24 @@ def _execute_live(signal, size_usd, price_a, price_b,
         from py_clob_client.client import ClobClient
     except ImportError:
         log.error("py-clob-client not installed. Run: pip install py-clob-client")
-        return _failure_result("live", "clob_client_missing", "py-clob-client not installed")
+        return _failure_result(
+            "live",
+            "clob_client_missing",
+            "py-clob-client not installed",
+            runtime_scope=runtime_scope,
+            blocker_source=f"{runtime_scope}-execution",
+        )
 
     private_key = runtime_config.get("POLYMARKET_PRIVATE_KEY")
     if not private_key:
         log.error("POLYMARKET_PRIVATE_KEY not set")
-        return _failure_result("live", "private_key_missing", "POLYMARKET_PRIVATE_KEY not set")
+        return _failure_result(
+            "live",
+            "private_key_missing",
+            "POLYMARKET_PRIVATE_KEY not set",
+            runtime_scope=runtime_scope,
+            blocker_source=f"{runtime_scope}-execution",
+        )
 
     try:
         client = ClobClient(
@@ -1409,7 +1489,7 @@ def _execute_live(signal, size_usd, price_a, price_b,
                 "strategy_name": "cointegration_live",
                 "trade_state_mode": db.TRADE_STATE_LIVE,
                 "reconciliation_mode": db.RECONCILIATION_ORDERS,
-                "runtime_scope": db.RUNTIME_SCOPE_PENNY,
+                "runtime_scope": runtime_scope,
                 "entry_execution": entry_execution,
                 "entry_fee_usd": estimated_fee,
                 **live_identity,
@@ -1460,6 +1540,7 @@ def _execute_live(signal, size_usd, price_a, price_b,
             "fees_usd": estimated_fee,
             "entry_execution": entry_execution,
             "pending": exec_mode == "maker",
+            "runtime_scope": runtime_scope,
             "confidence_score": confidence_metadata.get("confidence_score") if confidence_metadata else None,
             "confidence_policy": confidence_metadata.get("confidence_policy") if confidence_metadata else None,
             "confidence_applied": bool(confidence_metadata),
@@ -1476,7 +1557,13 @@ def _execute_live(signal, size_usd, price_a, price_b,
 
     except Exception as e:
         log.error("Live execution failed: %s", e)
-        return _failure_result("live", "exchange_order_failed", str(e))
+        return _failure_result(
+            "live",
+            "exchange_order_failed",
+            str(e),
+            runtime_scope=runtime_scope,
+            blocker_source="shared-external",
+        )
 
 
 def place_gtc_order(token_id, side, price, size_shares, mode=None):

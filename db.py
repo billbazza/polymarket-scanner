@@ -1359,6 +1359,9 @@ def _attach_pairs_runtime_status(
     signal["preflight_ok"] = bool(decision.get("ok"))
     signal["preflight_reason"] = None if decision.get("ok") else decision.get("reason")
     signal["preflight_reason_code"] = None if decision.get("ok") else decision.get("reason_code")
+    signal["preflight_blocking_runtime_scope"] = None if decision.get("ok") else decision.get("blocker_runtime_scope")
+    signal["preflight_blocking_strategy"] = None if decision.get("ok") else decision.get("blocker_strategy")
+    signal["preflight_blocking_source"] = None if decision.get("ok") else decision.get("blocker_source")
     signal["manual_can_open_trade"] = bool(signal.get("tradeable")) and bool(decision.get("ok"))
     signal["last_attempt"] = latest_attempt
 
@@ -3215,13 +3218,21 @@ def _decision_audit_fields(
         default=decision_scope,
     )
     history_strategy = _trade_strategy_key(history_trade) if history_trade else decision_strategy
+    decision_source = f"{decision_scope}-{decision_strategy}"
+    history_source = f"{history_scope}-{history_strategy}"
+    blocker_scope = history_scope if history_trade else decision_scope
+    blocker_strategy = history_strategy if history_trade else decision_strategy
+    blocker_source = history_source if history_trade else decision_source
     return {
         "runtime_scope": decision_scope,
         "decision_strategy": decision_strategy,
-        "decision_source": f"{decision_scope}-{decision_strategy}",
+        "decision_source": decision_source,
         "history_runtime_scope": history_scope,
         "history_strategy": history_strategy,
-        "history_source": f"{history_scope}-{history_strategy}",
+        "history_source": history_source,
+        "blocker_runtime_scope": blocker_scope,
+        "blocker_strategy": blocker_strategy,
+        "blocker_source": blocker_source,
     }
 
 
@@ -3655,7 +3666,16 @@ def open_trade(signal_id, size_usd=100, metadata=None):
         runtime_scope=state_fields["runtime_scope"],
     )
     if not decision["ok"]:
-        log.info("Paper pairs trade blocked for signal %s: %s", signal_id, decision["reason"])
+        log.info(
+            "Pairs trade blocked signal=%s runtime_scope=%s decision_source=%s blocker_source=%s history_source=%s reason_code=%s reason=%s",
+            signal_id,
+            decision.get("runtime_scope"),
+            decision.get("decision_source"),
+            decision.get("blocker_source"),
+            decision.get("history_source"),
+            decision.get("reason_code"),
+            decision.get("reason"),
+        )
         conn.close()
         return None
     sig = decision["signal"]

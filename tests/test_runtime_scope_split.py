@@ -169,6 +169,38 @@ class RuntimeScopeSplitTests(unittest.TestCase):
         self.assertEqual(penny_account["open_trades"], 1)
         self.assertEqual(penny_account["committed_capital"], 3.0)
         self.assertEqual(penny_account["runtime_scope"], self.db.RUNTIME_SCOPE_PENNY)
+        self.assertEqual(paper_decision["blocker_source"], "paper-cointegration")
+        self.assertEqual(penny_decision["blocker_source"], "penny-cointegration")
+
+    def test_pairs_db_guard_logs_active_scope_and_blocker_source(self):
+        signal_id = self.db.save_signal(_signal())
+        trade_id = self.db.open_trade(
+            signal_id,
+            size_usd=3,
+            metadata={
+                "runtime_scope": self.db.RUNTIME_SCOPE_PENNY,
+                "trade_state_mode": self.db.TRADE_STATE_LIVE,
+                "reconciliation_mode": self.db.RECONCILIATION_ORDERS,
+            },
+        )
+        self.assertIsNotNone(trade_id)
+
+        with self.assertLogs("scanner.db", level="INFO") as captured:
+            blocked = self.db.open_trade(
+                signal_id,
+                size_usd=3,
+                metadata={
+                    "runtime_scope": self.db.RUNTIME_SCOPE_PENNY,
+                    "trade_state_mode": self.db.TRADE_STATE_LIVE,
+                    "reconciliation_mode": self.db.RECONCILIATION_ORDERS,
+                },
+            )
+
+        self.assertIsNone(blocked)
+        output = "\n".join(captured.output)
+        self.assertIn("runtime_scope=penny", output)
+        self.assertIn("blocker_source=penny-cointegration", output)
+        self.assertNotIn("Paper pairs trade blocked", output)
 
     def test_stats_and_trades_api_are_runtime_scoped(self):
         _, paper_trade_id, penny_trade_id = self._seed_scoped_pairs_trades()
@@ -1008,6 +1040,8 @@ class RuntimeScopeSplitTests(unittest.TestCase):
         self.assertIn("Live safeguard vetoes", html)
         self.assertIn("acceptance && acceptance.all_passed === false", html)
         self.assertIn("Weather phase: skipped", html)
+        self.assertIn("details.blocker_source", html)
+        self.assertIn("details.attempt_runtime_scope", html)
         self.assertIn("cycle started in background", html)
         self.assertIn("Penny Max Open Trades", html)
         self.assertIn("Changes save immediately to the live penny scope and are appended to the audit journal.", html)
@@ -1116,6 +1150,31 @@ class RuntimeScopeSplitTests(unittest.TestCase):
         self.assertEqual(paper_row["blocking_source"], "paper-weather")
         self.assertIsNone(penny_row["blocking_reason_code"])
         self.assertIsNone(penny_row["blocking_source"])
+
+    def test_pairs_api_block_response_exposes_scoped_blocker_source(self):
+        signal_id = self.db.save_signal(_signal())
+        trade_id = self.db.open_trade(
+            signal_id,
+            size_usd=3,
+            metadata={
+                "runtime_scope": self.db.RUNTIME_SCOPE_PENNY,
+                "trade_state_mode": self.db.TRADE_STATE_LIVE,
+                "reconciliation_mode": self.db.RECONCILIATION_ORDERS,
+            },
+        )
+        self.assertIsNotNone(trade_id)
+
+        penny_response = self.client.post(
+            f"/api/trades?signal_id={signal_id}&runtime_scope=penny&size_usd=3",
+            headers={"X-API-Key": "test-admin-key"},
+        )
+
+        self.assertEqual(penny_response.status_code, 409)
+        payload = penny_response.json()
+        self.assertEqual(payload["reason_code"], "signal_already_open")
+        self.assertEqual(payload["blocking_source"], "penny-cointegration")
+        self.assertEqual(payload["blocking_runtime_scope"], "penny")
+        self.assertEqual(payload["blocking_strategy"], "cointegration")
 
 
 if __name__ == "__main__":

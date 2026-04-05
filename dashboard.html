@@ -1937,10 +1937,13 @@ async function loadPaperAttempts() {
           ? 'runner'
           : row.source;
       const strategy = row.strategy === 'system' ? 'system' : row.strategy;
+      const details = row.details || {};
+      const scopeLabel = row.runtime_scope || details.attempt_runtime_scope || scope;
+      const blockerSource = details.blocker_source || details.history_source || details.attempt_source || `${scopeLabel}-${strategy}`;
       return `<tr>
         <td>${fmt(row.timestamp)}</td>
-        <td>${esc(source)}${row.autonomy_level ? `<div style="color:var(--text2);font-size:10px">${esc(row.autonomy_level)}</div>` : ''}</td>
-        <td>${esc(strategy)}${row.phase ? `<div style="color:var(--text2);font-size:10px" title="${esc(row.phase)}">${esc(row.phase)}</div>` : ''}</td>
+        <td>${esc(source)}${row.autonomy_level ? `<div style="color:var(--text2);font-size:10px">${esc(row.autonomy_level)}</div>` : ''}<div style="color:var(--text2);font-size:10px">${esc(String(scopeLabel).toUpperCase())}</div></td>
+        <td>${esc(strategy)}${row.phase ? `<div style="color:var(--text2);font-size:10px" title="${esc(row.phase)}">${esc(row.phase)}</div>` : ''}<div style="color:var(--text2);font-size:10px" title="${esc(blockerSource)}">${esc(blockerSource)}</div></td>
         <td><span class="badge" style="background:rgba(15,23,42,0.85);color:${decisionColor};border:1px solid ${decisionColor}">${decisionLabel}</span></td>
         <td class="event-name" title="${esc(row.event || '')}">${esc(row.event || '—')}</td>
         <td title="${esc(row.reason || '')}">

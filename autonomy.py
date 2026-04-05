@@ -316,6 +316,7 @@ def _safe_record_paper_trade_attempt(**kwargs):
 
 def record_attempt(level, strategy, outcome, reason_code, reason, **kwargs):
     """Persist an operator-facing paper-trade attempt or gating event."""
+    runtime_scope = kwargs.pop("runtime_scope", None) or runtime_scope_for_level(level)
     _safe_record_paper_trade_attempt(
         source="autonomy",
         strategy=strategy,
@@ -323,7 +324,7 @@ def record_attempt(level, strategy, outcome, reason_code, reason, **kwargs):
         reason_code=reason_code,
         reason=reason,
         autonomy_level=level,
-        runtime_scope=runtime_scope_for_level(level),
+        runtime_scope=runtime_scope,
         phase=kwargs.pop("phase", None),
         **kwargs,
     )
@@ -963,6 +964,12 @@ def run_cycle(state):
                     event=event_name,
                     signal_id=signal_id,
                     phase=current_stage,
+                    runtime_scope=runtime_scope,
+                    details={
+                        "blocker_source": f"{runtime_scope}-cointegration",
+                        "blocker_runtime_scope": runtime_scope,
+                        "blocker_strategy": "cointegration",
+                    },
                 )
                 continue
 
@@ -979,6 +986,12 @@ def run_cycle(state):
                     event=event_name,
                     signal_id=signal_id,
                     phase=current_stage,
+                    runtime_scope=runtime_scope,
+                    details={
+                        "blocker_source": f"{runtime_scope}-cointegration",
+                        "blocker_runtime_scope": runtime_scope,
+                        "blocker_strategy": "cointegration",
+                    },
                 )
                 continue
 
@@ -1047,7 +1060,12 @@ def run_cycle(state):
             log.info("  Opening %s trade: %s | $%.2f", mode, event_name[:40], trade_size)
 
             try:
-                result = execution.execute_trade(opp, size_usd=trade_size, mode=mode)
+                result = execution.execute_trade(
+                    opp,
+                    size_usd=trade_size,
+                    mode=mode,
+                    runtime_scope=runtime_scope,
+                )
                 if result["ok"]:
                     traded += 1
                     this_cycle_signal_ids.add(signal_id)
@@ -1123,9 +1141,11 @@ def run_cycle(state):
                             extra_details=veto_details,
                         )
                         log.warning(
-                            "  Penny cointegration live safeguard veto: signal=%s event=%s reason_code=%s reason=%s",
+                            "  Penny cointegration live safeguard veto: signal=%s event=%s runtime_scope=%s blocker_source=%s reason_code=%s reason=%s",
                             signal_id,
                             event_name[:80],
+                            runtime_scope,
+                            result.get("blocker_source"),
                             result.get("reason_code"),
                             result.get("error"),
                         )
@@ -1339,11 +1359,12 @@ def run_cycle(state):
                     )
                     if not decision["ok"]:
                         log.info(
-                            "Autonomy weather skip signal=%s reason_code=%s runtime_scope=%s decision_source=%s history_source=%s reason=%s",
+                            "Autonomy weather skip signal=%s reason_code=%s runtime_scope=%s decision_source=%s blocker_source=%s history_source=%s reason=%s",
                             w_id,
                             decision["reason_code"],
                             decision.get("runtime_scope"),
                             decision.get("decision_source"),
+                            decision.get("blocker_source"),
                             decision.get("history_source"),
                             decision["reason"],
                         )
@@ -1387,6 +1408,7 @@ def run_cycle(state):
                         weather_signal_payload,
                         size_usd=trade_size,
                         mode=weather_policy["trade_mode"],
+                        runtime_scope=runtime_scope,
                     )
                     if result.get("ok"):
                         record_attempt(
