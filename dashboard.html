@@ -1510,23 +1510,25 @@ async function loadStats() {
       meta.textContent = 'No strategy contribution data recorded yet.';
     } else {
       const topNet = [...strategies].sort((a, b) => (b.net_pnl || 0) - (a.net_pnl || 0))[0];
-      const topUtil = [...strategies].sort((a, b) => (b.committed_capital || 0) - (a.committed_capital || 0))[0];
+      const strategyCapital = row => (row.reporting_capital ?? row.committed_capital ?? 0);
+      const topUtil = [...strategies].sort((a, b) => strategyCapital(b) - strategyCapital(a))[0];
       const dq = strategyBreakdown.data_quality || {};
       meta.textContent =
         `Top net contributor: ${topNet?.label || '—'} ${fmtUsd(topNet?.net_pnl || 0)}. ` +
-        `${isPaper ? 'Most research capital in use' : 'Most live capital deployed'}: ${topUtil?.label || '—'} ${fmtUsd(topUtil?.committed_capital || 0)}.` +
+        `${isPaper ? 'Most research capital in use' : 'Most live capital deployed'}: ${topUtil?.label || '—'} ${fmtUsd(strategyCapital(topUtil || {}))}.` +
         (isPaper && dq.has_gaps
           ? ` ${dq.external_open_trades_excluded_from_paper_utilization || 0} external open trade(s) excluded from paper utilization; ${dq.open_trades_missing_marks || 0} open trade(s) missing marks.`
           : '');
       body.innerHTML = strategies.map(row => {
+        const reportingCapital = strategyCapital(row);
         const tradeLabel = `${row.trade_count || 0} total`;
         const tradeSub = `${row.open_trades || 0} open / ${row.closed_trades || 0} closed`;
         const stateSub = isPaper
           ? `${row.paper_open_trades || 0} research open · ${row.external_open_trades || 0} external open`
-          : `${row.open_trades || 0} penny open · ${row.live_open_trades || 0} exchange-tracked`;
+          : `${row.external_open_trades || 0} live/wallet open · ${row.live_open_trades || 0} exchange-tracked · ${row.wallet_open_trades || 0} wallet-attached`;
         const capitalSub = isPaper
           ? `${(row.bankroll_utilization_pct || 0).toFixed(1)}% of research bankroll`
-          : `${fmtUsd(row.committed_capital || 0)} in live exposure`;
+          : `${fmtUsd(reportingCapital)} in live exposure`;
         const coverage = row.data_quality_status === 'ok'
           ? 'Clean'
           : `${row.open_trades_missing_marks || 0} missing mark${(row.open_trades_missing_marks || 0) === 1 ? '' : 's'}${row.trade_state_inferred_trades ? ` · ${row.trade_state_inferred_trades} inferred state` : ''}`;
@@ -1536,7 +1538,7 @@ async function loadStats() {
           <td>${formatSignedCell(row.unrealized_pnl || 0)}</td>
           <td>${formatSignedCell(row.net_pnl || 0)}</td>
           <td><div class="metric-stack"><span>${esc(tradeLabel)}</span><span class="sub">${esc(tradeSub)}</span><span class="sub">${esc(stateSub)}</span></div></td>
-          <td><div class="metric-stack"><span>${fmtUsd(row.committed_capital || 0)}</span><span class="sub">${esc(capitalSub)}</span></div></td>
+          <td><div class="metric-stack"><span>${fmtUsd(reportingCapital)}</span><span class="sub">${esc(capitalSub)}</span></div></td>
           <td><div class="metric-stack"><span>${esc(coverage)}</span><span class="sub">${row.closed_trades ? `${(row.win_rate || 0).toFixed(1)}% win · ${row.wins || 0}W/${row.losses || 0}L` : 'No closed trades'}</span></div></td>
         </tr>`;
       }).join('');

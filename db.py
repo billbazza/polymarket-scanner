@@ -1767,6 +1767,8 @@ def _empty_strategy_bucket(strategy: str) -> dict:
         "committed_capital": 0.0,
         "external_capital": 0.0,
         "capital_deployed": 0.0,
+        "reporting_capital": 0.0,
+        "reporting_capital_basis": "committed_capital",
         "avg_trade_size": 0.0,
         "bankroll_utilization_pct": 0.0,
         "trade_state_inferred_trades": 0,
@@ -1814,12 +1816,14 @@ def get_strategy_performance(refresh_unrealized: bool = False, runtime_scope: st
         conn.close()
 
     buckets = {strategy: _empty_strategy_bucket(strategy) for strategy in STRATEGY_ORDER}
+    reporting_scope = scope or RUNTIME_SCOPE_PAPER
     total_committed_capital = 0.0
     total_realized_pnl = 0.0
     total_unrealized_pnl = 0.0
     total_paper_realized_pnl = 0.0
     total_paper_unrealized_pnl = 0.0
     total_external_open_trades = 0
+    total_reporting_capital = 0.0
     total_open_trades_missing_marks = 0
     total_inferred_trade_states = 0
     excluded_non_ledger_trades = 0
@@ -1890,6 +1894,13 @@ def get_strategy_performance(refresh_unrealized: bool = False, runtime_scope: st
         bucket["paper_committed_capital"] = bucket["committed_capital"]
         bucket["external_capital"] = round(bucket["external_capital"], 2)
         bucket["capital_deployed"] = round(bucket["capital_deployed"], 2)
+        bucket["reporting_capital"] = round(
+            bucket["external_capital"] if reporting_scope == RUNTIME_SCOPE_PENNY else bucket["committed_capital"],
+            2,
+        )
+        bucket["reporting_capital_basis"] = (
+            "external_capital" if reporting_scope == RUNTIME_SCOPE_PENNY else "committed_capital"
+        )
         bucket["avg_trade_size"] = round((bucket["capital_deployed"] / bucket["trade_count"]) if bucket["trade_count"] else 0.0, 2)
         bucket["bankroll_utilization_pct"] = round(
             (bucket["committed_capital"] / starting_bankroll * 100) if starting_bankroll > 0 else 0.0,
@@ -1903,13 +1914,14 @@ def get_strategy_performance(refresh_unrealized: bool = False, runtime_scope: st
         total_unrealized_pnl += bucket["unrealized_pnl"]
         total_paper_realized_pnl += bucket["paper_realized_pnl"]
         total_paper_unrealized_pnl += bucket["paper_unrealized_pnl"]
+        total_reporting_capital += bucket["reporting_capital"]
         if bucket["trade_count"] or strategy in {"cointegration", "weather", "whale", "copy"}:
             strategies.append(bucket)
 
-    scope = normalize_runtime_scope(runtime_scope, default="")
     return {
         "starting_bankroll": round(starting_bankroll, 2),
         "total_committed_capital": round(total_committed_capital, 2),
+        "total_reporting_capital": round(total_reporting_capital, 2),
         "total_realized_pnl": round(total_realized_pnl, 2),
         "total_unrealized_pnl": round(total_unrealized_pnl, 2),
         "total_paper_realized_pnl": round(total_paper_realized_pnl, 2),
@@ -1919,6 +1931,9 @@ def get_strategy_performance(refresh_unrealized: bool = False, runtime_scope: st
             f"strategy_pnl_scope_{scope}__utilization_scope_only"
             if scope
             else "strategy_pnl_all_states__utilization_paper_only"
+        ),
+        "reporting_capital_basis": (
+            "external_capital" if reporting_scope == RUNTIME_SCOPE_PENNY else "committed_capital"
         ),
         "data_quality": {
             "trade_state_inferred_trades": total_inferred_trade_states,

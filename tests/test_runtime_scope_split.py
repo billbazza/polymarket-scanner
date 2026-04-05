@@ -258,6 +258,41 @@ class RuntimeScopeSplitTests(unittest.TestCase):
             penny_account["realized_pnl_usd"],
             penny_stats["trade_reconciliation"]["realized_pnl"],
         )
+
+    def test_penny_strategy_breakdown_reports_live_exposure_from_penny_ledger(self):
+        signal_id = self.db.save_signal(_signal())
+        self.db.open_trade(
+            signal_id,
+            size_usd=3,
+            metadata={
+                "runtime_scope": self.db.RUNTIME_SCOPE_PENNY,
+                "trade_state_mode": self.db.TRADE_STATE_LIVE,
+                "reconciliation_mode": self.db.RECONCILIATION_ORDERS,
+            },
+        )
+
+        with patch.object(self.db, "_get_live_wallet_snapshot", return_value={
+            "ok": True,
+            "verified": True,
+            "verification_status": "verified",
+            "wallet_connected": True,
+            "wallet_address": "0x1234567890abcdef1234567890abcdef12345678",
+            "available_balance_usd": 11.0,
+            "balance_source": "polygon_wallet",
+            "wallet_error": None,
+            "verification_error": None,
+        }):
+            penny_stats = self.client.get("/api/stats?runtime_scope=penny").json()
+
+        strategies = {row["strategy"]: row for row in penny_stats["strategy_breakdown"]["strategies"]}
+        coin = strategies["cointegration"]
+        self.assertEqual(coin["open_trades"], 1)
+        self.assertEqual(coin["committed_capital"], 0.0)
+        self.assertEqual(coin["external_capital"], 3.0)
+        self.assertEqual(coin["reporting_capital"], 3.0)
+        self.assertEqual(coin["reporting_capital_basis"], "external_capital")
+        self.assertEqual(penny_stats["strategy_breakdown"]["total_reporting_capital"], 3.0)
+        self.assertEqual(penny_stats["runtime_account"]["deployed_capital_usd"], 3.0)
         self.assertTrue(penny_stats["acceptance_checks"]["all_passed"])
 
     def test_penny_scope_excludes_paper_state_rows_from_live_ledger_views(self):
